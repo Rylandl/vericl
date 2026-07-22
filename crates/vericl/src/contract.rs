@@ -79,6 +79,14 @@ pub struct Contract {
     /// contract clause, not a silent approximation — see README "A first
     /// finding" for the analogous fma story.
     pub wrapping: bool,
+    /// Pretty-printed `instantiate(...)` entries (`"F = f32"`, `"taps =
+    /// 3"`), one per generic type parameter or `#[comptime]` parameter the
+    /// kernel declares. Empty for a non-generic, non-comptime kernel. The
+    /// instantiation *values* are already part of `SOURCE_HASH` (they're in
+    /// the raw contract attribute tokens the hash covers) — this field
+    /// exists purely so evidence records what a kernel was monomorphized
+    /// at, the same way `wrapping` records a declared clause.
+    pub instantiate: &'static [&'static str],
 }
 
 /// Serializable form of a [`Contract`] for the evidence manifest.
@@ -87,6 +95,14 @@ pub struct ContractRecord {
     pub assumes: Vec<String>,
     pub compare: String,
     pub wrapping: bool,
+    /// See [`Contract::instantiate`]. `[]` for a non-generic, non-comptime
+    /// kernel. `#[serde(default)]` so evidence written before this field
+    /// existed still loads (as `[]`) instead of hard-failing deserialization
+    /// — unlike a source/IR hash change, adding this field never changes
+    /// `SOURCE_HASH` for a kernel that doesn't use `instantiate(...)`, so an
+    /// old manifest for such a kernel is otherwise still perfectly valid.
+    #[serde(default)]
+    pub instantiate: Vec<String>,
 }
 
 /// Identity a piece of evidence is bound to. Any mismatch between a stored
@@ -126,6 +142,7 @@ impl Contract {
             assumes: self.assumes.iter().map(|s| s.to_string()).collect(),
             compare: self.compare.describe(),
             wrapping: self.wrapping,
+            instantiate: self.instantiate.iter().map(|s| s.to_string()).collect(),
         }
     }
 }

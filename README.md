@@ -69,10 +69,11 @@ health check rather than a surprise.
         y.iter().all(|v| v.abs() <= 100.0)
     ),
     compare(abs = 1e-4),
-    gen(alpha in -4.0..=4.0, x in -100.0..=100.0, y in -100.0..=100.0)
+    gen(alpha in -4.0..=4.0, x in -100.0..=100.0, y in -100.0..=100.0),
+    instantiate(F = f32)
 )]
 #[cube(launch)]
-pub fn axpy(alpha: f32, x: &Array<f32>, y: &mut Array<f32>) {
+pub fn axpy<F: Float + CubeElement>(alpha: F, x: &Array<F>, y: &mut Array<F>) {
     if ABSOLUTE_POS < y.len() {
         y[ABSOLUTE_POS] = alpha * x[ABSOLUTE_POS] + y[ABSOLUTE_POS];
     }
@@ -81,12 +82,61 @@ pub fn axpy(alpha: f32, x: &Array<f32>, y: &mut Array<f32>) {
 
 From this single definition VeriCL derives, in a generated `axpy_vericl` module: the untouched
 CubeCL kernel; a sequential scalar `reference` twin (`ABSOLUTE_POS` becomes a loop variable,
-`&Array<T>` becomes `&[T]`) sharing no CubeCL machinery; the `assumes` clauses as an executable
-`check_assumes` predicate; a `SOURCE_HASH` identity that evidence binds to; and — from the
-`gen(...)` clause — a `conformance_case` function that generates inputs, runs the reference and
+`&Array<T>` becomes `&[T]`, and — per `instantiate(...)` below — the generic type parameter is
+substituted to its pinned concrete type) sharing no CubeCL machinery; the `assumes` clauses as an
+executable `check_assumes` predicate; a `SOURCE_HASH` identity that evidence binds to; and — from
+the `gen(...)` clause — a `conformance_case` function that generates inputs, runs the reference and
 the real kernel, and compares them, so no kernel needs hand-written GPU launch/input-gen glue.
-Kernels using constructs the twin cannot model (`UNIT_POS`, `SharedMemory`, `plane_*`, `comptime`,
-vectors, `return`) are rejected at compile time rather than silently approximated.
+Kernels using constructs the twin cannot model (`UNIT_POS`, `SharedMemory`, `plane_*`, `comptime!`
+blocks, vectors, `return`) are rejected at compile time rather than silently approximated; kernel
+*composition* (calling another `#[cube]` fn) is likewise out of scope.
+
+### The `instantiate(...)` clause: monomorphizing generic + `#[comptime]` kernels
+
+Real CubeCL kernels are overwhelmingly generic over their element type (`<F: Float>`) and use
+`#[comptime]` parameters for unroll counts, tap counts, and feature toggles — a July 2026 dogfooding
+survey against a private 22-kernel production codebase found generics blocking 20/22 kernels and
+`#[comptime]` blocking 15/22 (see `docs/dogfood-2026-07.md`). `instantiate(...)` names a concrete
+value for every generic type parameter and every `#[comptime]` parameter the kernel declares —
+`instantiate(F = f32, taps = 3)` — and VeriCL monomorphizes everything it derives at those values:
+
+- **Reference twin**: the generic type ident is substituted token-wise wherever it appears in the
+  twin's signature and body (`F` -> `f32`); `#[comptime]` parameters are removed from the twin's
+  signature entirely and instead bound as `let name: ty = value;` consts at the top of `reference`
+  (before the `ABSOLUTE_POS` loop — they're loop-invariant by construction) and `check_assumes`.
+  The perf-only `#[unroll]`/`#[unroll(n)]` statement attribute is stripped from twin loops (it isn't
+  valid plain Rust); any *other* statement attribute is a compile error, not a silent drop.
+- **`conformance_case`**: launches via `<name>::launch::<f32, R>(...)`, with `#[comptime]` values
+  spliced in at their declared parameter position — CubeCL keeps a comptime param in its original
+  position with its plain type, it's only non-const params that get wrapped for the runtime.
+- **`kernel_definition()`** (the IR the SMT prover and `ir_hash` see): calls the CubeCL-generated
+  `expand::<f32>(...)` with the same turbofish and comptime values, exactly mirroring a real call
+  site.
+- **Contract identity**: instantiation values are part of the raw contract attribute tokens, so
+  `SOURCE_HASH` already changes when they change; `Contract`/`ContractRecord` additionally record
+  the pinned values as strings (`instantiate: ["F = f32", "taps = 3"]`) purely for evidence
+  legibility.
+
+A kernel with generic type parameters and/or `#[comptime]` parameters and **no** `instantiate(...)`
+clause is a targeted compile error telling you to add one; an `instantiate(...)` clause on a kernel
+with neither is also an error (an unused instantiation is a contract lie). v0 supports exactly one
+`instantiate(...)` clause per kernel — multiple instantiations of the same kernel body is future
+work — and only plain type generic parameters (no lifetimes, no const generics, no where-clauses).
+
+**Float-method host-callability.** After substitution the twin's body may call `Float`/`Numeric`
+trait methods (`F::new(x)`, `x.sqrt()`, ...) resolved through `cubecl::prelude`'s traits. Most of
+these are safe to call on the host: either they have a real per-type implementation (`Float::new`)
+or they share a name with a `std` `f32` inherent method, which Rust's method resolution always
+prefers over a trait method regardless of which traits are `use`-imported. A few are *not* safe —
+`log1p`, `inverse_sqrt`, `erf`, and `is_inf` have no such shadow and panic
+(`Unexpanded Cube functions should not be called.`) if called on the host at all. VeriCL verified
+this empirically (`crates/vericl-examples/tests/float_method_whitelist.rs` calls every candidate
+method on `f32` and either cross-checks it against `std` or confirms it panics) and rejects, at
+macro time, any twin body calling a method outside the verified whitelist:
+`error: host-callability of 'F::erf' in the reference twin is unverified — outside the vericl v0
+subset`. This is an explicit rejection, not a best-effort attempt — a twin that silently miscomputes
+or panics on a method vericl never verified is exactly the failure mode this project exists to
+prevent.
 
 ### The `gen(...)` clause: ergonomic by being explicit
 

@@ -4,7 +4,7 @@
     {
       "kernel": "axpy",
       "identity": {
-        "source_hash": "sha256:2db7ace93f8609d038374fb0ebcfb8338f6bfe0a96f6c9ebba51bb42866d558d",
+        "source_hash": "sha256:0f202b53a0452e9196663041d9f7b56c6002ae655387d8364bb1bbfcfd7c6dc1",
         "vericl_version": "0.1.0",
         "ir_hash": "sha256:3ae1a32f63226aac7b8cb2d19851e3bcad00626ac98b5116131e91f48772e722"
       },
@@ -16,7 +16,10 @@
           "y.iter().all(| v | v.abs() <= 100.0)"
         ],
         "compare": "f32 |e-a| <= 1e-4 + 0e0*|e|",
-        "wrapping": false
+        "wrapping": false,
+        "instantiate": [
+          "F = f32"
+        ]
       },
       "claims": [
         {
@@ -76,7 +79,8 @@
           "x.len() == y.len()"
         ],
         "compare": "exact",
-        "wrapping": false
+        "wrapping": false,
+        "instantiate": []
       },
       "claims": [
         {
@@ -136,7 +140,8 @@
           "x.len() == y.len()"
         ],
         "compare": "exact",
-        "wrapping": true
+        "wrapping": true,
+        "instantiate": []
       },
       "claims": [
         {
@@ -167,6 +172,70 @@
           "config": {
             "logic": "QF_LIA",
             "obligations": 2,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    },
+    {
+      "kernel": "fir3",
+      "identity": {
+        "source_hash": "sha256:9dbb776f857e6ab8b11ec00a70f7d8fe32861bfc4ce98539828701c6646e46e3",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:31368a579aead12dde5ad6985955fe6a0c6e62509e351ca270bdc907c38e886b"
+      },
+      "contract": {
+        "assumes": [
+          "x.len() == y.len()"
+        ],
+        "compare": "f32 |e-a| <= 1e-5 + 0e0*|e|",
+        "wrapping": false,
+        "instantiate": [
+          "F = f32",
+          "taps = 3"
+        ]
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 4,
             "solver": "z3 Z3 version 4.16.0 - 64 bit"
           },
           "result": {

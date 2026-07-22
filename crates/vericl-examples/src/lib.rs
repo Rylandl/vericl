@@ -6,7 +6,10 @@
 
 use cubecl::prelude::*;
 
-/// f32 saxpy.
+/// Generic saxpy — the flagship `instantiate(...)` example: `F` is pinned to
+/// `f32` below, monomorphizing the reference twin, `conformance_case`'s
+/// launch, and `kernel_definition`'s IR extraction all at that one concrete
+/// type (see the `instantiate(...)` contract clause in the README).
 ///
 /// Tolerance rationale (a first real VeriCL finding): the wgpu/Metal backend
 /// contracts `a*x + y` (fma / fast-math), so under cancellation no useful ULP
@@ -22,12 +25,97 @@ use cubecl::prelude::*;
         y.iter().all(|v| v.abs() <= 100.0)
     ),
     compare(abs = 1e-4),
-    gen(alpha in -4.0..=4.0, x in -100.0..=100.0, y in -100.0..=100.0)
+    gen(alpha in -4.0..=4.0, x in -100.0..=100.0, y in -100.0..=100.0),
+    instantiate(F = f32)
 )]
 #[cube(launch)]
-pub fn axpy(alpha: f32, x: &Array<f32>, y: &mut Array<f32>) {
+pub fn axpy<F: Float + CubeElement>(alpha: F, x: &Array<F>, y: &mut Array<F>) {
     if ABSOLUTE_POS < y.len() {
         y[ABSOLUTE_POS] = alpha * x[ABSOLUTE_POS] + y[ABSOLUTE_POS];
+    }
+}
+
+/// A small windowed FIR (up to 3 taps), generic over its element type *and*
+/// pinning the active tap count via `#[comptime]` — the milestone's
+/// headline case: a genuinely generic + comptime kernel that still lands a
+/// **proved** out-of-bounds-freedom claim (see
+/// `fir3_kernel_definition_is_provably_in_bounds` below), not just a
+/// differential one. Deliberately
+/// avoids a loop-carried accumulator (the dogfood survey's Tier-2 prover
+/// gap, docs/dogfood-2026-07.md) by fully guarding each of the (at most) two
+/// extra taps with its own `if` rather than a `for k in 0..taps` loop — the
+/// same "guard, don't loop-carry" shape as `axpy`/`sum_racy`'s bounds
+/// obligations, just with `taps` deciding how many guards are live.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-5),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0),
+    instantiate(F = f32, taps = 3)
+)]
+#[cube(launch)]
+pub fn fir3<F: Float>(x: &Array<F>, y: &mut Array<F>, #[comptime] taps: u32) {
+    if ABSOLUTE_POS < y.len() {
+        let mut acc = x[ABSOLUTE_POS];
+        // Deliberately NOT collapsed to `if taps > 1 && ABSOLUTE_POS >= 1`
+        // (clippy::collapsible_if): the SMT bounds prover (vericl-ir) does
+        // not model `&&`-composed branch conditions and reports
+        // `OutOfSubset` for them (confirmed empirically — collapsing this
+        // exact kernel turns `fir3_kernel_definition_is_provably_in_bounds`
+        // from Proved into OutOfSubset), while it does track nested `if`
+        // conditions individually on its path-condition stack. Nesting is
+        // what keeps this kernel in the provable subset.
+        #[allow(clippy::collapsible_if)]
+        if taps > 1 {
+            if ABSOLUTE_POS >= 1 {
+                acc += x[ABSOLUTE_POS - 1];
+            }
+        }
+        #[allow(clippy::collapsible_if)]
+        if taps > 2 {
+            if ABSOLUTE_POS >= 2 {
+                acc += x[ABSOLUTE_POS - 2];
+            }
+        }
+        y[ABSOLUTE_POS] = acc;
+    }
+}
+
+/// Same shape as `fir3`, pinned at a different comptime value purely to
+/// demonstrate that changing an `instantiate(...)` value changes kernel
+/// identity (`SOURCE_HASH`) — see
+/// `fir3_identity_changes_with_instantiate_value` below. Not part of the
+/// conformance suite.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-5),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0),
+    instantiate(F = f32, taps = 1)
+)]
+#[cube(launch)]
+pub fn fir3_alt<F: Float>(x: &Array<F>, y: &mut Array<F>, #[comptime] taps: u32) {
+    if ABSOLUTE_POS < y.len() {
+        let mut acc = x[ABSOLUTE_POS];
+        // Deliberately NOT collapsed to `if taps > 1 && ABSOLUTE_POS >= 1`
+        // (clippy::collapsible_if): the SMT bounds prover (vericl-ir) does
+        // not model `&&`-composed branch conditions and reports
+        // `OutOfSubset` for them (confirmed empirically — collapsing this
+        // exact kernel turns `fir3_kernel_definition_is_provably_in_bounds`
+        // from Proved into OutOfSubset), while it does track nested `if`
+        // conditions individually on its path-condition stack. Nesting is
+        // what keeps this kernel in the provable subset.
+        #[allow(clippy::collapsible_if)]
+        if taps > 1 {
+            if ABSOLUTE_POS >= 1 {
+                acc += x[ABSOLUTE_POS - 1];
+            }
+        }
+        #[allow(clippy::collapsible_if)]
+        if taps > 2 {
+            if ABSOLUTE_POS >= 2 {
+                acc += x[ABSOLUTE_POS - 2];
+            }
+        }
+        y[ABSOLUTE_POS] = acc;
     }
 }
 
@@ -387,6 +475,104 @@ mod tests {
                 );
             }
             other => panic!("expected OutOfSubset (not Proved — see doc comment), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // instantiate(...): generic + #[comptime] monomorphization (fir3).
+    // -----------------------------------------------------------------
+
+    /// Independently written 3-tap (at most) windowed sum, used only to
+    /// cross-check the macro-derived, instantiate(...)-monomorphized twin —
+    /// kept deliberately separate from the kernel body so the check is not
+    /// circular. Mirrors `fmix32` above for `mix_u32`.
+    fn fir_handwritten(x: &[f32], taps: u32) -> Vec<f32> {
+        x.iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let mut acc = v;
+                if taps > 1 && i >= 1 {
+                    acc += x[i - 1];
+                }
+                if taps > 2 && i >= 2 {
+                    acc += x[i - 2];
+                }
+                acc
+            })
+            .collect()
+    }
+
+    /// `fir3`'s twin (F -> f32, `#[comptime] taps` removed from the
+    /// signature and bound as a `let taps: u32 = 3;` const per
+    /// `instantiate(F = f32, taps = 3)`) matches the independent
+    /// hand-written computation above — the same guard against a circular
+    /// derivation check as `xorshift_twin_matches_handwritten`/
+    /// `mix_u32_twin_matches_handwritten_fmix32`.
+    #[test]
+    fn fir3_twin_matches_handwritten() {
+        let x: Vec<f32> = vec![1.0, -2.0, 3.5, 0.25, -7.0, 10.0, 0.0, -1.5];
+        let mut y = vec![0.0f32; x.len()];
+        // reference() takes no `taps` parameter — it's a const now.
+        fir3_vericl::reference(&x, &mut y, x.len());
+        let expected = fir_handwritten(&x, 3);
+        for (i, (&got, &want)) in y.iter().zip(expected.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-6, "index {i}: got {got}, want {want}");
+        }
+    }
+
+    /// The twin honors the guard exactly like `axpy`'s: threads past the
+    /// guard write nothing to `y`.
+    #[test]
+    fn fir3_twin_respects_guard() {
+        let x = vec![1.0f32; 3];
+        let mut y = vec![9.0f32; 3];
+        fir3_vericl::reference(&x, &mut y, 256); // threads >> len
+        assert_eq!(y, vec![1.0, 2.0, 3.0]); // taps=3: x[0], x[1]+x[0], x[2]+x[1]+x[0]
+    }
+
+    /// `instantiate(...)`'s pinned values are part of the recorded contract
+    /// (`Contract::instantiate`/`ContractRecord::instantiate`), in clause
+    /// declaration order — separate from `assumes`/`wrapping`, mirroring how
+    /// `wrapping_is_recorded_in_the_contract` pins that clause's field.
+    #[test]
+    fn instantiate_is_recorded_in_the_contract() {
+        assert_eq!(fir3_vericl::contract().instantiate, &["F = f32", "taps = 3"]);
+        assert_eq!(fir3_alt_vericl::contract().instantiate, &["F = f32", "taps = 1"]);
+        // A non-generic, non-comptime kernel has an empty instantiate list.
+        assert!(axpy_off_by_one_vericl::contract().instantiate.is_empty());
+    }
+
+    /// Changing an `instantiate(...)` value changes kernel identity: `fir3`
+    /// and `fir3_alt` are byte-identical source except for the pinned
+    /// `taps` value, and the instantiation value is part of the raw
+    /// contract attribute tokens `SOURCE_HASH` covers — so the two hashes
+    /// must differ. This is the source-level counterpart to
+    /// `identity_hashes_are_distinct_per_kernel` above, specifically for
+    /// the instantiate(...) clause.
+    #[test]
+    fn fir3_identity_changes_with_instantiate_value() {
+        assert_ne!(fir3_vericl::SOURCE_HASH, fir3_alt_vericl::SOURCE_HASH);
+    }
+
+    /// The milestone's headline result: `fir3` is genuinely generic
+    /// (`F: Float`) *and* has a `#[comptime]` parameter, monomorphized via
+    /// `instantiate(F = f32, taps = 3)` — and its bounds obligations still
+    /// discharge as `Proved`, not merely `OutOfSubset`. Achieved by
+    /// avoiding a loop-carried accumulator (see the kernel's doc comment):
+    /// each extra tap is its own guarded `if`, the same shape the prover
+    /// already handles for `axpy`/`sum_racy`.
+    #[test]
+    fn fir3_kernel_definition_is_provably_in_bounds() {
+        let def = fir3_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = fir3_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            // x[pos] read, y[pos] write, guarded x[pos-1]/x[pos-2] reads.
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 4),
+            other => panic!("expected Proved, got {other:?}"),
         }
     }
 }

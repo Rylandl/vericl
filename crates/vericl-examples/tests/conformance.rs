@@ -16,7 +16,7 @@ use vericl_examples::*;
 
 vericl::suite! {
     runtime: cubecl::wgpu::WgpuRuntime,
-    kernels: [axpy, xorshift_step, mix_u32],
+    kernels: [axpy, xorshift_step, mix_u32, fir3],
     evidence: "evidence/vericl.json",
     extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime),
 }

@@ -306,6 +306,7 @@ mod tests {
                 assumes: vec![],
                 compare: "exact".into(),
                 wrapping: false,
+                instantiate: vec![],
             },
             claims: vec![],
             trusted: vec![],

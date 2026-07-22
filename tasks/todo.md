@@ -89,10 +89,10 @@ Working toward the four first-release outcomes in README.md.
       the harness sets it after computing it via vericl-ir, so `verify()`'s existing whole-`Identity`
       comparison now catches IR-level drift (e.g. a CubeCL-upgrade codegen change with no source
       diff) in addition to source-level drift, with both hashes reported on mismatch.
-- [x] Absorb per-kernel GPU glue into generated code — DONE, see "Roadmap" item 3 below for the
+- [x] Absorb per-kernel GPU glue into generated code — DONE, see "Roadmap" item 4 below for the
       full writeup (`gen(...)` clause, `conformance_case`, `vericl::suite!`). Standalone
       `vericl check` CLI remains not done (superseded by the `cargo test` CI story — see README
-      CI story row and Roadmap item 5).
+      CI story row and Roadmap item 6).
 - [x] Adversarial soundness review of the SMT bounds prover — DONE. One CRITICAL confirmed bug:
       `process_range_loop` (crates/vericl-ir/src/prover.rs) never read `rl.step`, so a
       `range_stepped` (CubeCL stepped-range) loop — including a genuinely descending loop where
@@ -155,11 +155,102 @@ caught deterministically.
    real kernel; terminate!() latent soundness gap found and banned. Roadmap below reordered
    accordingly — new order: instantiate() clause (generics+comptime), composition, prover
    div/mod + loop-carry refinement, shared-memory reductions last.
-2. CI: DEFERRED per Ryland (2026-07-22) — no GitHub Actions or remote execution for now;
+2. [DONE 2026-07-22] `instantiate(...)` contract clause — generic (`<F: Float>`) kernel and
+   `#[comptime]` parameter support, monomorphized at declared concrete values (roadmap item 1,
+   unblocks 20/22 dogfooded kernels). Design: `instantiate(F = f32, taps = 3)` — one clause per
+   kernel (v0), type params get concrete types, `#[comptime]` params get concrete literal
+   values. Gating replaces the old blanket "generic kernels are outside the vericl v0 subset"
+   rejection with three targeted errors: a kernel with generics/comptime and no clause ("add
+   one, e.g. `instantiate(F = f32, N = 8)`"); a clause on a kernel with neither ("unused
+   instantiation is a contract lie"); and a duplicate clause. Only plain type generic params
+   are supported (lifetimes/const generics/where-clauses still rejected outright).
+   Monomorphization: the generic ident is substituted token-wise into the twin's signature
+   (via a substituted, reparsed param list feeding the *same* `classify_param`/`NumKind`/
+   `gen(...)` machinery every other kernel already uses — no downstream function needed to
+   learn about instantiate() at all) and body (extending the existing `transform_body`
+   ABSOLUTE_POS/banned-ident walk with a substitution map); `#[comptime]` params are removed
+   from the twin signature and bound as `let name: ty = value;` consts at the top of
+   `reference`/`check_assumes` (loop-invariant by construction); `kernel_definition()` calls
+   `expand::<f32, ...>(...)` and `conformance_case` calls `launch::<f32, ..., R>(...)` with
+   comptime values spliced in at their declared parameter position (cubecl keeps a comptime
+   param in its original position with its plain type — confirmed from cubecl-macros'
+   `generate/launch.rs`). Two new syn `Fold` passes over the twin body (added to the existing
+   unconditional block-reparse, so they cost nothing for kernels that don't need them):
+   `StripUnrollFold` removes the perf-only `#[unroll]`/`#[unroll(n)]` statement attribute from
+   twin loops (invalid in plain Rust) and errors on any *other* statement attribute instead of
+   silently dropping it; `FloatMethodCheck` rejects any call (`.method()` or `Type::method()`)
+   to a name on `FLOAT_METHOD_REJECT`.
+   **Float-method host-callability** (the CRITICAL research item) — empirically verified (not
+   just read from source) via `crates/vericl-examples/tests/float_method_whitelist.rs`, which
+   calls every candidate on host `f32` and cross-checks against `std`/confirms a panic:
+   `FLOAT_METHOD_WHITELIST` (new, abs, min, max, clamp, floor/ceil/round/trunc, sqrt, recip,
+   sin/cos/tan/asin/acos/atan/atan2, sinh/cosh/tanh, exp, ln, powf, powi, hypot, is_nan,
+   to_degrees, to_radians, from_int, min_value, max_value) are host-safe — most because Rust's
+   inherent-method resolution always prefers `std`'s own `f32` method over the trait's
+   `unexpanded!()`-panicking default, a few (`new`, `from_int`, `min_value`, `max_value`) via a
+   real per-type implementation. `FLOAT_METHOD_REJECT` (log1p, inverse_sqrt, erf, is_inf,
+   rhypot, magnitude, normalize, dot, mul_hi, saturating_add, saturating_sub, from_int_128,
+   from_vec, cast_from, reinterpret) panic on host (`Unexpanded Cube functions should not be
+   called.`) and are rejected at macro time naming the method — `cast_from`/`reinterpret` were
+   *added* to this list mid-task, found by the private dogfood validation below (see its
+   entry), a genuine example of real-code dogfooding sharpening a whitelist built first from
+   source reading alone. Separately (also found via dogfooding, recorded in code comments, not
+   yet reflected in the whitelist since it's a different axis): `new`/`from_int` additionally
+   require a *compile-time-constant* argument even in GPU-expand context — passing either a
+   genuinely runtime-computed value compiles (for `from_int`) or doesn't (for `new`) but panics
+   or fails independent of vericl the moment it's actually expanded/launched. Host-callable and
+   expand-runtime-safe are different, currently-undocumented-until-now axes; worth a dedicated
+   `FLOAT_METHOD_CONST_ONLY` distinction as follow-up if a dogfooded kernel needs it.
+   Examples: `axpy` converted to `axpy<F: Float + CubeElement>` with `instantiate(F = f32)` —
+   the flagship shows the feature (the `+ CubeElement` bound is required by cubecl itself for
+   any kernel with a bare scalar generic parameter, unrelated to vericl — confirmed against
+   cubecl's own `kernel_with_generics` test pattern, where the bound lives on the *caller*
+   instead since cubecl's own test never has vericl's generated code calling `launch` with an
+   already-concrete type). New `fir3<F: Float>(x: &Array<F>, y: &mut Array<F>, #[comptime]
+   taps: u32)` — a clean-room windowed FIR, taps 1..=3 selected by the comptime `taps` value —
+   is the milestone's headline: genuinely generic *and* comptime, and its bounds obligations
+   still discharge `Proved` (4 obligations), not merely `OutOfSubset`, by deliberately avoiding
+   a loop-carried accumulator (guarding each extra tap with its own nested `if` rather than a
+   `for k in 0..taps` loop — confirmed empirically that collapsing to `if taps > 1 &&
+   ABSOLUTE_POS >= 1` turns this from `Proved` into `OutOfSubset`: the prover does not compose
+   `&&`-joined branch conditions, only nested `if`s, individually, on its path-condition stack
+   — now a `#[allow(clippy::collapsible_if)]` with that exact finding recorded in a comment).
+   `fir3_alt` (same shape, `taps = 1`) exists solely to show instantiate() changes
+   `SOURCE_HASH`. `suite!` runs `axpy`/`fir3` unchanged alongside the pre-existing kernels — no
+   suite-side change needed, proving the "monomorphize once, everything downstream just works"
+   design. `Contract`/`ContractRecord` gained `instantiate: &[&str]`/`Vec<String>`
+   (`#[serde(default)]` on the record field so evidence written before this feature still
+   loads).
+   Private validation (per the README's Substrate policy: never committed, described here only
+   by construct class): one real generic + `#[comptime]` production launch kernel, blocked
+   *only* by the generics/comptime gate (no composition, no shared-memory topology) per the
+   survey, passed differentially on wgpu end-to-end across 5 sizes after `instantiate(...)`
+   annotation; its bounds proof is honestly `OutOfSubset` on a pre-existing, separately
+   documented div/mod-index gap (nothing to do with instantiate()). Needed two documented,
+   semantics-preserving adaptations to compile at all under the v0 subset — both are genuine
+   subset-gap findings fed back into the public whitelist/rejection lists above, not
+   workarounds-of-convenience: (1) a `usize -> F` runtime index conversion via `F::cast_from`
+   (blanket-`unexpanded!()`, panics on host for every type) replaced with a small precomputed
+   lookup-table array read (the same pattern the kernel's own other float lookups already use);
+   (2) two `comptime!(...)` macro blocks (still separately banned, unrelated to instantiate())
+   dropped as a no-semantic-change codegen-hint removal, same class as the pre-existing
+   `#[unroll]`-dropping precedent in that private workspace.
+   Verification: `cargo test --workspace` and `-p vericl-examples --features cpu` both green;
+   `cargo clippy --workspace --all-targets` zero warnings on both feature sets; `VERICL_UPDATE=1
+   cargo test` then plain `cargo test` green (fresh evidence, `axpy`+`fir3` both carry
+   `tested`+`proved` claims); `conform demo-defects` exits 0; the stale-evidence cycle (mutate
+   `fir3`'s guard → fails naming both hashes → revert → passes) exercised end to end; the
+   no-instantiate and unused-instantiate errors demonstrated in the scratchpad (not committed);
+   the private dogfood suite (`mulhilo32_kernel`, `philox4x32_two_kernel`,
+   `synth_freqshift_cw_kernel`) green end to end, `dogfood-rejects` still fails to build with
+   its generics-blocked kernel now naming the *new* targeted "add instantiate(...)" error
+   instead of the old blanket one (confirming the replacement fires correctly) while its
+   topology-blocked variant is unaffected.
+3. CI: DEFERRED per Ryland (2026-07-22) — no GitHub Actions or remote execution for now;
    everything stays local. The CI story is `cargo test --workspace` (+ `--features cpu`) run
    locally. A workflow existed briefly and was removed in ff675ec (recoverable from e869646);
    do not re-add remote CI without an explicit ask.
-3. [x] Ergonomics: absorb per-kernel GPU launch glue into the macro — DONE. `#[vericl::kernel]`
+4. [x] Ergonomics: absorb per-kernel GPU launch glue into the macro — DONE. `#[vericl::kernel]`
    gained a `gen(...)` contract clause (`name in lo..=hi` per parameter, elementwise for arrays;
    optional `len(name = N)` to pin an array's generated length instead of the case size — needed
    by `sum_racy`'s `assumes(y.len() == 1)`) and now generates `<name>_vericl::conformance_case`,
@@ -212,7 +303,10 @@ caught deterministically.
    test` fails naming both `source_hash` and `ir_hash` → revert → passes) exercised end to end,
    and the float-without-`gen` compile rejection demonstrated in a standalone scratch crate.
    Standalone `vericl` CLI remains future work (see README CI story row).
-4. Next proved property: race-freedom via two-thread symbolic reduction (the sum_racy class
+5. Next proved property: race-freedom via two-thread symbolic reduction (the sum_racy class
    proved, not just differentially caught).
-5. Later: QF_BV wrapping model in the prover; fold cubecl version into Identity; upstream
-   conversation with tracel-ai; standalone `vericl check` CLI (README CI story row).
+6. Later: QF_BV wrapping model in the prover; fold cubecl version into Identity; upstream
+   conversation with tracel-ai; standalone `vericl check` CLI (README CI story row); prover
+   div/mod-index modeling (unblocks proving kernels like the private `synth_freqshift_cw`
+   validation above); kernel composition (roadmap item 3 per docs/dogfood-2026-07.md); a
+   `FLOAT_METHOD_CONST_ONLY` distinction if a dogfooded kernel needs a runtime `new`/`from_int`.
