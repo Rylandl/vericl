@@ -1,0 +1,15 @@
+[package]
+name = "vericl-macros"
+description = "Contract attribute macro for vericl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }
+sha2 = { workspace = true }

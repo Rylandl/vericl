@@ -1,0 +1,25 @@
+[package]
+name = "vericl-examples"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["wgpu"]
+wgpu = ["cubecl/wgpu"]
+cpu = ["cubecl/cpu"]
+
+[dependencies]
+vericl = { workspace = true }
+vericl-ir = { workspace = true }
+serde_json = { workspace = true }
+cubecl = { workspace = true }
+
+[[bin]]
+name = "vanilla"
+path = "src/bin/vanilla.rs"
+
+[[bin]]
+name = "conform"
+path = "src/bin/conform.rs"

@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vericl",
+    "crates/vericl-macros",
+    "crates/vericl-ir",
+    "crates/vericl-examples",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+vericl = { path = "crates/vericl", version = "0.1.0" }
+vericl-macros = { path = "crates/vericl-macros", version = "0.1.0" }
+vericl-ir = { path = "crates/vericl-ir", version = "0.1.0" }
+
+# Pinned per README: isolate CubeCL coupling, upgrade deliberately.
+cubecl = { version = "=0.10.0", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits", "fold"] }
+easy-smt = "0.3"
+
+[profile.dev]
+# cubecl + wgpu are slow unoptimized; kernels JIT at runtime anyway.
+opt-level = 1

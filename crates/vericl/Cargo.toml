@@ -1,0 +1,11 @@
+[package]
+name = "vericl"
+description = "Conformance and evidence harness for CubeCL compute kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vericl-macros = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
