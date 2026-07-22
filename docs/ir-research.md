@@ -69,6 +69,32 @@ health check; `TypeHash` (below) is a cheap schema-drift tripwire.
   Operator, Metadata, Branch, ...}`; `LocalConst{id}` is assigned once (SSA-ish). Walker =
   recursive descent with a path-condition stack; each Index/IndexAssign emits the obligation
   `0 <= index < Length(list)` under current path conditions + contract assumes.
+- **`&&`/`||`/`!` lowering (July 2026 prover-expansion milestone, validated empirically against
+  the pinned `cubecl =0.10.0` by extracting IR for `a && b`/`a || b`/`!a`-shaped guards — see
+  `crates/vericl-ir/src/prover.rs`'s module docs and `prover::tests::{and,or,not}_guard_proves`):
+  CubeCL lowers these to **eager** `Operator::And`/`Or(BinaryOperator { lhs, rhs })` and
+  `Operator::Not(UnaryOperator { input })` over already-evaluated `Bool`-typed sub-expressions —
+  *not* to nested branches. Concretely, for `if a && b { ... }`, both `a` and `b` are computed as
+  ordinary preceding `Comparison`/`Operator` instructions (unconditionally, before the `&&`
+  itself), then one more instruction combines them via `Operator::And`, and *that* result is fed
+  as the single `cond` `Variable` to `Branch::If`. This is the same shape the `value_of` term
+  model already handles for everything else: `And`/`Or`/`Not` model directly as SMT `and`/`or`/
+  `not` over their (recursively resolved) operands.
+- **`Arithmetic::Div`/`Modulo` (same milestone):** both lower from `/`/`%` as ordinary
+  `Arithmetic::{Div,Modulo}(BinaryOperator { lhs, rhs })` — no special IR shape, just two more
+  arithmetic variants alongside `Add`/`Sub`/`Mul`. What's genuinely different is what's *sound*
+  to do with them: SMT-LIB's `div`/`mod` (Euclidean division) are the natural encoding, but only
+  coincide with Rust's/WGSL's truncated-toward-zero division when both operands are nonnegative.
+  `vericl-ir` therefore emits an internal side-obligation (divisor nonzero, both operands
+  nonnegative) before modeling either operator, discharging it fresh via the solver under the
+  live path conditions rather than inferring it from the operands' IR-declared unsigned types —
+  see the prover module docs' "Div/mod-derived indices" section for the full soundness argument
+  and `prover::tests::{div,mod}_guarded_proves`/`div_unguarded_divisor_is_out_of_subset`/
+  `div_index_unbounded_refutes` for the empirical positive/negative controls. z3 handles a
+  *symbolic* (non-constant) divisor/modulus in QF_LIA/Ints fine in practice for the query shapes
+  this checker emits — including deriving `a == b * (div a b) + (mod a b)` from the theory's own
+  axioms to connect a decoded-and-recombined index (`row * width + col`) back to the original
+  `ABSOLUTE_POS`-based guard (see `vericl-examples`' `flatten_decode_scale`).
 
 axpy's actual trace (from the prototype):
 

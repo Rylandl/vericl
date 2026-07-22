@@ -36,9 +36,9 @@ Tier 2 — prover gates (twin + differential fine; proof honestly unavailable):
 
 | Gap | Shapes | Notes |
 |---|---|---|
-| Loop-carried accumulators | 8 | Rejection is sound but coarse: could be refined to reject only when carried state feeds an index |
-| `/`, `%`-derived indices (flat 1-D → row/col decode) | 7 | QF_LIA models nonneg div/mod fine; this is implementable, not fundamental |
-| Array-value-dependent indices (offset tables / gather) | ≥5 | Needs element-range assumptions (e.g. quantified assumes) to be provable |
+| Loop-carried accumulators | 8 | **[implemented, 2026-07]** Refined per this table's own suggestion: carried variables are tainted (not the whole loop rejected), so an accumulator whose index/branch expressions don't touch carried state now proves — see `vericl-ir`'s `process_range_loop`/`loop_carried_accumulator_unused_as_index_proves` |
+| `/`, `%`-derived indices (flat 1-D → row/col decode) | 7 | **[implemented, 2026-07]** Modeled via SMT-LIB `div`/`mod` (Euclidean) behind a solver-discharged nonzero+nonnegative side-obligation — see `vericl-ir`'s `divmod_int` and the public `flatten_decode_scale` example (candidate #1 below) |
+| Array-value-dependent indices (offset tables / gather) | ≥5 | Needs element-range assumptions (e.g. quantified assumes) to be provable — not yet implemented |
 
 Notable non-findings: zero uses of `Tensor`, `Line`/`Vector`, `Slice`, `plane_*`, or `Atomic`;
 all dispatch is 1-D in-kernel. Earlier roadmap speculation about Tensor/2D support is
@@ -51,7 +51,9 @@ guard. Unreachable today (all users also hit other gates) but now banned explici
 ## Candidate public example kernels (clean-room, generic)
 
 1. `flatten_decode_scale` — `/`,`%` decode of `ABSOLUTE_POS` into (row, col) then an
-   axpy-shaped write; pins the div/mod prover boundary.
+   axpy-shaped write; pins the div/mod prover boundary. **[implemented, 2026-07]** —
+   `crates/vericl-examples/src/lib.rs`, wired into `vericl::suite!`; carries both a `tested`
+   (differential) and `proved` (2-obligation SMT bounds) claim in `evidence/vericl.json`.
 2. `gather_copy` — `output[i] = input[offsets[i]]` with element-range assumes; pins the
    value-dependent-index boundary.
 3. `block_sum_reduce` (aspirational) — minimal shared-memory tree reduction; the design target

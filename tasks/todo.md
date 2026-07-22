@@ -215,6 +215,14 @@ caught deterministically.
    ABSOLUTE_POS >= 1` turns this from `Proved` into `OutOfSubset`: the prover does not compose
    `&&`-joined branch conditions, only nested `if`s, individually, on its path-condition stack
    — now a `#[allow(clippy::collapsible_if)]` with that exact finding recorded in a comment).
+   [UPDATED 2026-07-22, see roadmap item 5 below: boolean condition composition is now modeled.
+   `fir3` has since moved to the `&&`-composed form (`taps > 1 && ABSOLUTE_POS >= 1`) as its
+   primary/public shape and still proves; the `#[allow(clippy::collapsible_if)]`/nested-if
+   workaround this paragraph describes was removed from the public example. The nested-if
+   shape's provability (a genuinely different code path in the prover — the SMT push/pop
+   path-condition stack, rather than an `Operator::And` term) remains independently pinned, now
+   as a `vericl-ir` unit test rather than a second public example:
+   `prover::tests::nested_if_guard_still_proves`.]
    `fir3_alt` (same shape, `taps = 1`) exists solely to show instantiate() changes
    `SOURCE_HASH`. `suite!` runs `axpy`/`fir3` unchanged alongside the pre-existing kernels — no
    suite-side change needed, proving the "monomorphize once, everything downstream just works"
@@ -303,10 +311,103 @@ caught deterministically.
    test` fails naming both `source_hash` and `ir_hash` → revert → passes) exercised end to end,
    and the float-without-`gen` compile rejection demonstrated in a standalone scratch crate.
    Standalone `vericl` CLI remains future work (see README CI story row).
-5. Next proved property: race-freedom via two-thread symbolic reduction (the sum_racy class
+5. [DONE 2026-07-22] Three prover-subset expansions (roadmap item 4's div/mod +
+   loop-carry refinement, plus a boolean-composition gap found while building `fir3` above),
+   sound-by-construction, plus the `flatten_decode_scale` public example kernel
+   (docs/dogfood-2026-07.md candidate #1) — Tier-2 table there annotated `[implemented]`.
+   All three land in `crates/vericl-ir/src/prover.rs`; see that file's module docs for the full
+   soundness argument behind each (this entry summarizes).
+
+   **IR findings** (docs/ir-research.md §3, validated empirically the same way as the original
+   IR-access research — extracting IR for small probe kernels, not read from source alone):
+   CubeCL 0.10 lowers `&&`/`||`/`!` to **eager** `Operator::And`/`Or(BinaryOperator)` and
+   `Operator::Not(UnaryOperator)` over already-evaluated `Bool` sub-expressions — *not* to
+   nested branches as speculated in the task brief. `/`/`%` lower to ordinary
+   `Arithmetic::Div`/`Modulo(BinaryOperator)`, no different in IR shape from `Add`/`Sub`/`Mul`.
+
+   **Boolean condition composition:** `And`/`Or`/`Not` modeled directly as SMT `and`/`or`/`not`
+   over recursively-resolved operands (`Prover::bool_binary`/`bool_unary`), plus `Bool` constants
+   in `constant_expr` (a natural companion, strictly sound). A tainted sub-condition taints the
+   whole composed condition, same discipline as everywhere else. `fir3` converted from a nested-
+   `if` workaround to the natural `&&` form (see the [UPDATED] note on roadmap item 2 above) and
+   still proves (4 obligations, unchanged). Tests: `prover::tests::{and,or,not}_guard_proves`
+   (positive) and `and_guard_insufficient_refutes`/`or_guard_insufficient_refutes` (negative — an
+   `&&`/`||` guard whose arms don't actually protect the access still `Refuted`, confirming
+   composition doesn't over-prove) plus `nested_if_guard_still_proves` (regression pinning the
+   *other* condition-composition shape, the path-condition stack, moved here from being
+   implicitly covered by `fir3`'s old shape).
+
+   **Div/mod-derived indices:** `Arithmetic::Div`/`Modulo` modeled with SMT-LIB `div`/`mod`
+   (Euclidean) — but only when a solver-discharged internal side-obligation (divisor nonzero,
+   both operands nonnegative, checked fresh via `Prover::try_discharge` under the *live* path
+   conditions, not inferred from the operands' declared unsigned types) actually proves;
+   otherwise the result is left tainted, never hard-errored (`Prover::divmod_int`). This
+   side-obligation is deliberately not counted in the public `obligations` total (it's an
+   internal modeling precondition, not a bounds check). z3 handles a symbolic (non-constant)
+   divisor fine in practice, including deriving `a == b*(div a b) + (mod a b)` from the theory's
+   own axioms — load-bearing for `flatten_decode_scale` below, which recombines a decoded index
+   and relies on the solver connecting it back to the original guard. Tests:
+   `prover::tests::div_guarded_proves`/`mod_guarded_proves` (positive),
+   `div_unguarded_divisor_is_out_of_subset` (negative/taint: divisor possibly zero → the
+   dependent index obligation fails as `OutOfSubset`, never `Proved`),
+   `div_index_unbounded_refutes` (negative/refute: a genuinely-unsafe decode where the divisor
+   guard discharges but nothing bounds the resulting index → `Refuted`, asserted to be
+   specifically the `y` write obligation).
+
+   **Loop-carry refinement:** replaces the old wholesale "reject any loop that reassigns a
+   variable bound outside it" with tainting exactly the reassigned (carried) variables — via the
+   same `memo`/taint machinery as any other unsupported construct — for the loop body's whole
+   walk (`Prover::carried_stack`, consulted by `bind_out`/`taint_out`) and, defensively, again
+   after the loop returns. Everything else in the loop, and every other loop, is still modeled
+   exactly as before. CAREFUL design point honored: the induction-variable handling and the
+   stepped-loop rejection (`rl.step.is_some()`) are untouched, run first, and are unaffected by
+   this refinement — reran `stepped_range_loop_is_out_of_subset` (`vericl-ir` and
+   `vericl-examples`) and `stepped_loop_cannot_vacuously_prove` (the exact vacuous-proof shape
+   from the earlier adversarial review) after the change: unchanged pass, obligation counts
+   unaffected. `scope_reassigns_any` (found the *first* carried variable, used only to reject)
+   replaced by `scope_reassigned_vars`/`collect_reassigned_vars` (collects the *whole* set, used
+   to taint). Tests: `prover::tests::loop_carried_accumulator_unused_as_index_proves` (positive —
+   the regression this refinement exists for: an accumulator whose index/branch expressions
+   never touch carried state now proves, 2 obligations) and
+   `loop_carried_accumulator_used_as_index_is_out_of_subset` (renamed/updated negative control —
+   an index literally derived from the carried accumulator is still never `Proved`; the reason
+   string changed from a wholesale "loop-carried" rejection to a use-site "write index... depends
+   on a construct outside the vericl v0 subset", since the loop itself is no longer rejected
+   outright).
+
+   **`flatten_decode_scale`** (`crates/vericl-examples/src/lib.rs`): 1-D dispatch, `row =
+   ABSOLUTE_POS / width`, `col = ABSOLUTE_POS % width` (a plain runtime `u32` parameter, not
+   `#[comptime]` — the modeling has to hold for a symbolic divisor), guarded write at the
+   *recombined* `row * width + col` scaled by a factor. Contract: `assumes(x.len() ==
+   y.len())`, `compare(abs = 1e-4)`, `gen(x in -100.0..=100.0, y in 0.0..=0.0, width in 1..=64,
+   scale in 0.1..=4.0)`. Wired into `vericl::suite!` alongside the other honest kernels — no
+   suite-side change needed beyond adding the name. Carries both a `tested` (differential,
+   wgpu, 7 sizes) and a `proved` (`smt-oob-freedom`, 2 obligations: the `x` read and the
+   recombined-index `y` write) claim in `evidence/vericl.json` — the milestone headline, per the
+   task brief. Twin-derivation guarded by `flatten_decode_scale_twin_matches_handwritten`
+   (independent row/col arithmetic, same pattern as `fir_handwritten`/`fmix32`) and
+   `_twin_respects_guard`.
+
+   Verification: full existing prover regression suite green, unchanged — 21/21 `vericl-ir` unit
+   tests (10 pre-existing, one renamed/updated in place for the loop-carry refinement + 11 new: 3
+   boolean-composition positive, 2 negative, 1 nested-if regression pin, 3 div positive/negative/
+   refute controls, 1 mod positive, 1 loop-carry positive) plus 23/23 `vericl-examples` lib tests
+   (19 pre-existing + 4 new
+   `flatten_decode_scale_*`); `cargo test --workspace` and `-p vericl-examples --features cpu`
+   both green; `cargo clippy --workspace --all-targets` zero warnings on both feature sets (one
+   `clippy::nonminimal_bool` fix needed on the deliberately-non-simplified `!` test guard);
+   `VERICL_UPDATE=1 cargo test` (default features) then plain `cargo test` green — fresh evidence
+   for all five honest kernels including `flatten_decode_scale`'s new `tested`+`proved` pair; a
+   `--features cpu` `VERICL_UPDATE=1` pass was run and verified green too, then the *default*
+   `VERICL_UPDATE=1` was run last (after it) to leave the committed evidence in the default
+   (non-cpu) shape, per the "run VERICL_UPDATE as the LAST thing you do" staleness-guard lesson
+   from the earlier adversarial review; `conform demo-defects` exits 0, output unchanged (neither
+   defect kernel touches `&&`/div/mod/loop-carry).
+6. Next proved property: race-freedom via two-thread symbolic reduction (the sum_racy class
    proved, not just differentially caught).
-6. Later: QF_BV wrapping model in the prover; fold cubecl version into Identity; upstream
-   conversation with tracel-ai; standalone `vericl check` CLI (README CI story row); prover
-   div/mod-index modeling (unblocks proving kernels like the private `synth_freqshift_cw`
-   validation above); kernel composition (roadmap item 3 per docs/dogfood-2026-07.md); a
-   `FLOAT_METHOD_CONST_ONLY` distinction if a dogfooded kernel needs a runtime `new`/`from_int`.
+7. Later: QF_BV wrapping model in the prover; fold cubecl version into Identity; upstream
+   conversation with tracel-ai; standalone `vericl check` CLI (README CI story row); kernel
+   composition (roadmap item 3 per docs/dogfood-2026-07.md); array-value-dependent indices
+   (offset tables / gather) via quantified assumes (docs/dogfood-2026-07.md Tier-2 gap #3,
+   still open); a `FLOAT_METHOD_CONST_ONLY` distinction if a dogfooded kernel needs a runtime
+   `new`/`from_int`.

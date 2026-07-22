@@ -192,9 +192,9 @@
     {
       "kernel": "fir3",
       "identity": {
-        "source_hash": "sha256:9dbb776f857e6ab8b11ec00a70f7d8fe32861bfc4ce98539828701c6646e46e3",
+        "source_hash": "sha256:23a1dcab2219c1455281324a45480444fb74443afa6c25474e09bda936214d24",
         "vericl_version": "0.1.0",
-        "ir_hash": "sha256:31368a579aead12dde5ad6985955fe6a0c6e62509e351ca270bdc907c38e886b"
+        "ir_hash": "sha256:a641c1f86a4a8f2c7dc688757593bac06156bd6b137f3da6e8c8ee0c59d940a8"
       },
       "contract": {
         "assumes": [
@@ -236,6 +236,67 @@
           "config": {
             "logic": "QF_LIA",
             "obligations": 4,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    },
+    {
+      "kernel": "flatten_decode_scale",
+      "identity": {
+        "source_hash": "sha256:b06d15bd4f8ca84aeb1f6482208bb464ed91be29625161f64e5b63ace54d5ef4",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:dd2d3a5eba13004c2c743b67849e5320f71f500231bc776f1ea5a35f9bb27c1f"
+      },
+      "contract": {
+        "assumes": [
+          "x.len() == y.len()"
+        ],
+        "compare": "f32 |e-a| <= 1e-4 + 0e0*|e|",
+        "wrapping": false,
+        "instantiate": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 2,
             "solver": "z3 Z3 version 4.16.0 - 64 bit"
           },
           "result": {

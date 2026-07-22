@@ -40,12 +40,21 @@ pub fn axpy<F: Float + CubeElement>(alpha: F, x: &Array<F>, y: &mut Array<F>) {
 /// headline case: a genuinely generic + comptime kernel that still lands a
 /// **proved** out-of-bounds-freedom claim (see
 /// `fir3_kernel_definition_is_provably_in_bounds` below), not just a
-/// differential one. Deliberately
-/// avoids a loop-carried accumulator (the dogfood survey's Tier-2 prover
-/// gap, docs/dogfood-2026-07.md) by fully guarding each of the (at most) two
-/// extra taps with its own `if` rather than a `for k in 0..taps` loop — the
-/// same "guard, don't loop-carry" shape as `axpy`/`sum_racy`'s bounds
-/// obligations, just with `taps` deciding how many guards are live.
+/// differential one. Deliberately avoids a loop-carried accumulator (the
+/// dogfood survey's Tier-2 prover gap, docs/dogfood-2026-07.md) by fully
+/// guarding each of the (at most) two extra taps with its own condition
+/// rather than a `for k in 0..taps` loop.
+///
+/// Guards are written as a single `&&`-composed condition (`taps > 1 &&
+/// ABSOLUTE_POS >= 1`) — the natural, idiomatic shape. This used to require
+/// two nested `if`s instead (see `crates/vericl-ir/src/prover.rs`'s
+/// `nested_if_guard_still_proves` test, which pins that the nested-if shape
+/// still proves too): the SMT bounds prover didn't model `&&`-composed
+/// branch conditions and reported `OutOfSubset` for them, confirmed
+/// empirically at the time by collapsing this exact kernel. Boolean
+/// condition composition (`Operator::And`/`Or`/`Not`, all eagerly evaluated
+/// by CubeCL rather than lowered to nested branches — see
+/// docs/ir-research.md §3) is now modeled, so the collapsed form proves.
 #[vericl::kernel(
     assumes(x.len() == y.len()),
     compare(abs = 1e-5),
@@ -56,25 +65,11 @@ pub fn axpy<F: Float + CubeElement>(alpha: F, x: &Array<F>, y: &mut Array<F>) {
 pub fn fir3<F: Float>(x: &Array<F>, y: &mut Array<F>, #[comptime] taps: u32) {
     if ABSOLUTE_POS < y.len() {
         let mut acc = x[ABSOLUTE_POS];
-        // Deliberately NOT collapsed to `if taps > 1 && ABSOLUTE_POS >= 1`
-        // (clippy::collapsible_if): the SMT bounds prover (vericl-ir) does
-        // not model `&&`-composed branch conditions and reports
-        // `OutOfSubset` for them (confirmed empirically — collapsing this
-        // exact kernel turns `fir3_kernel_definition_is_provably_in_bounds`
-        // from Proved into OutOfSubset), while it does track nested `if`
-        // conditions individually on its path-condition stack. Nesting is
-        // what keeps this kernel in the provable subset.
-        #[allow(clippy::collapsible_if)]
-        if taps > 1 {
-            if ABSOLUTE_POS >= 1 {
-                acc += x[ABSOLUTE_POS - 1];
-            }
+        if taps > 1 && ABSOLUTE_POS >= 1 {
+            acc += x[ABSOLUTE_POS - 1];
         }
-        #[allow(clippy::collapsible_if)]
-        if taps > 2 {
-            if ABSOLUTE_POS >= 2 {
-                acc += x[ABSOLUTE_POS - 2];
-            }
+        if taps > 2 && ABSOLUTE_POS >= 2 {
+            acc += x[ABSOLUTE_POS - 2];
         }
         y[ABSOLUTE_POS] = acc;
     }
@@ -84,7 +79,12 @@ pub fn fir3<F: Float>(x: &Array<F>, y: &mut Array<F>, #[comptime] taps: u32) {
 /// demonstrate that changing an `instantiate(...)` value changes kernel
 /// identity (`SOURCE_HASH`) — see
 /// `fir3_identity_changes_with_instantiate_value` below. Not part of the
-/// conformance suite.
+/// conformance suite. Deliberately kept on the *nested*-`if` guard shape
+/// (rather than following `fir3`'s move to `&&`) so the two kernels'
+/// source text differs only in the pinned `taps` value and this guard
+/// shape, not in both — the hash-differs test is about `instantiate(...)`
+/// specifically, and nested-`if` provability is independently pinned by
+/// `crates/vericl-ir/src/prover.rs`'s `nested_if_guard_still_proves`.
 #[vericl::kernel(
     assumes(x.len() == y.len()),
     compare(abs = 1e-5),
@@ -95,14 +95,6 @@ pub fn fir3<F: Float>(x: &Array<F>, y: &mut Array<F>, #[comptime] taps: u32) {
 pub fn fir3_alt<F: Float>(x: &Array<F>, y: &mut Array<F>, #[comptime] taps: u32) {
     if ABSOLUTE_POS < y.len() {
         let mut acc = x[ABSOLUTE_POS];
-        // Deliberately NOT collapsed to `if taps > 1 && ABSOLUTE_POS >= 1`
-        // (clippy::collapsible_if): the SMT bounds prover (vericl-ir) does
-        // not model `&&`-composed branch conditions and reports
-        // `OutOfSubset` for them (confirmed empirically — collapsing this
-        // exact kernel turns `fir3_kernel_definition_is_provably_in_bounds`
-        // from Proved into OutOfSubset), while it does track nested `if`
-        // conditions individually on its path-condition stack. Nesting is
-        // what keeps this kernel in the provable subset.
         #[allow(clippy::collapsible_if)]
         if taps > 1 {
             if ABSOLUTE_POS >= 1 {
@@ -158,6 +150,46 @@ pub fn mix_u32(x: &Array<u32>, y: &mut Array<u32>) {
         h *= 0xc2b2ae35u32;
         h ^= h >> 16u32;
         y[ABSOLUTE_POS] = h;
+    }
+}
+
+/// Flat 1-D `ABSOLUTE_POS` decoded into a `(row, col)` pair via `/`/`%`,
+/// recombined into a write index, and scaled — the milestone's div/mod
+/// headline (docs/dogfood-2026-07.md Tier-2 gap #2, candidate
+/// `flatten_decode_scale`): a clean-room stand-in for the dogfood survey's
+/// "flat 1-D → row/col decode" shape (7/22 kernels blocked on it), pinning
+/// the div/mod prover boundary with a genuine, publicly-committable
+/// example. `width` is a plain runtime `u32` parameter, not a `#[comptime]`
+/// constant — the div/mod modeling has to hold for a symbolic divisor, not
+/// just a literal.
+///
+/// The guard is a single `ABSOLUTE_POS < y.len()` (the same axpy-shaped
+/// bound as every other honest kernel here) plus `width >= 1u32`, which is
+/// what actually matters for the *proof*: it's exactly the fact
+/// `vericl-ir`'s div/mod side-obligation needs to discharge (divisor
+/// nonzero; both operands nonnegative comes for free — `ABSOLUTE_POS` and
+/// `width` are both unsigned leaves). The write index is the *recombined*
+/// `row * width + col`, not `ABSOLUTE_POS` directly — proving it in bounds
+/// requires the SMT solver to derive `row * width + col == ABSOLUTE_POS`
+/// from the SMT-LIB `div`/`mod` (Euclidean) axioms and combine that with
+/// the `ABSOLUTE_POS < y.len()` guard, which is the actual boundary this
+/// example pins (see `flatten_decode_scale_kernel_definition_is_provably_in_bounds`
+/// below). Euclidean division coincides with Rust's/WGSL's truncated
+/// semantics exactly when both operands are nonnegative (see
+/// `vericl-ir`'s module docs) — true here by construction, so the
+/// differential reference and the real kernel compute identically.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-4),
+    gen(x in -100.0..=100.0, y in 0.0..=0.0, width in 1..=64, scale in 0.1..=4.0)
+)]
+#[cube(launch)]
+pub fn flatten_decode_scale(x: &Array<f32>, y: &mut Array<f32>, width: u32, scale: f32) {
+    if ABSOLUTE_POS < y.len() && width >= 1u32 {
+        let w = width as usize;
+        let row = ABSOLUTE_POS / w;
+        let col = ABSOLUTE_POS % w;
+        y[row * w + col] = x[ABSOLUTE_POS] * scale;
     }
 }
 
@@ -556,11 +588,13 @@ mod tests {
 
     /// The milestone's headline result: `fir3` is genuinely generic
     /// (`F: Float`) *and* has a `#[comptime]` parameter, monomorphized via
-    /// `instantiate(F = f32, taps = 3)` — and its bounds obligations still
-    /// discharge as `Proved`, not merely `OutOfSubset`. Achieved by
+    /// `instantiate(F = f32, taps = 3)`, *and* uses `&&`-composed guards
+    /// (`taps > 1 && ABSOLUTE_POS >= 1`) — and its bounds obligations still
+    /// discharge as `Proved`, not merely `OutOfSubset`. Achieved by (a)
     /// avoiding a loop-carried accumulator (see the kernel's doc comment):
-    /// each extra tap is its own guarded `if`, the same shape the prover
-    /// already handles for `axpy`/`sum_racy`.
+    /// each extra tap is its own guarded condition, the same shape the
+    /// prover already handles for `axpy`/`sum_racy`; and (b) boolean
+    /// condition composition (`vericl-ir`'s `Operator::And` modeling).
     #[test]
     fn fir3_kernel_definition_is_provably_in_bounds() {
         let def = fir3_vericl::kernel_definition();
@@ -572,6 +606,76 @@ mod tests {
         match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
             // x[pos] read, y[pos] write, guarded x[pos-1]/x[pos-2] reads.
             vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 4),
+            other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // flatten_decode_scale: the div/mod prover-expansion milestone kernel.
+    // -----------------------------------------------------------------
+
+    /// The twin honors the guard: threads past `y.len()` write nothing.
+    #[test]
+    fn flatten_decode_scale_twin_respects_guard() {
+        let x = vec![1.0f32; 4];
+        let mut y = vec![9.0f32; 4];
+        flatten_decode_scale_vericl::reference(&x, &mut y, 2, 3.0, 256); // threads >> len
+        // pos 0: row=0,col=0 -> idx 0; pos 1: row=0,col=1 -> idx 1;
+        // pos 2: row=1,col=0 -> idx 2; pos 3: row=1,col=1 -> idx 3 (idx ==
+        // pos throughout, by construction of the row/col decode/recombine).
+        assert_eq!(y, vec![3.0, 3.0, 3.0, 3.0]);
+    }
+
+    /// Independently computes the same row/col decode + scale via plain
+    /// integer division/remainder (not derived from the kernel body), to
+    /// cross-check the macro-derived twin — same guard against a circular
+    /// derivation check as `fir_handwritten`/`fmix32` above.
+    #[test]
+    fn flatten_decode_scale_twin_matches_handwritten() {
+        let x: Vec<f32> = (0..12).map(|i| i as f32 - 5.0).collect();
+        let mut y = vec![0.0f32; x.len()];
+        let width = 4usize;
+        let scale = 2.5f32;
+        flatten_decode_scale_vericl::reference(&x, &mut y, width as u32, scale, x.len());
+        for (pos, (&xv, &yv)) in x.iter().zip(y.iter()).enumerate() {
+            let row = pos / width;
+            let col = pos % width;
+            let idx = row * width + col;
+            assert_eq!(idx, pos, "row/col recombine should be the identity at pos {pos}");
+            assert_eq!(yv, xv * scale, "index {pos}");
+        }
+    }
+
+    /// `assumes(x.len() == y.len())` is still the only structured assume —
+    /// `width`'s nonzero-ness is established by the kernel's own `width >=
+    /// 1u32` runtime guard (a path condition), not a declared assume; see
+    /// the kernel's doc comment.
+    #[test]
+    fn flatten_decode_scale_structured_assumes() {
+        assert_eq!(
+            flatten_decode_scale_vericl::contract().structured_assumes,
+            &[vericl::StructuredAssume::LenEq { a: "x", b: "y" }]
+        );
+    }
+
+    /// The div/mod milestone's headline result: the write index is the
+    /// *recombined* `row * width + col`, not a bare `ABSOLUTE_POS` — proving
+    /// it in bounds requires the SMT solver to derive `row * width + col ==
+    /// ABSOLUTE_POS` from the `div`/`mod` (Euclidean) axioms and combine
+    /// that with the `ABSOLUTE_POS < y.len()` guard. Before div/mod
+    /// modeling, `Arithmetic::Div`/`Modulo` tainted their output, `row`/
+    /// `col` were unbound, and this was `OutOfSubset` at the write index.
+    #[test]
+    fn flatten_decode_scale_kernel_definition_is_provably_in_bounds() {
+        let def = flatten_decode_scale_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = flatten_decode_scale_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            // x[pos] read, y[row*width+col] write.
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
             other => panic!("expected Proved, got {other:?}"),
         }
     }
