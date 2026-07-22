@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::contract::Compare;
+
 /// Result of comparing two output buffers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompareReport {
@@ -152,6 +154,38 @@ pub fn compare_exact_u32(expected: &[u32], actual: &[u32]) -> CompareReport {
         mismatches,
         max_ulp: None,
         worst,
+    }
+}
+
+/// Dispatch a declared [`Compare`] mode against an `f32` buffer pair. Used by
+/// the macro-generated `conformance_case` (one call per compared `&mut
+/// Array<f32>` parameter), which knows the element type at expansion time
+/// but not which `compare(...)` mode the author declared.
+///
+/// Panics if `compare` is [`Compare::Exact`] — that mode is for integer
+/// kernels; an f32 array needs `max_ulp` or `abs`/`rel`. This is a contract-
+/// authoring bug caught the first time the kernel's evidence is generated,
+/// not a runtime data problem.
+pub fn compare_f32_with(compare: Compare, expected: &[f32], actual: &[f32]) -> CompareReport {
+    match compare {
+        Compare::MaxUlpF32(max_ulp) => compare_f32(expected, actual, max_ulp),
+        Compare::AbsRelF32 { abs, rel } => compare_f32_absrel(expected, actual, abs, rel),
+        Compare::Exact => panic!(
+            "compare(exact) is for integer kernels; an f32 array needs `max_ulp = N` or \
+             `abs = X[, rel = Y]`"
+        ),
+    }
+}
+
+/// Dispatch a declared [`Compare`] mode against a `u32` buffer pair. See
+/// [`compare_f32_with`]; panics if `compare` is not [`Compare::Exact`].
+pub fn compare_u32_with(compare: Compare, expected: &[u32], actual: &[u32]) -> CompareReport {
+    match compare {
+        Compare::Exact => compare_exact_u32(expected, actual),
+        other => panic!(
+            "compare({}) is for float kernels; a u32 array only supports compare(exact)",
+            other.describe()
+        ),
     }
 }
 

@@ -21,7 +21,8 @@ use cubecl::prelude::*;
         x.iter().all(|v| v.abs() <= 100.0),
         y.iter().all(|v| v.abs() <= 100.0)
     ),
-    compare(abs = 1e-4)
+    compare(abs = 1e-4),
+    gen(alpha in -4.0..=4.0, x in -100.0..=100.0, y in -100.0..=100.0)
 )]
 #[cube(launch)]
 pub fn axpy(alpha: f32, x: &Array<f32>, y: &mut Array<f32>) {
@@ -77,7 +78,8 @@ pub fn mix_u32(x: &Array<u32>, y: &mut Array<u32>) {
 /// test can pass; the sequential reference panics deterministically.
 #[vericl::kernel(
     assumes(x.len() == y.len(), alpha.abs() <= 4.0),
-    compare(abs = 1e-4)
+    compare(abs = 1e-4),
+    gen(alpha in -4.0..=4.0, x in -100.0..=100.0, y in -100.0..=100.0)
 )]
 #[cube(launch)]
 pub fn axpy_off_by_one(alpha: f32, x: &Array<f32>, y: &mut Array<f32>) {
@@ -91,7 +93,8 @@ pub fn axpy_off_by_one(alpha: f32, x: &Array<f32>, y: &mut Array<f32>) {
 /// the GPU result is whatever the race leaves behind.
 #[vericl::kernel(
     assumes(y.len() == 1),
-    compare(max_ulp = 0)
+    compare(max_ulp = 0),
+    gen(x in 0.5..=1.5, y in 0.0..=0.0, len(y = 1))
 )]
 #[cube(launch)]
 pub fn sum_racy(x: &Array<f32>, y: &mut Array<f32>) {

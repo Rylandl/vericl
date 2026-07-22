@@ -18,14 +18,18 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::{Group, Ident, TokenStream as TokenStream2, TokenTree};
-use quote::{ToTokens, quote};
+use quote::{ToTokens, format_ident, quote};
 use sha2::{Digest, Sha256};
 use syn::fold::Fold;
+use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    BinOp, Expr, ExprBinary, FnArg, ItemFn, Meta, Pat, ReturnType, Token, Type, parse_macro_input,
+    BinOp, Expr, ExprBinary, ExprRange, FnArg, ItemFn, Meta, Pat, RangeLimits, ReturnType, Token,
+    Type, parse_macro_input,
 };
+
+mod suite;
 
 /// Constructs outside the v0 subset. Encountering any of these idents in a
 /// kernel body is a compile error: the reference twin cannot model them yet.
@@ -66,6 +70,53 @@ const BANNED_IDENTS: &[&str] = &[
 
 const BANNED_PREFIXES: &[&str] = &["plane_", "Atomic"];
 
+/// One entry inside a `gen(...)` contract clause: either a per-parameter
+/// generation range (`name in lo..=hi`, applied elementwise for arrays) or a
+/// length pin (`len(name = N)`) that fixes an array parameter's generated
+/// length to a constant instead of the differential case size `n`.
+enum GenEntry {
+    Range { name: Ident, lo: Expr, hi: Expr },
+    Len { name: Ident, value: Expr },
+}
+
+impl Parse for GenEntry {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let name: Ident = input.parse()?;
+        if name == "len" {
+            let content;
+            syn::parenthesized!(content in input);
+            let target: Ident = content.parse().map_err(|e| {
+                syn::Error::new(e.span(), format!("expected `len(name = N)`: {e}"))
+            })?;
+            content.parse::<Token![=]>()?;
+            let value: Expr = content.parse()?;
+            if !content.is_empty() {
+                return Err(content.error("len(name = N) expects exactly one `name = N` entry"));
+            }
+            return Ok(GenEntry::Len { name: target, value });
+        }
+        input.parse::<Token![in]>().map_err(|e| {
+            syn::Error::new(
+                e.span(),
+                format!("expected `{name} in lo..=hi` or `len({name} = N)`: {e}"),
+            )
+        })?;
+        let range: Expr = input.parse()?;
+        match range {
+            Expr::Range(ExprRange {
+                start: Some(lo),
+                end: Some(hi),
+                limits: RangeLimits::Closed(_),
+                ..
+            }) => Ok(GenEntry::Range { name, lo: *lo, hi: *hi }),
+            other => Err(syn::Error::new(
+                other.span(),
+                "gen(...) ranges must be inclusive with both ends given: `name in lo..=hi`",
+            )),
+        }
+    }
+}
+
 struct ContractSpec {
     assumes: Vec<Expr>,
     compare: TokenStream2,
@@ -73,6 +124,9 @@ struct ContractSpec {
     /// Whether the `wrapping` clause is declared, and the span to blame if
     /// the kernel turns out to be outside the subset it requires.
     wrapping: Option<proc_macro2::Span>,
+    /// `gen(...)` clause entries, in declared order (not necessarily
+    /// parameter order — see `resolve_gen_plan`).
+    gen_entries: Vec<GenEntry>,
 }
 
 fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
@@ -83,6 +137,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
     let mut compare = quote!(::vericl::Compare::Exact);
     let mut compare_desc = "exact".to_string();
     let mut wrapping = None;
+    let mut gen_entries: Vec<GenEntry> = Vec::new();
 
     for meta in metas {
         match &meta {
@@ -143,10 +198,24 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
             Meta::Path(p) if p.is_ident("wrapping") => {
                 wrapping = Some(p.span());
             }
+            Meta::List(list) if list.path.is_ident("gen") => {
+                let entries: Punctuated<GenEntry, Token![,]> = list
+                    .parse_args_with(Punctuated::parse_terminated)
+                    .map_err(|e| {
+                        syn::Error::new(
+                            list.span(),
+                            format!(
+                                "gen(...) expects `name in lo..=hi` range entries and/or \
+                                 `len(name = N)` length pins: {e}"
+                            ),
+                        )
+                    })?;
+                gen_entries.extend(entries);
+            }
             other => {
                 return Err(syn::Error::new(
                     other.span(),
-                    "expected `assumes(...)`, `compare(...)`, or `wrapping`",
+                    "expected `assumes(...)`, `compare(...)`, `gen(...)`, or `wrapping`",
                 ));
             }
         }
@@ -157,6 +226,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
         compare,
         compare_desc,
         wrapping,
+        gen_entries,
     })
 }
 
@@ -202,6 +272,37 @@ fn is_wrapping_integer_type(ty: &Type) -> bool {
     let Type::Path(tp) = ty else { return false };
     let Some(last) = tp.path.segments.last() else { return false };
     matches!(last.ident.to_string().as_str(), "u32" | "i32" | "u64" | "i64")
+}
+
+/// The scalar kinds `gen(...)` knows how to generate. v0 supports exactly
+/// the float type used by every example (`f32`) and the integer types the
+/// `wrapping` clause already recognizes (`u32`/`i32`/`u64`/`i64`) — matching
+/// this project's convention of rejecting an unsupported subset explicitly
+/// rather than silently approximating it. `f64` and other numeric types are
+/// out of scope for v0 because `vericl::rng::SplitMix64` has no `f64`
+/// generator to reuse honestly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumKind {
+    F32,
+    U32,
+    I32,
+    U64,
+    I64,
+}
+
+impl NumKind {
+    fn of(ty: &Type) -> Option<Self> {
+        let Type::Path(tp) = ty else { return None };
+        let last = tp.path.segments.last()?;
+        match last.ident.to_string().as_str() {
+            "f32" => Some(NumKind::F32),
+            "u32" => Some(NumKind::U32),
+            "i32" => Some(NumKind::I32),
+            "u64" => Some(NumKind::U64),
+            "i64" => Some(NumKind::I64),
+            _ => None,
+        }
+    }
 }
 
 /// Rewrites the reference twin's checked (panic-on-overflow-in-debug)
@@ -336,6 +437,16 @@ fn pretty(ts: &impl ToTokens) -> String {
         .replace("( ", "(")
         .replace(" )", ")")
         .replace(" ,", ",")
+}
+
+/// `vericl::suite! { runtime: ..., kernels: [...], evidence: "..." }` — see
+/// `suite::expand` for the full grammar and design rationale.
+#[proc_macro]
+pub fn suite(input: TokenStream) -> TokenStream {
+    match suite::expand(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }
 
 #[proc_macro_attribute]
@@ -542,6 +653,11 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         kd_call_args.push(quote!(#name));
     }
 
+    // --- conformance_case(): the macro-generated GPU launch/input-gen glue
+    // (README ergonomics milestone) — `generate_case` per the `gen(...)`
+    // clause, then run reference vs. GPU and compare every `&mut Array`.
+    let conformance_items = build_conformance_items(&params, &spec.gen_entries, fn_name, &fn_name_str)?;
+
     let doc = if wrapping {
         format!(
             "VeriCL-generated artifacts for kernel `{fn_name_str}` (compare: {compare_desc}, \
@@ -610,6 +726,8 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 #fn_name::expand(&mut __vericl_builder.scope, #(#kd_call_args),*);
                 __vericl_builder.build(::cubecl::prelude::KernelSettings::default())
             }
+
+            #conformance_items
         }
     })
 }
@@ -654,4 +772,415 @@ fn len_call_target(expr: &Expr, array_params: &[String]) -> Option<String> {
 fn int_literal(expr: &Expr) -> Option<u64> {
     let Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(li), .. }) = expr else { return None };
     li.base10_parse::<u64>().ok()
+}
+
+// ---------------------------------------------------------------------------
+// gen(...) / conformance_case(): macro-generated GPU launch and input-gen
+// glue, so per-kernel harnesses stop hand-writing it (README ergonomics
+// milestone). See `GenEntry` above for the `gen(...)` clause grammar.
+// ---------------------------------------------------------------------------
+
+/// One kernel parameter's resolved generation plan, built once from
+/// `params` + the `gen(...)` clause and reused for both `generate_case` and
+/// `conformance_case`.
+enum FieldRole {
+    Scalar,
+    ArrayRef,
+    ArrayMut,
+}
+
+struct GenField {
+    name: Ident,
+    /// The type `generate_case` returns this field as: `T` for a scalar,
+    /// `Vec<T>` for an array.
+    owned_ty: TokenStream2,
+    /// The `let #name = ...;` statement that draws this field from the RNG.
+    stmt: TokenStream2,
+    role: FieldRole,
+    /// Element type, for arrays only.
+    elem_ty: Option<Type>,
+    /// Element numeric kind, for arrays only (drives comparison dispatch).
+    elem_kind: Option<NumKind>,
+}
+
+/// `gen(...)` range entries by parameter name.
+type GenRanges = std::collections::HashMap<String, (Expr, Expr)>;
+/// `gen(...)` `len(...)` pins by parameter name.
+type GenLens = std::collections::HashMap<String, Expr>;
+
+/// Resolve the `gen(...)` clause into a lookup by parameter name, validating
+/// that every entry names a real parameter (and that `len(...)` only targets
+/// array parameters) before any codegen happens.
+fn resolve_gen_entries(
+    params: &[Param],
+    gen_entries: &[GenEntry],
+    fn_name_str: &str,
+) -> syn::Result<(GenRanges, GenLens)> {
+    let mut ranges: GenRanges = std::collections::HashMap::new();
+    let mut lens: GenLens = std::collections::HashMap::new();
+    for entry in gen_entries {
+        match entry {
+            GenEntry::Range { name, lo, hi } => {
+                let key = name.to_string();
+                if !params.iter().any(|p| p.name == *name) {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        format!(
+                            "gen(...) declares a range for `{key}`, but `{key}` is not a \
+                             parameter of `{fn_name_str}`"
+                        ),
+                    ));
+                }
+                if ranges.insert(key.clone(), (lo.clone(), hi.clone())).is_some() {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        format!("gen(...) declares more than one range for `{key}`"),
+                    ));
+                }
+            }
+            GenEntry::Len { name, value } => {
+                let key = name.to_string();
+                match params.iter().find(|p| p.name == *name) {
+                    None => {
+                        return Err(syn::Error::new(
+                            name.span(),
+                            format!(
+                                "gen(...) declares len(...) for `{key}`, but `{key}` is not a \
+                                 parameter of `{fn_name_str}`"
+                            ),
+                        ));
+                    }
+                    Some(p) if !matches!(p.kind, ParamKind::ArrayRef(_) | ParamKind::ArrayMut(_)) => {
+                        return Err(syn::Error::new(
+                            name.span(),
+                            format!(
+                                "gen(...) len(...) only applies to Array parameters; `{key}` is \
+                                 a scalar"
+                            ),
+                        ));
+                    }
+                    _ => {}
+                }
+                if lens.insert(key.clone(), value.clone()).is_some() {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        format!("gen(...) declares len(...) more than once for `{key}`"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok((ranges, lens))
+}
+
+/// The `let #name = ...;` statement drawing one integer field (scalar or,
+/// via `len`, an array element closure body) from `__vericl_rng`, either
+/// uniformly over `range` or full-range when no range is declared —
+/// integers need no explicit `gen(...)` range (unlike floats — see
+/// `build_conformance_items`).
+fn integer_draw_expr(ty: &TokenStream2, kind: NumKind, range: Option<&(Expr, Expr)>) -> TokenStream2 {
+    if let Some((lo, hi)) = range {
+        quote! {
+            {
+                let __lo: #ty = #lo;
+                let __hi: #ty = #hi;
+                let __span: i128 = (__hi as i128) - (__lo as i128) + 1;
+                (__lo as i128 + (__vericl_rng.next_u64() as i128).rem_euclid(__span)) as #ty
+            }
+        }
+    } else {
+        match kind {
+            NumKind::U32 => quote!(__vericl_rng.next_u32() as #ty),
+            NumKind::I32 => quote!(__vericl_rng.next_u32() as #ty),
+            NumKind::U64 => quote!(__vericl_rng.next_u64() as #ty),
+            NumKind::I64 => quote!(__vericl_rng.next_u64() as #ty),
+            NumKind::F32 => unreachable!("floats never reach integer_draw_expr"),
+        }
+    }
+}
+
+/// Build one parameter's [`GenField`]: its owned type, its `generate_case`
+/// draw statement, and (for arrays) its element type/kind for later
+/// `conformance_case` codegen.
+fn build_gen_field(
+    p: &Param,
+    ranges: &GenRanges,
+    lens: &GenLens,
+    fn_name_str: &str,
+) -> syn::Result<GenField> {
+    let name = p.name.clone();
+    let name_str = name.to_string();
+    match &p.kind {
+        ParamKind::Scalar(ty) => {
+            let Some(kind) = NumKind::of(ty) else {
+                return Err(syn::Error::new(
+                    ty.span(),
+                    format!(
+                        "gen(...) v0 only supports f32/u32/i32/u64/i64 scalar parameters; \
+                         `{name_str}: {}` is outside that set",
+                        ty.to_token_stream()
+                    ),
+                ));
+            };
+            let range = ranges.get(&name_str);
+            let stmt = if kind == NumKind::F32 {
+                let (lo, hi) = range.ok_or_else(|| {
+                    syn::Error::new(
+                        ty.span(),
+                        format!(
+                            "kernel `{fn_name_str}`: parameter `{name_str}` is a float with no \
+                             declared gen(...) range — declare `gen({name_str} in lo..=hi)`; \
+                             unbounded float generation produces NaN/inf-adjacent garbage and \
+                             un-provable tolerances"
+                        ),
+                    )
+                })?;
+                quote!(let #name: #ty = __vericl_rng.next_f32_range((#lo) as f32, (#hi) as f32);)
+            } else {
+                let draw = integer_draw_expr(&quote!(#ty), kind, range);
+                quote!(let #name: #ty = #draw;)
+            };
+            Ok(GenField { name, owned_ty: quote!(#ty), stmt, role: FieldRole::Scalar, elem_ty: None, elem_kind: None })
+        }
+        ParamKind::ArrayRef(elem) | ParamKind::ArrayMut(elem) => {
+            let Some(kind) = NumKind::of(elem) else {
+                return Err(syn::Error::new(
+                    elem.span(),
+                    format!(
+                        "gen(...) v0 only supports f32/u32/i32/u64/i64 array elements; \
+                         `{name_str}: Array<{}>` is outside that set",
+                        elem.to_token_stream()
+                    ),
+                ));
+            };
+            let range = ranges.get(&name_str);
+            let len_tokens = match lens.get(&name_str) {
+                Some(e) => quote!((#e) as usize),
+                None => quote!(n),
+            };
+            let stmt = if kind == NumKind::F32 {
+                let (lo, hi) = range.ok_or_else(|| {
+                    syn::Error::new(
+                        elem.span(),
+                        format!(
+                            "kernel `{fn_name_str}`: parameter `{name_str}` is a float array \
+                             with no declared gen(...) range — declare `gen({name_str} in \
+                             lo..=hi)`; unbounded float generation produces NaN/inf-adjacent \
+                             garbage and un-provable tolerances"
+                        ),
+                    )
+                })?;
+                quote! {
+                    let #name: ::std::vec::Vec<#elem> =
+                        __vericl_rng.fill_f32(#len_tokens, (#lo) as f32, (#hi) as f32);
+                }
+            } else {
+                let draw = integer_draw_expr(&quote!(#elem), kind, range);
+                quote! {
+                    let #name: ::std::vec::Vec<#elem> =
+                        (0..#len_tokens).map(|_| #draw).collect();
+                }
+            };
+            let role = if matches!(p.kind, ParamKind::ArrayMut(_)) { FieldRole::ArrayMut } else { FieldRole::ArrayRef };
+            Ok(GenField { name, owned_ty: quote!(::std::vec::Vec<#elem>), stmt, role, elem_ty: Some(elem.clone()), elem_kind: Some(kind) })
+        }
+    }
+}
+
+/// Build the macro-generated `generate_case` and `conformance_case` items
+/// for one kernel's `<name>_vericl` module (README ergonomics milestone:
+/// `#[vericl::kernel]` already knows every signature, so the harness no
+/// longer hand-writes GPU launch/input-gen glue per kernel).
+fn build_conformance_items(
+    params: &[Param],
+    gen_entries: &[GenEntry],
+    fn_name: &Ident,
+    fn_name_str: &str,
+) -> syn::Result<TokenStream2> {
+    let (ranges, lens) = resolve_gen_entries(params, gen_entries, fn_name_str)?;
+    let fields: Vec<GenField> = params
+        .iter()
+        .map(|p| build_gen_field(p, &ranges, &lens, fn_name_str))
+        .collect::<syn::Result<_>>()?;
+
+    let gen_stmts: Vec<&TokenStream2> = fields.iter().map(|f| &f.stmt).collect();
+    let owned_tys: Vec<&TokenStream2> = fields.iter().map(|f| &f.owned_ty).collect();
+    let field_names: Vec<&Ident> = fields.iter().map(|f| &f.name).collect();
+    let check_args: Vec<TokenStream2> = fields
+        .iter()
+        .map(|f| {
+            let name = &f.name;
+            match f.role {
+                FieldRole::Scalar => quote!(#name),
+                FieldRole::ArrayRef | FieldRole::ArrayMut => quote!(&#name),
+            }
+        })
+        .collect();
+
+    let generate_case_fn = quote! {
+        /// Generate one differential case's inputs deterministically from
+        /// `(n, seed)`, in kernel-parameter declaration order (not
+        /// `gen(...)` clause order) — see the `gen(...)` contract clause.
+        /// Resamples up to 64 times if `check_assumes` rejects the draw,
+        /// then panics naming the kernel: a persistent rejection means the
+        /// declared `gen(...)` ranges are inconsistent with the kernel's
+        /// own `assumes(...)` clauses, an authoring bug to fix rather than
+        /// a runtime condition to recover from.
+        fn generate_case(n: usize, seed: u64) -> ( #(#owned_tys,)* ) {
+            let mut __vericl_rng = ::vericl::SplitMix64::new(seed);
+            for _vericl_attempt in 0..64u32 {
+                #(#gen_stmts)*
+                if check_assumes(#(#check_args),*) {
+                    return ( #(#field_names,)* );
+                }
+            }
+            panic!(
+                "kernel `{}`: gen(...) could not produce inputs satisfying assumes(...) after \
+                 64 resample attempts — the declared gen(...) ranges are inconsistent with this \
+                 kernel's assumes(...) clauses",
+                #fn_name_str,
+            );
+        }
+    };
+
+    // --- conformance_case(): reference vs. GPU, per array parameter.
+    let mut ref_clone_stmts: Vec<TokenStream2> = Vec::new();
+    let mut reference_args: Vec<TokenStream2> = Vec::new();
+    let mut gpu_upload_stmts: Vec<TokenStream2> = Vec::new();
+    let mut launch_args: Vec<TokenStream2> = Vec::new();
+    let mut gpu_readback_stmts: Vec<TokenStream2> = Vec::new();
+    let mut compare_stmts: Vec<TokenStream2> = Vec::new();
+
+    for f in &fields {
+        let name = &f.name;
+        match f.role {
+            FieldRole::Scalar => {
+                reference_args.push(quote!(#name));
+                launch_args.push(quote!(#name));
+            }
+            FieldRole::ArrayRef => {
+                let elem = f.elem_ty.as_ref().expect("array field has elem_ty");
+                let handle = format_ident!("__vericl_{}_handle", name);
+                reference_args.push(quote!(&#name));
+                gpu_upload_stmts.push(quote! {
+                    let #handle = client.create_from_slice(
+                        <#elem as ::cubecl::prelude::CubeElement>::as_bytes(&#name),
+                    );
+                });
+                launch_args.push(quote! {
+                    unsafe { ::cubecl::prelude::ArrayArg::from_raw_parts(#handle, #name.len()) }
+                });
+            }
+            FieldRole::ArrayMut => {
+                let elem = f.elem_ty.as_ref().expect("array field has elem_ty");
+                let elem_kind = f.elem_kind.expect("array field has elem_kind");
+                let ref_name = format_ident!("__vericl_{}_ref", name);
+                let handle = format_ident!("__vericl_{}_handle", name);
+                let gpu_name = format_ident!("__vericl_{}_gpu", name);
+
+                ref_clone_stmts.push(quote! {
+                    let mut #ref_name: ::std::vec::Vec<#elem> = #name.clone();
+                });
+                reference_args.push(quote!(&mut #ref_name));
+                gpu_upload_stmts.push(quote! {
+                    let #handle = client.create_from_slice(
+                        <#elem as ::cubecl::prelude::CubeElement>::as_bytes(&#name),
+                    );
+                });
+                launch_args.push(quote! {
+                    unsafe {
+                        ::cubecl::prelude::ArrayArg::from_raw_parts(#handle.clone(), #name.len())
+                    }
+                });
+                gpu_readback_stmts.push(quote! {
+                    let #gpu_name: ::std::vec::Vec<#elem> =
+                        <#elem as ::cubecl::prelude::CubeElement>::from_bytes(
+                            &client.read_one(#handle).unwrap(),
+                        )
+                        .to_vec();
+                });
+
+                let compare_call = match elem_kind {
+                    NumKind::F32 => quote!(::vericl::compare_f32_with(contract().compare, &#ref_name, &#gpu_name)),
+                    NumKind::U32 => quote!(::vericl::compare_u32_with(contract().compare, &#ref_name, &#gpu_name)),
+                    NumKind::I32 | NumKind::U64 | NumKind::I64 => {
+                        return Err(syn::Error::new(
+                            elem.span(),
+                            format!(
+                                "conformance_case v0 only supports comparing f32 or u32 `&mut \
+                                 Array` elements; `{name}: &mut Array<{}>` is outside that set",
+                                elem.to_token_stream()
+                            ),
+                        ));
+                    }
+                };
+                let name_str = name.to_string();
+                compare_stmts.push(quote! {
+                    __vericl_reports.push((#name_str.to_string(), #compare_call));
+                });
+            }
+        }
+    }
+
+    let conformance_case_fn = quote! {
+        /// Run one differential case: generate inputs via `gen(...)`, run
+        /// the sequential reference (catching a panic as a finding, not a
+        /// harness crash), launch the real kernel with standard 1D dispatch
+        /// (`CubeCount = ceil(n/cube_dim)`, `num_threads = count*cube_dim`),
+        /// and compare every `&mut Array` parameter's final contents
+        /// against the reference's — the single point of custody for the
+        /// GPU launch/input-gen glue every kernel previously hand-wrote.
+        pub fn conformance_case<R: ::cubecl::prelude::Runtime>(
+            client: &::cubecl::prelude::ComputeClient<R>,
+            n: usize,
+            seed: u64,
+            cube_dim: u32,
+        ) -> ::vericl::CaseOutcome {
+            let ( #(#field_names,)* ) = generate_case(n, seed);
+
+            #(#ref_clone_stmts)*
+
+            let __vericl_count = (n as u32).div_ceil(cube_dim).max(1);
+            let __vericl_cube_count = ::cubecl::prelude::CubeCount::Static(__vericl_count, 1, 1);
+            let __vericl_cube_dim = ::cubecl::prelude::CubeDim::new_1d(cube_dim);
+            let __vericl_num_threads = (__vericl_count * cube_dim) as usize;
+
+            let __vericl_ref_outcome = ::vericl::catch_reference_panic(|| {
+                reference(#(#reference_args,)* __vericl_num_threads);
+            });
+
+            match __vericl_ref_outcome {
+                Err(__vericl_panic_msg) => ::vericl::CaseOutcome {
+                    case: format!("n={n}"),
+                    reports: ::std::vec::Vec::new(),
+                    reference_panic: Some(__vericl_panic_msg),
+                },
+                Ok(()) => {
+                    #(#gpu_upload_stmts)*
+                    #fn_name::launch::<R>(
+                        client,
+                        __vericl_cube_count,
+                        __vericl_cube_dim,
+                        #(#launch_args,)*
+                    );
+                    #(#gpu_readback_stmts)*
+
+                    let mut __vericl_reports: ::std::vec::Vec<(::std::string::String, ::vericl::CompareReport)> =
+                        ::std::vec::Vec::new();
+                    #(#compare_stmts)*
+
+                    ::vericl::CaseOutcome {
+                        case: format!("n={n}"),
+                        reports: __vericl_reports,
+                        reference_panic: None,
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(quote! {
+        #generate_case_fn
+        #conformance_case_fn
+    })
 }

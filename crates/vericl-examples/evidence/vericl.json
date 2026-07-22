@@ -4,7 +4,7 @@
     {
       "kernel": "axpy",
       "identity": {
-        "source_hash": "sha256:18ef02264fcf1aeb141551f6db582fa12db584e855e5fa4e03b8eadd23262af8",
+        "source_hash": "sha256:2db7ace93f8609d038374fb0ebcfb8338f6bfe0a96f6c9ebba51bb42866d558d",
         "vericl_version": "0.1.0",
         "ir_hash": "sha256:3ae1a32f63226aac7b8cb2d19851e3bcad00626ac98b5116131e91f48772e722"
       },
@@ -57,7 +57,7 @@
       "trusted": [
         "rustc codegen of the reference twin",
         "vericl-macros source-to-reference derivation",
-        "wgpu buffer upload/readback integrity",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
         "GPU hardware",
         "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
         "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
@@ -117,7 +117,7 @@
       "trusted": [
         "rustc codegen of the reference twin",
         "vericl-macros source-to-reference derivation",
-        "wgpu buffer upload/readback integrity",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
         "GPU hardware",
         "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
         "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
@@ -177,7 +177,7 @@
       "trusted": [
         "rustc codegen of the reference twin",
         "vericl-macros source-to-reference derivation",
-        "wgpu buffer upload/readback integrity",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
         "GPU hardware",
         "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
         "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",

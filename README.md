@@ -42,7 +42,7 @@ instead of accumulated.
 | First machine-checked property | Out-of-bounds freedom for a supported kernel subset, discharged by an SMT solver over the CubeCL IR |
 | Numerical stance (v1) | Exact comparison for integer kernels; floating-point kernels declare a per-kernel tolerance that is recorded as an assumption in the evidence |
 | Evidence format | A manifest binding every result to the kernel identity it was produced from; both human- and machine-readable |
-| CI story | A `vericl check` command that fails on missing, stale, or mismatched evidence |
+| CI story | Conformance runs under plain `cargo test` (`vericl::suite!` generates the test); `VERICL_UPDATE=1 cargo test` regenerates evidence. A standalone `vericl check` CLI is future work — the `cargo test` path fully covers "fails on missing, stale, or mismatched evidence" for v0 |
 
 ### Why CubeCL
 
@@ -68,7 +68,8 @@ health check rather than a surprise.
         x.iter().all(|v| v.abs() <= 100.0),
         y.iter().all(|v| v.abs() <= 100.0)
     ),
-    compare(abs = 1e-4)
+    compare(abs = 1e-4),
+    gen(alpha in -4.0..=4.0, x in -100.0..=100.0, y in -100.0..=100.0)
 )]
 #[cube(launch)]
 pub fn axpy(alpha: f32, x: &Array<f32>, y: &mut Array<f32>) {
@@ -81,9 +82,50 @@ pub fn axpy(alpha: f32, x: &Array<f32>, y: &mut Array<f32>) {
 From this single definition VeriCL derives, in a generated `axpy_vericl` module: the untouched
 CubeCL kernel; a sequential scalar `reference` twin (`ABSOLUTE_POS` becomes a loop variable,
 `&Array<T>` becomes `&[T]`) sharing no CubeCL machinery; the `assumes` clauses as an executable
-`check_assumes` predicate; and a `SOURCE_HASH` identity that evidence binds to. Kernels using
-constructs the twin cannot model (`UNIT_POS`, `SharedMemory`, `plane_*`, `comptime`, vectors,
-`return`) are rejected at compile time rather than silently approximated.
+`check_assumes` predicate; a `SOURCE_HASH` identity that evidence binds to; and — from the
+`gen(...)` clause — a `conformance_case` function that generates inputs, runs the reference and
+the real kernel, and compares them, so no kernel needs hand-written GPU launch/input-gen glue.
+Kernels using constructs the twin cannot model (`UNIT_POS`, `SharedMemory`, `plane_*`, `comptime`,
+vectors, `return`) are rejected at compile time rather than silently approximated.
+
+### The `gen(...)` clause: ergonomic by being explicit
+
+`gen(...)` declares, per parameter, how `conformance_case` draws inputs: `name in lo..=hi` for a
+scalar or (applied elementwise) an array, and an optional `len(name = N)` to pin an array's
+generated length to a constant instead of the case size — needed by kernels like `sum_racy`, whose
+`assumes(y.len() == 1)` requires `gen(..., len(y = 1))`. Integer parameters left out of `gen(...)`
+default to full-range generation; **float parameters with no declared range are a compile error**,
+not a silent default. This is a deliberate ergonomic decision: an unbounded float draw produces
+NaN/inf-adjacent garbage and tolerances no `compare(abs = ...)` can honestly justify, and the
+failure is far more useful caught at authoring time (`error: parameter alpha is a float with no
+declared gen(...) range`) than surfacing later as a confusing NaN mismatch or an unprovable
+tolerance at run time. Generated inputs are drawn from vericl's `SplitMix64` in kernel-parameter
+declaration order (not `gen(...)` clause order) for determinism, then checked against
+`check_assumes(...)`; a rejected draw resamples (same RNG stream) up to 64 times before erroring
+with the kernel name, so a persistent failure means the declared ranges are inconsistent with the
+kernel's own `assumes(...)`, not a runtime fluke.
+
+### Suites: `vericl::suite!`
+
+```rust
+vericl::suite! {
+    runtime: cubecl::wgpu::WgpuRuntime,
+    kernels: [axpy, xorshift_step, mix_u32],
+    evidence: "evidence/vericl.json",
+}
+```
+
+Expands to `#[test] fn vericl_conformance()`: builds the client, runs every listed kernel's
+`conformance_case` across the declared sizes, discharges the SMT bounds proof via `vericl-ir`
+(`prove: false` omits proved claims instead of ever recording a fake or skipped one), and
+assembles the evidence manifest. With `VERICL_UPDATE` set (any value), it writes the manifest;
+otherwise it loads what's on disk, calls `vericl::verify`, and panics with the problem list on any
+mismatch — so `cargo test` is the whole CI story. The evidence path is relative to
+`CARGO_MANIFEST_DIR`. An optional `extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime)`
+folds an additional differential lane (sharing CubeCL's front end, so recorded as *not
+independent* — only the macro-derived sequential twin is) into the same test, appending claims to
+the same entries before the manifest is finalized, so one suite invocation always produces exactly
+one manifest.
 
 ### A first finding: why `compare(abs = ...)` exists
 

@@ -89,7 +89,10 @@ Working toward the four first-release outcomes in README.md.
       the harness sets it after computing it via vericl-ir, so `verify()`'s existing whole-`Identity`
       comparison now catches IR-level drift (e.g. a CubeCL-upgrade codegen change with no source
       diff) in addition to source-level drift, with both hashes reported on mismatch.
-- [ ] Standalone `vericl check` CLI; absorb per-kernel GPU glue into generated code
+- [x] Absorb per-kernel GPU glue into generated code — DONE, see "Roadmap" item 3 below for the
+      full writeup (`gen(...)` clause, `conformance_case`, `vericl::suite!`). Standalone
+      `vericl check` CLI remains not done (superseded by the `cargo test` CI story — see README
+      CI story row and Roadmap item 5).
 - [x] Adversarial soundness review of the SMT bounds prover — DONE. One CRITICAL confirmed bug:
       `process_range_loop` (crates/vericl-ir/src/prover.rs) never read `rl.step`, so a
       `range_stepped` (CubeCL stepped-range) loop — including a genuinely descending loop where
@@ -150,9 +153,63 @@ caught deterministically.
    implementations are never committed to this open-source repo (see README "Relationship to
    Substrate"). Run them from a local uncommitted crate; feed back only generic findings
    (subset gaps, new contract clauses) and independently re-derived example kernels.
-2. CI: GitHub Actions with `conform check` required (macOS runners have Metal — both lanes).
-3. Ergonomics: absorb per-kernel GPU launch glue into the macro; standalone `vericl` CLI.
+2. CI: GitHub Actions with `cargo test --workspace` required (macOS runners have Metal — both
+   lanes via `--features cpu`). Superseded the earlier `conform check` plan now that conformance
+   runs under `cargo test` (see item 3).
+3. [x] Ergonomics: absorb per-kernel GPU launch glue into the macro — DONE. `#[vericl::kernel]`
+   gained a `gen(...)` contract clause (`name in lo..=hi` per parameter, elementwise for arrays;
+   optional `len(name = N)` to pin an array's generated length instead of the case size — needed
+   by `sum_racy`'s `assumes(y.len() == 1)`) and now generates `<name>_vericl::conformance_case`,
+   which draws inputs via vericl's `SplitMix64` (declaration order, deterministic, resampling up
+   to 64 times against `check_assumes` before erroring), runs the reference and the real kernel
+   with standard 1D dispatch, and compares every `&mut Array` param against the reference
+   (reporting the param name on mismatch). Deliberate ergonomic decision: a float parameter with
+   no declared `gen(...)` range is a **compile-time error**, not a silent unbounded default —
+   unbounded float generation produces NaN/inf-adjacent garbage and tolerances no
+   `compare(abs = ...)` can honestly justify, and that's far more useful caught at authoring time
+   than as a confusing runtime NaN mismatch. New `vericl::suite!` (proc-macro in `vericl-macros` —
+   chosen over `macro_rules!` in core because the DSL's several optional, order-independent,
+   defaulted fields need real parsing with error spans, which is exactly what `parse_contract`
+   already does for the kernel attribute; `vericl-macros` still never depends on `cubecl` itself,
+   it only emits tokens that reference `::cubecl::`/`::vericl_ir::` paths at the call site, same as
+   `kernel_definition()` already did) expands to a `#[test] fn vericl_conformance()`: runs every
+   listed kernel's `conformance_case` across the declared sizes, discharges the SMT bounds proof
+   when `prove` is enabled (default; missing z3 is now an actionable compile-time-style panic
+   naming the `brew`/`apt` install command, not a silent skip), and assembles evidence exactly in
+   the existing schema — `VERICL_UPDATE` set writes it, otherwise it verifies against what's on
+   disk and panics with the problem list, so `cargo test` is the whole CI story. Multi-lane
+   (`--features cpu`) is an optional `extra_lane: (cfg(...), RuntimePath)` DSL field folded into
+   the *same* test via `#[cfg(...)]` on a block, rather than a second hand-written `#[test]` —
+   two independent tests sharing one evidence file would race under `cargo test`'s unordered
+   execution and try to write two different claim shapes to the same manifest. `evidence/vericl.json`
+   moved from the workspace root to `crates/vericl-examples/evidence/vericl.json`
+   (`CARGO_MANIFEST_DIR`-relative, the idiomatic cargo convention, instead of a hand-counted
+   `../../` from the harness binary). `vericl` core gained `catch_reference_panic` (the
+   panic-hook-silencing helper, moved out of `conform.rs`), `describe_case_outcome` +
+   `CaseOutcome::pass` (`CaseOutcome.report: Option<CompareReport>` became
+   `reports: Vec<(String, CompareReport)>` — one entry per compared `&mut Array` param, so a
+   multi-output kernel's mismatch names the offending param), `compare_f32_with`/`compare_u32_with`
+   (dispatch a declared `Compare` against a known element type), `differential_config`/
+   `proved_config` (claim `config` JSON, shared instead of duplicated), and the `trust` module
+   (`reference_twin_trust`, `backend_buffer_trust`, `GPU_HARDWARE_TRUST`, `proved_bounds_trust`,
+   `shared_frontend_lane_trust` — the wording `conform.rs` used to hand-duplicate). `verify()`
+   gained a downgrade check: a stored `Proved` claim with no matching claim in the current build
+   (e.g. `prove: false`, or z3 going missing) is now a reported problem, not a silent pass — with
+   regression tests `dropped_proved_claim_is_a_downgrade` /
+   `retained_proved_claim_is_not_a_downgrade`. `conform.rs` shrank to demo-defects mode only (729
+   → 149 lines), reusing `conformance_case` for the defect kernels too; `tests/conformance.rs`
+   (new, 22 lines) replaces the old `update`/`check` machinery — 729 lines of hand-written
+   per-kernel harness in the examples crate became 171, and that 171 no longer grows per kernel
+   (adding a 4th honest kernel to the suite is one name in `kernels: [...]`, not a new ~100-line
+   `run_*` function). Verification: `cargo test --workspace` green without `VERICL_UPDATE` (fresh
+   evidence committed), `--features cpu` variant green (evidence gains the cpu-lane claims only
+   when the feature + `VERICL_UPDATE` produce it; the default evidence shape is unchanged),
+   `cargo clippy --workspace --all-targets` zero warnings on both feature sets, `conform`
+   demo-defects still exits 0, the stale-evidence negative test (mutate `axpy`'s guard → `cargo
+   test` fails naming both `source_hash` and `ir_hash` → revert → passes) exercised end to end,
+   and the float-without-`gen` compile rejection demonstrated in a standalone scratch crate.
+   Standalone `vericl` CLI remains future work (see README CI story row).
 4. Next proved property: race-freedom via two-thread symbolic reduction (the sum_racy class
    proved, not just differentially caught).
 5. Later: QF_BV wrapping model in the prover; fold cubecl version into Identity; upstream
-   conversation with tracel-ai.
+   conversation with tracel-ai; standalone `vericl check` CLI (README CI story row).
