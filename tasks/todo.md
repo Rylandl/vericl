@@ -153,9 +153,10 @@ caught deterministically.
    implementations are never committed to this open-source repo (see README "Relationship to
    Substrate"). Run them from a local uncommitted crate; feed back only generic findings
    (subset gaps, new contract clauses) and independently re-derived example kernels.
-2. CI: GitHub Actions with `cargo test --workspace` required (macOS runners have Metal — both
-   lanes via `--features cpu`). Superseded the earlier `conform check` plan now that conformance
-   runs under `cargo test` (see item 3).
+2. CI: DEFERRED per Ryland (2026-07-22) — no GitHub Actions or remote execution for now;
+   everything stays local. The CI story is `cargo test --workspace` (+ `--features cpu`) run
+   locally. A workflow existed briefly and was removed in ff675ec (recoverable from e869646);
+   do not re-add remote CI without an explicit ask.
 3. [x] Ergonomics: absorb per-kernel GPU launch glue into the macro — DONE. `#[vericl::kernel]`
    gained a `gen(...)` contract clause (`name in lo..=hi` per parameter, elementwise for arrays;
    optional `len(name = N)` to pin an array's generated length instead of the case size — needed
