@@ -66,6 +66,10 @@ const BANNED_IDENTS: &[&str] = &[
     "Slice",
     // early exit changes meaning between per-thread and sequential execution
     "return",
+    // terminate!() is a per-lane early exit; outside #[cube] it expands to an
+    // empty block, so a derived twin would silently fall through the guard
+    // instead of ending the lane (latent soundness gap found in dogfooding).
+    "terminate",
 ];
 
 const BANNED_PREFIXES: &[&str] = &["plane_", "Atomic"];

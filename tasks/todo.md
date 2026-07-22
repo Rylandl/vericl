@@ -149,10 +149,12 @@ caught deterministically.
 
 ## Roadmap (agreed 2026-07-22)
 
-1. Dogfood with real Substrate kernels — PRIVATELY ONLY. Proprietary Substrate kernel
-   implementations are never committed to this open-source repo (see README "Relationship to
-   Substrate"). Run them from a local uncommitted crate; feed back only generic findings
-   (subset gaps, new contract clauses) and independently re-derived example kernels.
+1. [DONE 2026-07-22] Dogfooded privately against 22 production kernels — full findings in
+   docs/dogfood-2026-07.md. Headline: generics block 20/22, composition 16/22, comptime 15/22;
+   Tensor/2D speculation withdrawn (zero uses); wrapping clause independently validated by a
+   real kernel; terminate!() latent soundness gap found and banned. Roadmap below reordered
+   accordingly — new order: instantiate() clause (generics+comptime), composition, prover
+   div/mod + loop-carry refinement, shared-memory reductions last.
 2. CI: DEFERRED per Ryland (2026-07-22) — no GitHub Actions or remote execution for now;
    everything stays local. The CI story is `cargo test --workspace` (+ `--features cpu`) run
    locally. A workflow existed briefly and was removed in ff675ec (recoverable from e869646);
