@@ -1056,3 +1056,83 @@ caught deterministically.
     per positive; obligation counts for existing suite kernels unchanged; full suite (both feature
     sets) + clippy (both) + demo-defects green; `VERICL_UPDATE` run LAST (only `gather_copy` added
     an evidence entry).
+
+13. [DONE 2026-07-23] Adversarial soundness review round 4 (element-range assume recognizer) —
+    DONE. **Verdict: exactly one CONFIRMED defect** — a recognizer-level false-`Proved` in the
+    element-range `assumes(...)` shape (item 12), fixed and regression-tested here. The
+    **prover-core machinery survived every mission** the reviewer threw at it: the SMT bounds
+    encoding, the fresh-symbol element model, `elem_bounds`/`elem_invalidated` write-invalidation
+    (both directions), signed-vs-unsigned non-negativity, gather/nested-gather composition, and the
+    `gather_oob` refutation all held with unchanged obligation counts. The single hole was upstream
+    of the prover, in how the macro *decides which clause text becomes a structured constraint* —
+    the prover faithfully proved what it was (wrongly) told.
+
+    **D1 (CRITICAL) — arbitrary-cast peeling on the element-assume closure LHS
+    (`crates/vericl-macros/src/lib.rs`).** `recognize_elem_assume` normalized the closure LHS via
+    `peel_to_ident`, which peeled *any* `Expr::Cast`. A truncating chain
+    `offsets.iter().all(|v| (*v as u8 as usize) < x.len())` was therefore recognized as
+    `ElemsBelowLen { offsets, x }`, so the prover modeled the **un-truncated** offset `< x.len()`
+    while the executable `check_assumes` evaluated the **truncation**. A contract-satisfying input
+    (offset 256, `x.len() == 8`: `256 as u8 as usize == 0 < 8` is true) then earned a `Proved{3}`
+    bounds certificate for a gather that reads `x[256]` — a real out-of-bounds read the reviewer
+    reproduced in the twin (`check_assumes == true`, `Proved{3}`, twin panic "index out of bounds:
+    len 8, index 256"). Fix: LHS cast peeling is now gated on **value-preservation** given the
+    iterated array's element type. New `IntKind` (signedness + bit width; `usize`/`isize` pinned to
+    their portable 32-bit floor — vericl runs its differential lane on 32-/64-bit hosts, so 32 is
+    the certainly-safe minimum for a cast *target*) and `int_kind_of_type`; new `lhs_is_binding`
+    replaces `peel_to_ident` and peels a cast only when the element type is a known unsigned integer
+    and the target is a known unsigned integer at least as wide, **checked per step against the
+    element width** (so `as u8 as usize` from `u32` is rejected at the `u8` step, 8 < 32, even
+    though the outer `as usize` alone would pass). Any other cast — narrowing, signed source, signed
+    target, unknown element/target type — leaves the whole clause string-only (sound: the prover
+    never receives the bound and cannot prove the gather from it). The bare/deref binding with no
+    cast is still recognized for any element type (a signed element still models `v < bound` alone,
+    no unsound `0 <= v`), so nothing shipped regresses. Pinned decision on the multi-step
+    `(*v as u64 as usize)` from `u32`: **accepted** — the value stays ≤ 2^32-1 through the `u64`
+    widening, so the final `as usize` is value-preserving on every host; `u64 as usize` (from a
+    `u64` element) is **rejected** as it could truncate on a 32-bit host.
+
+    **RHS verified independently, left as-is (`peel_cast_paren`).** The reviewer flagged RHS
+    truncation as the *safe* direction; I re-derived it per recognized shape rather than trusting
+    the claim. For `ElemsBelowLen` (RHS `B.len() as T`) and `ElemsBelowConst` (RHS `N as T`), a cast
+    of the non-negative bound satisfies `(bound as T) <= bound`, so peeling it can only make the
+    executed bound **≤** the modeled bound — i.e. the model is at most *weaker* than the contract,
+    never stronger. A weaker model admits *more* inputs than reality, so it can never mint a false
+    `Proved` (the exact reverse of the LHS hazard). No RHS cast shape was found where the model is
+    *stronger* than the contract, so no gate is needed there; the reasoning is recorded in the
+    `peel_cast_paren` doc comment.
+
+    **Blast radius — why this class is CRITICAL.** No shipped kernel used a truncating cast: the
+    three gather kernels (`gather_copy`, `nested_gather`, `gather_oob`) all use the value-preserving
+    `(*v as usize)` on `Array<u32>`/`Array<u64>` element arrays, still recognized identically, so
+    `evidence/vericl.json` is byte-identical and every obligation count is unchanged. And a
+    *suite-wired* kernel that hit this bug would have a second line of defense — the differential
+    lane runs real inputs against the twin, and a truncating clause makes the twin itself panic OOB
+    (as the reviewer's repro shows), so the differential would catch it. But a **proved-only**
+    kernel (`proved` claim without `tested` — e.g. `nested_gather`, or any production kernel wired
+    for the SMT proof alone) has **no such backstop**: the false `Proved` would be the only signal,
+    and it would be green. That is precisely why a recognizer false-`Proved` is critical even though
+    nothing shipped tripped it — the proof is load-bearing exactly where the differential is absent.
+
+    **Tests.** Macro recognizer (`vericl-macros`, white-box over `recognize_assume`):
+    `elem_assume_truncating_cast_chain_is_string_only` (the reviewer's exact repro — asserts `None`,
+    no `ElemsBelow*` emitted), `elem_assume_single_narrowing_cast_is_string_only`,
+    `elem_assume_value_preserving_forms_recognized` (shipped `as usize`, width-equal, widen-to-u64,
+    bare/deref, by-ref binding, extra parens — all still recognized),
+    `elem_assume_widening_chain_through_u64_is_recognized` (the pinned chain decision),
+    `elem_assume_u64_element_to_usize_is_string_only` (host-portability rejection + width-equal
+    accept), `elem_assume_signed_element_cast_rejected_bare_recognized`,
+    `elem_assume_unknown_element_type_gates_cast_only`, `int_kind_classification`. Prover backstop
+    (`vericl-examples`): `gather_copy_is_not_provable_without_element_assume` — WITHOUT the
+    element-range assume the gather is NOT `Proved` (OutOfSubset/Refuted), pinning that a string-only
+    clause cannot be laundered into a certificate.
+
+    **Verification.** `cargo test --workspace` green (vericl 25, vericl-examples lib 56 [+1],
+    vericl-ir 53, vericl-macros 23 [+8], integration all pass); `-p vericl-examples --features cpu`
+    green with the cpu lane + evidence check (`evidence/vericl.json` byte-identical, `git diff`
+    empty — no shipped kernel's contract changed, so no `VERICL_UPDATE` needed);
+    `cargo clippy --workspace --all-targets` and `-p vericl-examples --features cpu --all-targets`
+    both zero warnings; `conform` demo-defects exits 0 with output unchanged (all bounds/race/
+    differential defects still caught — `gather_oob` still `Refuted` with the element symbol at the
+    boundary, its `(*v as usize) < 16` clause still recognized). Reviewer's scratch repro reproduced
+    against the pre-fix build and confirmed string-only + non-provable after; scratch not committed.

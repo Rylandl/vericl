@@ -1392,6 +1392,35 @@ mod tests {
         }
     }
 
+    /// Round-4 adversarial-review backstop for the recognizer soundness fix.
+    /// The truncating-cast repro `offsets.iter().all(|v| (*v as u8 as usize) <
+    /// x.len())` is now left string-only (see the macro-crate regression
+    /// `elem_assume_truncating_cast_chain_is_string_only`), so the prover
+    /// receives NO `ElemsBelowLen` for `offsets`. This pins the consequence that
+    /// makes that sound: WITHOUT the element-range assume, the gather is NOT
+    /// provable — the loaded offset stays opaque and `x[offsets[i]]` is out of
+    /// subset, never `Proved`. So a truncating clause can never be laundered
+    /// into a false bounds certificate: the only thing that discharges the inner
+    /// obligation is the structured assume the fix now withholds.
+    #[test]
+    fn gather_copy_is_not_provable_without_element_assume() {
+        let def = gather_copy_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = gather_copy_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        // Only the length assume — the element-range assume is withheld, exactly
+        // as it is for a string-only (unrecognized) element clause. Any non-Proved
+        // outcome (OutOfSubset with the opaque offset, or Refuted) is an honest
+        // pass; only a Proved would mean a false bounds certificate was minted.
+        let assumes = [vericl_ir::Assume::LenEq { a: "offsets", b: "y" }];
+        if let vericl_ir::ProveResult::Proved { .. } =
+            vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes)
+        {
+            panic!("gather must NOT prove without the element-range assume");
+        }
+    }
+
     /// The defect twin: a stale constant bound (`< 16`) looser than `x.len() ==
     /// 8` — the prover models the offset `< 16` and refutes `x[offsets[i]]`,
     /// with the element symbol at the boundary in the counterexample.

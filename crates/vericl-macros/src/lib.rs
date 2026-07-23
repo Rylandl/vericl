@@ -2038,10 +2038,26 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         .filter(|p| matches!(p.kind, ParamKind::ArrayRef(_) | ParamKind::ArrayMut(_)))
         .map(|p| p.name.to_string())
         .collect();
+    // Each array parameter's element integer type (signedness + width), the
+    // type of `*v` in an `arr.iter().all(|v| ...)` element-range assume. Used
+    // to gate cast-peeling on the closure LHS: a cast is normalized away only
+    // when it is provably value-preserving for this element type (see
+    // `lhs_is_binding` / `recognize_elem_assume`). Non-integer or unrecognized
+    // element types are simply absent — cast peeling is then disabled and only
+    // the bare/deref binding is recognized.
+    let array_elem_kinds: HashMap<String, IntKind> = params
+        .iter()
+        .filter_map(|p| match &p.kind {
+            ParamKind::ArrayRef(elem) | ParamKind::ArrayMut(elem) => {
+                int_kind_of_type(elem).map(|k| (p.name.to_string(), k))
+            }
+            _ => None,
+        })
+        .collect();
     let recognized_assumes: Vec<RecognizedAssume> = spec
         .assumes
         .iter()
-        .filter_map(|e| recognize_assume(e, &array_param_names))
+        .filter_map(|e| recognize_assume(e, &array_param_names, &array_elem_kinds))
         .collect();
     let structured_assumes: Vec<TokenStream2> =
         recognized_assumes.iter().map(RecognizedAssume::to_tokens).collect();
@@ -2917,6 +2933,7 @@ fn expand_reference(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStrea
 /// `String`s). Kept as a value — rather than emitting tokens directly — so the
 /// same recognition drives both the emitted `StructuredAssume` constructors
 /// *and* the `gen(...)` element-range derivation (`ElemGenBound`).
+#[cfg_attr(test, derive(Debug))]
 enum RecognizedAssume {
     /// `A.len() == B.len()`.
     LenEq { a: String, b: String },
@@ -2969,8 +2986,13 @@ impl RecognizedAssume {
 /// usize) < B.len())` and `A.iter().all(|v| *v < N)`). Anything else returns
 /// `None` — see the call site's doc comment on why that's sound rather than a
 /// silent loss of soundness.
-fn recognize_assume(expr: &Expr, array_params: &[String]) -> Option<RecognizedAssume> {
-    recognize_len_assume(expr, array_params).or_else(|| recognize_elem_assume(expr, array_params))
+fn recognize_assume(
+    expr: &Expr,
+    array_params: &[String],
+    elem_kinds: &HashMap<String, IntKind>,
+) -> Option<RecognizedAssume> {
+    recognize_len_assume(expr, array_params)
+        .or_else(|| recognize_elem_assume(expr, array_params, elem_kinds))
 }
 
 fn recognize_len_assume(expr: &Expr, array_params: &[String]) -> Option<RecognizedAssume> {
@@ -2990,15 +3012,28 @@ fn recognize_len_assume(expr: &Expr, array_params: &[String]) -> Option<Recogniz
 }
 
 /// Recognize `arr.iter().all(|v| LHS < RHS)` where `LHS` is exactly the
-/// closure's single binding (peeling parens, `as _` casts, and `*` deref — the
-/// syntactic variants the task calls out as safe to normalize) and `RHS` is
-/// either `B.len()` (→ `ElemsBelowLen`) or an integer literal (→
-/// `ElemsBelowConst`). Only the *strict* `<` is recognized: a `<=` would admit
-/// `v == bound`, which is not a valid in-bounds guarantee, so it deliberately
-/// stays string-only (sound). Non-negativity of a signed element is NOT assumed
-/// here — the prover derives it from the element type — so the `as usize` cast
-/// is normalized away rather than required.
-fn recognize_elem_assume(expr: &Expr, array_params: &[String]) -> Option<RecognizedAssume> {
+/// closure's single binding (peeling parens, `*` deref, and — crucially — only
+/// *value-preserving* casts; see `lhs_is_binding`) and `RHS` is either `B.len()`
+/// (→ `ElemsBelowLen`) or an integer literal (→ `ElemsBelowConst`). Only the
+/// *strict* `<` is recognized: a `<=` would admit `v == bound`, which is not a
+/// valid in-bounds guarantee, so it deliberately stays string-only (sound).
+///
+/// The LHS cast gate is the soundness-critical part. The prover models the
+/// *un-truncated* element value as `< bound`, so a truncating cast on the LHS
+/// (`(*v as u8 as usize) < x.len()`) would let the executable `check_assumes`
+/// pass an offset (256) whose truncation (0) is below the bound while the real
+/// element (256) is not — a false `Proved` and a genuine out-of-bounds read.
+/// `lhs_is_binding` therefore peels a cast only when it cannot change the value
+/// on any vericl-supported host; every other cast leaves the clause string-only.
+/// Non-negativity of a signed element is NOT assumed here — the prover derives
+/// it from the element type — so a *value-preserving* `as usize` cast is
+/// normalized away rather than required, while the bare/deref binding (no cast)
+/// is recognized regardless of the element's signedness.
+fn recognize_elem_assume(
+    expr: &Expr,
+    array_params: &[String],
+    elem_kinds: &HashMap<String, IntKind>,
+) -> Option<RecognizedAssume> {
     // arr.iter().all(<closure>)
     let Expr::MethodCall(all_call) = expr else { return None };
     if all_call.method != "all" || all_call.args.len() != 1 {
@@ -3015,12 +3050,16 @@ fn recognize_elem_assume(expr: &Expr, array_params: &[String]) -> Option<Recogni
     }
     let Expr::Closure(closure) = &all_call.args[0] else { return None };
     let binding = closure_single_binding(closure)?;
+    // The element type of the iterated array `arr` — the type of `*v`. Absent
+    // (None) when the element type is not a recognized integer, which disables
+    // cast peeling but still recognizes the bare/deref binding.
+    let elem = elem_kinds.get(&arr).copied();
     // body: LHS < RHS (strict `<` only — soundness).
     let Expr::Binary(ExprBinary { left, op: BinOp::Lt(_), right, .. }) = peel_paren(&closure.body)
     else {
         return None;
     };
-    if peel_to_ident(left)? != binding {
+    if !lhs_is_binding(left, &binding, elem) {
         return None;
     }
     let rhs = peel_cast_paren(right);
@@ -3061,6 +3100,23 @@ fn peel_paren(mut e: &Expr) -> &Expr {
 
 /// Peel `Paren`/`Group`/`Cast` wrappers (an element-bound RHS like `x.len() as
 /// usize` normalizes to `x.len()`).
+///
+/// Unlike the closure LHS (`lhs_is_binding`), peeling an *arbitrary* cast here
+/// is sound in the RHS/bound position, verified per recognized shape:
+///   * `ElemsBelowLen` (RHS `B.len() as T`): the executable check runs
+///     `lhs < (B.len() as T)`; the model asserts `v < length_of(B)`. Any cast
+///     of a non-negative `B.len()` satisfies `(B.len() as T) <= B.len()` (a
+///     narrowing cast can only shrink or flip-negative, never grow it), so the
+///     executable bound is `<=` the model bound. The executable is therefore at
+///     least as *strict* as the model — every input passing `check_assumes`
+///     also satisfies the (looser) modeled `v < length_of(B)`.
+///   * `ElemsBelowConst` (RHS `N as T` for a literal `N`): identically,
+///     `(N as T) <= N` for any non-negative literal and any integer target, so
+///     the modeled bound `N` is `>=` the executed bound.
+///
+/// In both cases peeling the RHS cast can only make the model *weaker* than the
+/// contract, never stronger, so it can never mint a false `Proved` (the reverse
+/// of the LHS hazard). Hence no value-preservation gate is needed here.
 fn peel_cast_paren(mut e: &Expr) -> &Expr {
     loop {
         match e {
@@ -3072,19 +3128,88 @@ fn peel_cast_paren(mut e: &Expr) -> &Expr {
     }
 }
 
-/// If `expr` — after peeling parens/`Group`s, `as _` casts, and a leading `*`
-/// deref — is a bare identifier, that identifier's string. Used to check the
-/// LHS of an element-range comparison is exactly the closure binding (`*v`,
-/// `(*v as usize)`, `v as usize`, `v` all normalize to `v`; `*v + 1` does not,
-/// so an arithmetic index expression is correctly not recognized).
-fn peel_to_ident(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Paren(p) => peel_to_ident(&p.expr),
-        Expr::Group(g) => peel_to_ident(&g.expr),
-        Expr::Cast(c) => peel_to_ident(&c.expr),
-        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => peel_to_ident(&u.expr),
-        Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
-        _ => None,
+/// Signedness and bit width of an integer type, for the value-preservation
+/// check on the closure LHS of an element-range assume (`lhs_is_binding`).
+///
+/// `usize`/`isize` are modeled at their portably-guaranteed *minimum* width of
+/// 32 bits. The executable `check_assumes` runs on the differential lane's
+/// host, and vericl runs that lane only on 32- or 64-bit hosts; taking 32 as
+/// the floor for a cast *target* means a widening cast is accepted only when it
+/// is value-preserving even on the narrowest such host (so `u32 as usize` is
+/// accepted — 32 ≥ 32 — while `u64 as usize` is not — 32 < 64 — since it would
+/// truncate a 64-bit offset on a 32-bit host). This is the "restrict to what is
+/// certainly safe" option: it never over-accepts, at worst it leaves a
+/// genuinely-safe-on-64-bit clause string-only (a missed `Proved`, never a
+/// false one). No element type is `usize`/`isize` in practice (the classified
+/// kinds are u32/i32/u64/i64), so this floor only ever affects cast targets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
+struct IntKind {
+    signed: bool,
+    width: u32,
+}
+
+/// Classify a scalar integer type by name into its `IntKind`, or `None` for a
+/// non-integer / unrecognized type (floats, `bool`, generics, ...). Shared by
+/// the array element-type map and the per-step cast-target check.
+fn int_kind_of_type(ty: &Type) -> Option<IntKind> {
+    let Type::Path(tp) = ty else { return None };
+    let name = tp.path.segments.last()?.ident.to_string();
+    let (signed, width) = match name.as_str() {
+        "u8" => (false, 8),
+        "u16" => (false, 16),
+        "u32" => (false, 32),
+        "u64" => (false, 64),
+        "u128" => (false, 128),
+        // Portable minimum width — see `IntKind` doc.
+        "usize" => (false, 32),
+        "i8" => (true, 8),
+        "i16" => (true, 16),
+        "i32" => (true, 32),
+        "i64" => (true, 64),
+        "i128" => (true, 128),
+        "isize" => (true, 32),
+        _ => return None,
+    };
+    Some(IntKind { signed, width })
+}
+
+/// True if `left` normalizes to exactly the closure binding `binding` — peeling
+/// `Paren`/`Group` wrappers and `*` deref freely, but peeling a cast ONLY when
+/// it is provably value-preserving given the iterated array's element type
+/// `elem` (the type of `*v`).
+///
+/// A cast `_ as T` is value-preserving iff `elem` is a known *unsigned* integer
+/// and the target `T` is a known unsigned integer at least as wide as `elem`.
+/// The check is applied per step against `elem`'s width, so a chain such as
+/// `(*v as u8 as usize)` from a `u32` element is rejected at the `u8` step
+/// (8 < 32) even though the outer `as usize` alone would pass: the intermediate
+/// truncation already destroyed the value. Because every accepted target is at
+/// least `elem`-wide, the value stays bounded by `2^width(elem)-1` throughout,
+/// so an equal-or-wider unsigned target never truncates and never flips sign —
+/// `(*v as T) == *v` on every host. Any other cast (narrowing, signed source,
+/// signed target, unknown element or target type) returns `false`, leaving the
+/// whole element-range clause unrecognized (string-only, hence sound: the
+/// prover never receives the bound and cannot prove the gather from it).
+///
+/// The bare/deref binding with no cast is accepted for any `elem` (including a
+/// signed or unknown one): the prover models a signed element's `v < bound`
+/// alone, omitting the unsound `0 <= v`, so no cast is *required*, only gated.
+fn lhs_is_binding(left: &Expr, binding: &str, elem: Option<IntKind>) -> bool {
+    match left {
+        Expr::Paren(p) => lhs_is_binding(&p.expr, binding, elem),
+        Expr::Group(g) => lhs_is_binding(&g.expr, binding, elem),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+            lhs_is_binding(&u.expr, binding, elem)
+        }
+        Expr::Cast(c) => match (elem, int_kind_of_type(&c.ty)) {
+            (Some(e), Some(t)) if !e.signed && !t.signed && t.width >= e.width => {
+                lhs_is_binding(&c.expr, binding, elem)
+            }
+            _ => false,
+        },
+        Expr::Path(p) => p.path.get_ident().map(|i| *i == binding).unwrap_or(false),
+        _ => false,
     }
 }
 
@@ -3883,5 +4008,230 @@ mod tests {
         let err = expand_reference(quote::quote!(compare(max_ulp = 0)), &func)
             .expect_err("args rejected");
         assert!(err.to_string().contains("takes no arguments"), "unexpected: {}", err);
+    }
+
+    // -----------------------------------------------------------------
+    // Round-4 adversarial review: element-range assume LHS cast soundness.
+    // `recognize_elem_assume` used to peel ARBITRARY casts on the closure
+    // LHS, so a truncating chain like `(*v as u8 as usize) < x.len()` was
+    // recognized as `ElemsBelowLen` — the prover then modeled the untruncated
+    // offset `< x.len()` while the executable `check_assumes` evaluated the
+    // truncation, so a contract-satisfying input (offset 256, x.len() 8) got a
+    // Proved bounds certificate and a real OOB read in the twin. The fix gates
+    // LHS cast peeling on value-preservation given the element type. These are
+    // white-box unit tests over the recognizer itself.
+    // -----------------------------------------------------------------
+
+    /// Build the array-name → element-`IntKind` map the recognizer consults,
+    /// from `(name, type-string)` pairs (a non-integer type is dropped, exactly
+    /// as the call site drops it).
+    fn elem_kinds(pairs: &[(&str, &str)]) -> HashMap<String, IntKind> {
+        pairs
+            .iter()
+            .filter_map(|(name, ty)| {
+                let ty: Type = syn::parse_str(ty).expect("valid type");
+                int_kind_of_type(&ty).map(|k| ((*name).to_string(), k))
+            })
+            .collect()
+    }
+
+    /// The reviewer's exact round-4 repro. A truncating `as u8 as usize` chain
+    /// on a `u32` element array must NOT be recognized as an element-range
+    /// bound: it must stay string-only (recognizer returns `None`, so
+    /// `structured_assumes` carries no `ElemsBelow*` for it). The companion
+    /// prover-side test `gather_copy_is_not_provable_without_element_assume`
+    /// (crate `vericl-examples`) pins the other half — that without the
+    /// structured assume the gather cannot be proved — so a truncating clause
+    /// can never mint a false Proved.
+    #[test]
+    fn elem_assume_truncating_cast_chain_is_string_only() {
+        let params = ["offsets".to_string(), "x".to_string()];
+        let elems = elem_kinds(&[("offsets", "u32")]); // `x` is f32 → absent
+        let expr: Expr =
+            syn::parse_str("offsets.iter().all(|v| (*v as u8 as usize) < x.len())").unwrap();
+        let got = recognize_assume(&expr, &params, &elems);
+        assert!(
+            got.is_none(),
+            "truncating `as u8 as usize` chain must stay string-only, got {got:?}"
+        );
+        assert!(
+            !matches!(
+                got,
+                Some(RecognizedAssume::ElemsBelowLen { .. })
+                    | Some(RecognizedAssume::ElemsBelowConst { .. })
+            ),
+            "no ElemsBelow* variant may be emitted for a truncating clause"
+        );
+    }
+
+    /// A single narrowing cast (`as u8`) on a `u32` element is likewise
+    /// rejected — the truncation is the whole hazard, chain or not.
+    #[test]
+    fn elem_assume_single_narrowing_cast_is_string_only() {
+        let params = ["offsets".to_string(), "x".to_string()];
+        let elems = elem_kinds(&[("offsets", "u32")]);
+        let expr: Expr =
+            syn::parse_str("offsets.iter().all(|v| (*v as u8) < x.len())").unwrap();
+        assert!(recognize_assume(&expr, &params, &elems).is_none());
+    }
+
+    /// Value-preserving element-range forms are still recognized as
+    /// `ElemsBelowLen`/`ElemsBelowConst` — the fix must not regress the shipped
+    /// gather clauses. Covers: the shipped `(*v as usize)` widening, the
+    /// width-equal `as u32`, widening to `u64`, the bare/deref binding, the
+    /// by-ref binding pattern, and extra parens.
+    #[test]
+    fn elem_assume_value_preserving_forms_recognized() {
+        let params = ["offsets".to_string(), "x".to_string()];
+        let u32e = elem_kinds(&[("offsets", "u32")]);
+
+        // → ElemsBelowLen { offsets, x }
+        for src in [
+            "offsets.iter().all(|v| (*v as usize) < x.len())", // shipped gather shape
+            "offsets.iter().all(|v| (*v as u32) < x.len())",   // width-equal
+            "offsets.iter().all(|v| (*v as u64) < x.len())",   // widen (64 >= 32)
+            "offsets.iter().all(|v| ((*v) as usize) < x.len())", // extra parens
+        ] {
+            let expr: Expr = syn::parse_str(src).unwrap();
+            assert!(
+                matches!(
+                    recognize_assume(&expr, &params, &u32e),
+                    Some(RecognizedAssume::ElemsBelowLen { arr, len_of }) if arr == "offsets" && len_of == "x"
+                ),
+                "expected ElemsBelowLen for `{src}`"
+            );
+        }
+
+        // Bare / by-ref binding with a literal bound → ElemsBelowConst. (These
+        // are the shapes where no cast is written; the len form needs the `as
+        // usize` cast to typecheck `usize < usize` in the twin.)
+        for src in [
+            "offsets.iter().all(|v| *v < 16)",   // bare deref, no cast
+            "offsets.iter().all(|&v| v < 16)",   // by-ref binding, no deref
+            "offsets.iter().all(|v| (*v as usize) < 16)", // value-preserving cast
+        ] {
+            let expr: Expr = syn::parse_str(src).unwrap();
+            assert!(
+                matches!(
+                    recognize_assume(&expr, &params, &u32e),
+                    Some(RecognizedAssume::ElemsBelowConst { arr, bound: 16 }) if arr == "offsets"
+                ),
+                "expected ElemsBelowConst for `{src}`"
+            );
+        }
+    }
+
+    /// Pinned decision for the multi-step chain `(*v as u64 as usize)` from a
+    /// `u32` element: it is ACCEPTED (recognized). The value came from a 32-bit
+    /// element, so it stays ≤ 2^32-1 through the `u64` widening; the final `as
+    /// usize` (modeled at its 32-bit portable floor) is then value-preserving on
+    /// every vericl-supported host. The gate is applied per step against the
+    /// element width, so this passes (u64: 64 ≥ 32, usize: 32 ≥ 32) while the
+    /// truncating `as u8 as usize` fails at the u8 step (8 < 32).
+    #[test]
+    fn elem_assume_widening_chain_through_u64_is_recognized() {
+        let params = ["offsets".to_string(), "x".to_string()];
+        let u32e = elem_kinds(&[("offsets", "u32")]);
+        let expr: Expr =
+            syn::parse_str("offsets.iter().all(|v| (*v as u64 as usize) < x.len())").unwrap();
+        assert!(
+            matches!(
+                recognize_assume(&expr, &params, &u32e),
+                Some(RecognizedAssume::ElemsBelowLen { arr, len_of }) if arr == "offsets" && len_of == "x"
+            ),
+            "value-preserving chain `as u64 as usize` from u32 must be recognized"
+        );
+    }
+
+    /// A `u64` element widening `as usize` is REJECTED: `usize` is modeled at
+    /// its 32-bit portable floor, so `u64 as usize` could truncate a 64-bit
+    /// offset on a 32-bit host. Conservative (a missed Proved on 64-bit hosts),
+    /// never a false one. The explicit `as u64` (width-equal) is still fine.
+    #[test]
+    fn elem_assume_u64_element_to_usize_is_string_only() {
+        let params = ["offsets".to_string(), "x".to_string()];
+        let u64e = elem_kinds(&[("offsets", "u64")]);
+        let narrowing: Expr =
+            syn::parse_str("offsets.iter().all(|v| (*v as usize) < x.len())").unwrap();
+        assert!(
+            recognize_assume(&narrowing, &params, &u64e).is_none(),
+            "u64 element `as usize` may truncate on a 32-bit host — must stay string-only"
+        );
+        let width_equal: Expr =
+            syn::parse_str("offsets.iter().all(|v| (*v as u64) < x.len())").unwrap();
+        assert!(
+            matches!(
+                recognize_assume(&width_equal, &params, &u64e),
+                Some(RecognizedAssume::ElemsBelowLen { .. })
+            ),
+            "width-equal `u64 as u64` is value-preserving and must be recognized"
+        );
+    }
+
+    /// A signed element with a cast is REJECTED (`i32 as usize` wraps a negative
+    /// value to a huge index — not value-preserving), but the BARE signed
+    /// element is still recognized: the prover models a signed element's
+    /// `v < bound` alone (no `0 <= v`), leaving the low-end index obligation to
+    /// fail honestly, so no cast is required, only gated.
+    #[test]
+    fn elem_assume_signed_element_cast_rejected_bare_recognized() {
+        let params = ["offsets".to_string(), "x".to_string()];
+        let i32e = elem_kinds(&[("offsets", "i32")]);
+
+        let cast: Expr =
+            syn::parse_str("offsets.iter().all(|v| (*v as usize) < x.len())").unwrap();
+        assert!(
+            recognize_assume(&cast, &params, &i32e).is_none(),
+            "signed-element cast `i32 as usize` must stay string-only"
+        );
+
+        let bare: Expr = syn::parse_str("offsets.iter().all(|v| *v < 16)").unwrap();
+        assert!(
+            matches!(
+                recognize_assume(&bare, &params, &i32e),
+                Some(RecognizedAssume::ElemsBelowConst { arr, bound: 16 }) if arr == "offsets"
+            ),
+            "bare signed element (no cast) must still be recognized"
+        );
+    }
+
+    /// An unknown / non-integer element type (absent from the map) disables cast
+    /// peeling entirely, but the bare binding is still recognized — the cast
+    /// gate can only ever *remove* recognition, never add an unsound one.
+    #[test]
+    fn elem_assume_unknown_element_type_gates_cast_only() {
+        let params = ["offsets".to_string(), "x".to_string()];
+        let empty: HashMap<String, IntKind> = HashMap::new(); // offsets absent
+
+        let cast: Expr =
+            syn::parse_str("offsets.iter().all(|v| (*v as usize) < x.len())").unwrap();
+        assert!(
+            recognize_assume(&cast, &params, &empty).is_none(),
+            "cast peeling must be disabled when the element type is unknown"
+        );
+
+        let bare: Expr = syn::parse_str("offsets.iter().all(|v| *v < 16)").unwrap();
+        assert!(
+            matches!(
+                recognize_assume(&bare, &params, &empty),
+                Some(RecognizedAssume::ElemsBelowConst { .. })
+            ),
+            "bare binding is recognized regardless of element type"
+        );
+    }
+
+    /// `int_kind_of_type` pins the usize/isize portable floor (32) and the
+    /// signedness/width of the concrete integer types the gate reasons about.
+    #[test]
+    fn int_kind_classification() {
+        let k = |s: &str| int_kind_of_type(&syn::parse_str::<Type>(s).unwrap());
+        assert_eq!(k("u8"), Some(IntKind { signed: false, width: 8 }));
+        assert_eq!(k("u32"), Some(IntKind { signed: false, width: 32 }));
+        assert_eq!(k("u64"), Some(IntKind { signed: false, width: 64 }));
+        assert_eq!(k("usize"), Some(IntKind { signed: false, width: 32 }));
+        assert_eq!(k("i32"), Some(IntKind { signed: true, width: 32 }));
+        assert_eq!(k("isize"), Some(IntKind { signed: true, width: 32 }));
+        assert_eq!(k("f32"), None);
+        assert_eq!(k("bool"), None);
     }
 }
