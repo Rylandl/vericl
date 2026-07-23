@@ -1231,3 +1231,102 @@ caught deterministically.
     identity hashes only, `evidence/vericl_f64.json` + `evidence/cooperative_fallback.json`
     byte-identical. `VERICL_UPDATE=1` run for `--features cpu` first (verified), then default LAST
     (committed default shape), per the staleness-guard lesson.
+
+15. [DONE 2026-07-23] Adversarial soundness review round 5 (cooperative `AbsolutePos`
+    recomposition) — DONE. **Verdict: exactly one CONFIRMED CRITICAL**, a cooperative-mode
+    false-`Proved` where the `AbsolutePos` recomposition bypassed the faithful-integer invariant.
+    Every other surface the reviewer probed **survived** (audited below). Prover-only change,
+    confined to `crates/vericl-ir/src/prover.rs`; the full soundness argument lives in that file's
+    "Cooperative mode" + "Bounded-integer overflow model" module docs (this entry summarizes).
+
+    **D1 (CRITICAL) — unwrapped `AbsolutePos` in cooperative mode (`builtin_value`, ~1160).** The
+    cooperative `AbsolutePos` was built as `cube_pos*cube_dim + unit_pos` with raw `smt.times`/
+    `smt.plus`, the one integer term in the file constructed outside the faithful handlers. `cube_pos`
+    is a *full*-`u32` leaf (`[0, 2^32)`), so that raw sum can exceed `2^32`, which real hardware wraps
+    — the model's `abs_pos` was the **unwrapped over-value**, violating the module invariant that
+    every non-tainted modeled integer term equals the real hardware value. A guard `ABSOLUTE_POS <
+    output.len()` then forced `cube_pos*cube_dim < len` in the model and so transferred a bound onto
+    `cube_pos` that hardware never honors. Reviewer's repro (a cooperative kernel guarding on
+    `ABSOLUTE_POS` but indexing the *unguarded* `output[CUBE_POS]`) earned a false **`Proved{3}`**,
+    while a `cube_pos = 2^24`, `unit_pos = 0`, `cube_dim = 256` dispatch computes `abs_pos = 2^32 ≡
+    0 < len` (guard passes) and writes `output[2^24]` — wildly OOB for any `len <= 2^24` on a
+    CUDA-class backend (WGSL robustness would clamp; the certificate is still unsound).
+
+    **Fix — exact modular recomposition in QF_LIA (`abs_pos_sym`), NOT the taint route.**
+    `AbsolutePos` in cooperative mode is now a fresh in-range `u32` leaf `abs_pos` asserted
+    `abs_pos = cube_pos*cube_dim + unit_pos − k*2^32` for a fresh wrap count `k >= 0` (additionally
+    `k <= cube_dim − 1`, the tight constant ceiling: `cube_pos <= 2^32−1` ∧ `unit_pos <= cube_dim−1`
+    ⟹ raw sum `<= 2^32*cube_dim − 1` ⟹ `k = ⌊raw/2^32⌋ <= cube_dim−1`; not needed for soundness but
+    cheap). Both products are variable×constant (`cube_dim`, `2^32` are constants), hence **LINEAR —
+    QF_LIA, no QF_NIA**. This is *exact*: `abs_pos ∈ [0, 2^32)` congruent to the raw sum mod `2^32`
+    is its unique residue = the true hardware value, so multiple wraps are handled and no unwrapped
+    over-value can leak a bound. The taint route (a `checked_mul`-style no-overflow side-obligation
+    on the recomposition) was rejected as decided: `cube_pos` is full-range so the product *always*
+    can wrap, tainting `abs_pos` unconditionally and destroying **every** `ABSOLUTE_POS`-guarded
+    cooperative proof — far too coarse when the exact encoding costs one leaf + one `k` + one linear
+    equality. The plain-walk (`coop == None`) `AbsolutePos` is unchanged (a bare fresh `u32` leaf —
+    already faithful for an opaque position; there is no recomposition to be faithful to).
+
+    **Predeclaration (soundness-critical for the race walk).** Unlike the pre-fix raw term (a pure
+    `SExpr`, no declarations), `abs_pos_sym` emits a `declare-const` + assertions, so it is
+    **predeclared at the outermost SMT scope** — via `predeclare_coop_leaves` (bounds walk) and at
+    the top of each thread's `race_walk` (per-thread, reading that thread's `UnitPos = t`). A lazy
+    first resolution inside a branch arm would scope its declaration to that arm and drop it on the
+    matching `pop`, leaving a *deferred* cross-thread race obligation whose recorded guard/index
+    mentions `ABSOLUTE_POS` referencing an undeclared symbol — the exact hazard `race_setup` already
+    predeclares buffer lengths against. Confirmed live in `conform demo-defects`: the
+    `block_sum_reduce_racy` two-thread counterexample now shows both threads' predeclared symbols
+    (`abs_pos7`/`abs_wrap8` for `t1`, `abs_pos9`/`abs_wrap10` for `t2`), each recomposition exact
+    (`t1=1 ⟹ abs_pos=1`, `t2=0 ⟹ abs_pos=0`, both `abs_wrap=0`).
+
+    **Regression test (`cooperative_abspos_guard_cubepos_index_refutes`, +1).** The reviewer's exact
+    repro, made permanent. Under the fix it flips `Proved{3}` → **`Refuted`** (the honest verdict —
+    the OOB is genuinely reachable, not merely `OutOfSubset`), with the witness `cube_pos=16843009,
+    abs_wrap=1, abs_pos=16843008, len_output=16843009`: `abs_pos = 16843009*256 − 2^32 = 16843008 =
+    len−1 < len` (guard satisfied) while `cube_pos = 16843009 = len` (index == length, OOB). Asserts
+    the obligation is on `output` and the counterexample exhibits the large `cube_pos`.
+
+    **Sibling-hunt audit (independent, per task).** Grepped every `smt.times`/`plus`/`sub`/`negate`/
+    `div`/`modulo`/`ite` on integer terms and classified each: the only raw integer arithmetic
+    *outside* a faithful handler was this one defect. All others are load-bearing and correct —
+    `checked_mul`'s `times` (no-overflow side-obligation), `wrapping_binary`'s `plus`/`sub` (wrapped
+    by `wrap_to_range`), `wrap_to_range`'s own `plus`/`sub`/`ite` (the single-wrap correction),
+    `divmod_int`'s `div`/`modulo` (nonzero + nonnegativity side-obligation), and `constant_expr`/
+    `int_const`'s `negate` (exact negative literals). Independently confirms the reviewer found no
+    other site; documented in the module doc. Corrected the doc invariant claim to state the modular
+    recomposition explicitly (the "Cooperative mode" bullet, the `Leaves` sub-bullet, and
+    `prove_bounds_freedom_cooperative`'s rustdoc all now say `(CubePos*cube_dim + UnitPos) mod 2^32`,
+    not the raw identity).
+
+    **Survived surfaces (reviewer probed, held — confirmed real, no code change).** `wrap_to_range`'s
+    `ite` re-validated exhaustively against true hardware wrapping for u8 **and** i8 (all `256^2`
+    operand pairs × {Add, Sub} match — `wrapcheck.py`). `checked_mul` boundary-exact and load-bearing:
+    `a,b < 65536 ⟹ Proved` but `a,b < 65537 ⟹ OutOfSubset` (product can hit `2^32`), the `a*b == 2^32
+    ≡ 0` divisor construction still taints (`mul_overflow_divisor_is_out_of_subset`,
+    `guard_bounded_mul_proves`). `cast_int` value-preservation gating intact
+    (`adv_u64_narrow_*`-shaped `cast_int` fits-obligation). Faithful Add/Sub chains exact — `(pos−1)+1
+    == pos`, unguarded `x[pos−1]` refutes at the true `2^32−1` (`sub_underflow_unguarded_refutes`).
+    Element-assume + faithful-overflow interaction — `offsets[i]+1` can equal `x.len()` off-by-one,
+    still refutes; plain gather still `Proved{3}` (`gather_with_element_assume_proves`,
+    `nested_gather_composes_and_proves`, write-invalidation both directions). Guard-strengthening
+    findings from round 2 still real (`shifted_read_selfguard_refutes_at_type_max` /
+    `_strengthened_proves`). None of these flipped.
+
+    **Verification.** `cargo test --workspace` green (vericl 25, vericl-examples lib 56, vericl-ir 63
+    [+1], vericl-macros 23, integration all pass — `cooperative.rs` 3, `cooperative_fallback.rs` 1);
+    `-p vericl-examples --features cpu` green (conformance + f64 + cooperative_fallback + cooperative
+    lanes). **Shipped cooperative proofs unchanged (prover-only change; identities untouched):**
+    `cooperative_shared_load_proves` `Proved{5}`, `block_sum_reduce_is_race_free` `Proved{19}`
+    (bounds 8 + ww 6 + rw 4 + intercube 1 = 8+11), `grid_stride_reduce_is_race_free` `Proved{16}`,
+    both `*_defers_to_m3` still `OutOfSubset`, `cooperative_undersized_tile_refutes` still `Refuted`
+    on `unit_pos`. `cargo clippy --workspace --all-targets` and `--features cpu --all-targets` both
+    zero warnings. `conform demo-defects` exits 0, output semantically unchanged. **Evidence
+    byte-identical** — `git status` shows only `prover.rs` modified, no `evidence/*.json` touched
+    (`ir_hash`/`source_hash` are macro/IR-derived, untouched by a prover change), and the suite's
+    evidence-verify lanes pass without `VERICL_UPDATE`. **Private dogfood re-verified unchanged**
+    (`vericl-dogfood`, path-dep on this checkout; Substrate IP rules — construct classes only, no
+    committed IP): the cooperative `reduce_rssi` still `Proved` bounds(oob)=8 race=8 (ww=3 rw=4
+    intercube=1) uniformity=2 phases=3, whole `dogfood-kernels` suite green (composition, instantiate,
+    prover_subset, shmem_probe/min/conformance/reduce_rssi); `dogfood-rejects` still fails `cargo
+    build` by design (compile-fail fixtures, unaffected by a prover-runtime change). All five rounds'
+    regression tests green.

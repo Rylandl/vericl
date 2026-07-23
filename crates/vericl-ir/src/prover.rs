@@ -143,7 +143,12 @@
 //!     `[0, 2^32)`; positions/lengths are `u32` per `AddressType::U32`). This
 //!     is load-bearing twice over: it lets the no-overflow side-obligations
 //!     below discharge for genuinely-safe arithmetic, and it keeps the
-//!     single-wrap `ite` below exact.
+//!     single-wrap `ite` below exact. In *cooperative* mode `ABSOLUTE_POS` is
+//!     not a free leaf but a `u32`-range leaf additionally pinned to the exact
+//!     modular recomposition `(CubePos*cube_dim + UnitPos) mod 2^32`
+//!     (`abs_pos_sym`, "Cooperative mode" bullet) — still the real hardware
+//!     value, so the invariant holds; a raw unwrapped `CubePos*cube_dim +
+//!     UnitPos` would break it (round 5).
 //!   * **`Add`/`Sub`** are modeled *exactly* under wraparound
 //!     (`wrap_to_range`): the mathematical result is folded back into range
 //!     via `ite(raw > max, raw − 2^W, ite(raw < min, raw + 2^W, raw))`. Since
@@ -266,10 +271,23 @@
 //!   tainted: `UnitPos` is a fresh `[0, cube_dim)` symbol (the per-thread
 //!   leaf); `CubePos`/`CubeCount` are fresh nonnegative symbols (cube-uniform
 //!   leaves); `CubeDim` is the concrete numeral `cube_dim`; and `AbsolutePos`
-//!   is *recomputed* as `CubePos*cube_dim + UnitPos` (the 1-D identity)
+//!   is *recomputed* from the 1-D identity `CubePos*cube_dim + UnitPos`
 //!   instead of the plain walk's opaque fresh leaf, so a `tile[UnitPos]`
 //!   access and an `input[AbsolutePos]` access in the same kernel share one
-//!   `UnitPos` symbol. All of these are memoized on `VariableKind`, so every
+//!   `UnitPos` symbol. **That recomputation is the exact *modular* one**
+//!   (`abs_pos_sym`), not the raw sum: `AbsolutePos` is a fresh in-range `u32`
+//!   leaf `abs_pos` asserted equal to `CubePos*cube_dim + UnitPos − k*2^32`
+//!   for a fresh `k ≥ 0` — i.e. `abs_pos ≡ (CubePos*cube_dim + UnitPos) mod
+//!   2^32`, its unique residue and so the true hardware value. This is
+//!   soundness-critical, not cosmetic: `CubePos` is a *full*-`u32` leaf, so the
+//!   raw sum `CubePos*cube_dim + UnitPos` overflows `2^32` on hardware (e.g.
+//!   `CubePos = 2^24`, `cube_dim = 256` ⟹ `2^32 ≡ 0`), and a raw
+//!   `smt.times`/`smt.plus` term (the pre-round-5 encoding) would be that
+//!   *unwrapped* over-value — which a guard `ABSOLUTE_POS < len` would then
+//!   unsoundly transfer onto `CubePos` (`CubePos*256 < len`), falsely proving a
+//!   bare `output[CUBE_POS]` access whose real index is unbounded (adversarial
+//!   review round 5, `abs_pos_sym` docs). Both products are variable×constant,
+//!   hence LINEAR (QF_LIA). All of these are memoized on `VariableKind`, so every
 //!   occurrence of a given builtin resolves to the same symbol. **The three
 //!   leaf symbols are pre-declared at the outermost SMT scope** (see
 //!   `predeclare_coop_leaves`) rather than lazily on first use: SMT-LIB `pop`
@@ -558,7 +576,8 @@ pub fn prove_bounds_freedom(
 /// This is the shared-memory milestone entry point: relative to
 /// `prove_bounds_freedom` it additionally models the 1-D topology builtins
 /// (`UnitPos`/`CubePos`/`CubeDim`/`CubeCount`, with `AbsolutePos` recomputed as
-/// `CubePos*cube_dim + UnitPos`) and accepts `SharedMemory` (`SharedArray`)
+/// the exact modular `(CubePos*cube_dim + UnitPos) mod 2^32`, `abs_pos_sym`) and
+/// accepts `SharedMemory` (`SharedArray`)
 /// indexing bounded by the array's compile-time length (see the module docs'
 /// "Cooperative mode" / "Shared arrays" bullets). `cube_dim` must be the block
 /// size the kernel is actually launched with — binding it to a value the launch
@@ -1098,6 +1117,13 @@ impl<'a, 'b> Prover<'a, 'b> {
         self.unit_pos_sym()?;
         self.cube_pos_sym()?;
         self.cube_count_sym()?;
+        // `AbsolutePos` carries a `declare-const` + a recomposition assertion
+        // (unlike the pre-round-5 raw `times`/`plus` term, which was pure), so
+        // it must be predeclared at the outermost scope for the same reason as
+        // the other leaves: a lazy first resolution inside a branch arm would
+        // scope its declaration+assertion to that arm and drop them on the
+        // matching `pop`, leaving a later use referencing an undeclared symbol.
+        self.abs_pos_sym()?;
         Ok(())
     }
 
@@ -1140,6 +1166,59 @@ impl<'a, 'b> Prover<'a, 'b> {
         Ok(sym)
     }
 
+    /// The `AbsolutePos` leaf in cooperative mode: a fresh in-range `u32` symbol
+    /// `abs_pos` tied to the **exact modular recomposition**
+    /// `abs_pos = cube_pos*cube_dim + unit_pos − k*2^32` for a fresh wrap count
+    /// `k ≥ 0` (module docs' "Cooperative mode"). This is the soundness-critical
+    /// alternative to building `cube_pos*cube_dim + unit_pos` with raw
+    /// `smt.times`/`smt.plus`: because `cube_pos` is a full-`u32` leaf, that raw
+    /// sum can exceed `2^32`, which real hardware wraps, so the raw (unwrapped)
+    /// term is *not* the hardware value and a guard `ABSOLUTE_POS < len` would
+    /// unsoundly transfer a bound onto `cube_pos` that hardware never honors
+    /// (adversarial review round 5). Declaring `abs_pos` as its own leaf in
+    /// `[0, 2^32)` **congruent to the raw sum mod 2^32** models the wrap exactly:
+    /// a value in `[0, 2^32)` congruent to `X` mod `2^32` is unique, so `abs_pos`
+    /// is pinned to `X mod 2^32` = the true hardware value (multiple wraps
+    /// included, since `k` is unconstrained above by soundness). This keeps the
+    /// "every non-tainted modeled integer term equals the real hardware value"
+    /// invariant (module docs' "Bounded-integer overflow model"). Both products
+    /// are variable×constant (`cube_dim` and `2^32` are constants), hence LINEAR
+    /// — QF_LIA, no QF_NIA. Memoized on `VariableKind::Builtin(AbsolutePos)`; in
+    /// the race walk it is re-derived per thread (`race_walk` clears it so it
+    /// picks up that thread's `UnitPos`).
+    fn abs_pos_sym(&mut self) -> Result<SExpr, Stop> {
+        let kind = VariableKind::Builtin(Builtin::AbsolutePos);
+        if let Some(Some(e)) = self.memo.get(&kind) {
+            return Ok(*e);
+        }
+        let cube_dim = self.coop.expect("abs_pos_sym only reachable in cooperative mode");
+        let unit = self.unit_pos_sym()?;
+        let cube = self.cube_pos_sym()?;
+        // Fresh in-range leaf: `0 <= abs_pos <= u32::MAX` (address-type width).
+        let abs = self.declare_u32_leaf("abs_pos")?;
+        // Fresh wrap count `k >= 0`, additionally bounded above by the constant
+        // `cube_dim - 1`: with `cube_pos <= 2^32 - 1` and `unit_pos <= cube_dim
+        // - 1`, the raw sum is at most `2^32*cube_dim - 1`, so `k = floor(raw /
+        // 2^32) <= cube_dim - 1`. The upper bound is *not* needed for soundness
+        // (the `[0, 2^32)` range plus the congruence already pin `abs_pos` to the
+        // unique residue) but tightens the model at no cost.
+        let k = self.declare_int("abs_wrap", true)?;
+        let k_max = self.smt.numeral((cube_dim as u64).saturating_sub(1));
+        let k_le = self.smt.lte(k, k_max);
+        self.smt.assert(k_le).map_err(smt_err)?;
+        // abs_pos = cube_pos*cube_dim + unit_pos - k*2^32  (both products linear).
+        let cd = self.smt.numeral(cube_dim as u64);
+        let scaled = self.smt.times(cube, cd);
+        let sum = self.smt.plus(scaled, unit);
+        let modulus = self.smt.numeral(wrap_modulus(&address_type()));
+        let wraps = self.smt.times(k, modulus);
+        let rhs = self.smt.sub(sum, wraps);
+        let eq = self.smt.eq(abs, rhs);
+        self.smt.assert(eq).map_err(smt_err)?;
+        self.memo.insert(kind, Some(abs));
+        Ok(abs)
+    }
+
     /// Resolve a topology builtin. In cooperative mode the 1-D leaves are
     /// modeled (module docs' "Cooperative mode"); otherwise only
     /// `AbsolutePos` is (a plain fresh leaf), everything else tainted —
@@ -1156,14 +1235,11 @@ impl<'a, 'b> Prover<'a, 'b> {
             Builtin::CubePos => self.cube_pos_sym().ok(),
             Builtin::CubeCount => self.cube_count_sym().ok(),
             Builtin::CubeDim => Some(self.smt.numeral(cube_dim as u64)),
-            // AbsolutePos = CubePos*cube_dim + UnitPos (the 1-D identity).
-            Builtin::AbsolutePos => {
-                let unit = self.unit_pos_sym().ok()?;
-                let cube = self.cube_pos_sym().ok()?;
-                let cd = self.smt.numeral(cube_dim as u64);
-                let scaled = self.smt.times(cube, cd);
-                Some(self.smt.plus(scaled, unit))
-            }
+            // AbsolutePos = (CubePos*cube_dim + UnitPos) mod 2^32 — the 1-D
+            // identity under finite-width wraparound, encoded exactly by
+            // `abs_pos_sym` (a raw `times`/`plus` here would be the *unwrapped*
+            // over-value and unsound; see `abs_pos_sym`'s docs, round 5).
+            Builtin::AbsolutePos => self.abs_pos_sym().ok(),
             // X/Y/Z, plane, cluster builtins: out of the 1-D subset.
             _ => None,
         }
@@ -1809,10 +1885,17 @@ impl<'a, 'b> Prover<'a, 'b> {
                 Thread::T2 => r.t2,
             }
         };
-        // `UnitPos` -> this thread; force `AbsolutePos` to recompute as
-        // `CubePos*cube_dim + UnitPos` with the new `UnitPos`.
+        // `UnitPos` -> this thread; force `AbsolutePos` to recompute (exact
+        // modular recomposition, `abs_pos_sym`) with the new `UnitPos`.
         self.memo.insert(VariableKind::Builtin(Builtin::UnitPos), Some(t));
         self.memo.remove(&VariableKind::Builtin(Builtin::AbsolutePos));
+        // Predeclare this thread's `abs_pos` leaf + recomposition assertion at
+        // the outermost scope, *before* `process_scope` opens any branch push —
+        // its declaration must outlive every pop so a deferred cross-thread race
+        // obligation whose recorded guard/index mentions `ABSOLUTE_POS` can
+        // still reference it (identical reasoning to `race_setup`'s length
+        // predeclaration). Reads the `UnitPos = t` just set above.
+        self.abs_pos_sym()?;
         self.process_scope(body)?;
         let phase = std::mem::take(&mut self.race.as_mut().expect("race mode").current_phase);
         let r = self.race.as_mut().expect("race mode");
@@ -4469,6 +4552,68 @@ mod tests {
                 );
             }
             other => panic!("expected Refuted (undersized tile), got {other:?}"),
+        }
+    }
+
+    /// Adversarial review round 5 — permanent regression for the `AbsolutePos`
+    /// modular-recomposition soundness fix. A cooperative kernel that guards on
+    /// `ABSOLUTE_POS` but indexes with the *unguarded* `CUBE_POS`. The store's
+    /// bound obligation is `0 <= cube_pos < output.len()`; the only fact in
+    /// scope is the path condition `ABSOLUTE_POS < output.len()`. Under the
+    /// pre-fix raw `cube_pos*256 + unit_pos` (unwrapped) model, that guard
+    /// implied `cube_pos*256 < output.len()` and so `cube_pos < output.len()`,
+    /// a **false `Proved{3}`** — because on real hardware `ABSOLUTE_POS` wraps
+    /// mod `2^32`, so `cube_pos = 2^24, unit_pos = 0` gives `ABSOLUTE_POS = 0 <
+    /// len` while `output[cube_pos]` is wildly OOB for any `len <= 2^24`. With
+    /// the exact modular recomposition (`abs_pos_sym`), `abs_pos = (cube_pos*256
+    /// + unit_pos) mod 2^32` is a fresh in-range leaf, so z3 picks exactly that
+    /// wrapping witness and **`Refuted`s** with a counterexample exhibiting the
+    /// large `cube_pos`. The genuinely-reachable OOB makes `Refuted` (not
+    /// `OutOfSubset`) the honest verdict.
+    #[cube(launch)]
+    fn prover_test_coop_abspos_guard_cubepos_index(output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        tile[tid] = 0.0f32;
+        sync_cube();
+        if ABSOLUTE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn cooperative_abspos_guard_cubepos_index_refutes() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let output = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_coop_abspos_guard_cubepos_index::expand(&mut builder.scope, output);
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [BufferParam { name: "output", is_output: true }];
+        match prove_bounds_freedom_cooperative(&def, &buffers, &[], 256) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(
+                    obligation.contains("output"),
+                    "expected the `output[CUBE_POS]` write to refute: {obligation}"
+                );
+                // The witness is a large `cube_pos` whose recomposition wraps to
+                // a small in-range `abs_pos` — the exact hardware behavior the
+                // guard cannot see. Both symbols appear in the model.
+                assert!(
+                    counterexample.contains("cube_pos"),
+                    "counterexample should exhibit the offending cube_pos: {counterexample}"
+                );
+            }
+            ProveResult::Proved { obligations } => panic!(
+                "FALSE PROOF (unsound): coop abs_pos-guard / cube_pos-index Proved with \
+                 {obligations} obligations — hardware wraps abs_pos, so cube_pos can be 2^24 \
+                 with output[cube_pos] OOB"
+            ),
+            other => panic!("expected Refuted (wrapped abs_pos leaves cube_pos unbounded), got {other:?}"),
         }
     }
 
