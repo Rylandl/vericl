@@ -17,6 +17,7 @@ pub mod contract;
 pub mod evidence;
 pub mod panic;
 pub mod rng;
+pub mod shared;
 pub mod trust;
 
 pub use compare::{
@@ -33,6 +34,7 @@ pub use evidence::{
 };
 pub use panic::catch_reference_panic;
 pub use rng::SplitMix64;
+pub use shared::SharedTile;
 pub use trust::{
     GPU_HARDWARE_TRUST, backend_buffer_trust, proved_bounds_trust, reference_twin_trust,
     shared_frontend_lane_trust,

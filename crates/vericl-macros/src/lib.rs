@@ -34,6 +34,7 @@ use syn::{
     parse_macro_input,
 };
 
+mod coop;
 mod suite;
 
 /// Constructs outside the v0 subset. Encountering any of these idents in a
@@ -265,6 +266,13 @@ struct ContractSpec {
     /// annotated functions this kernel calls (kernel composition). `[]`
     /// when the clause is absent.
     uses: Vec<Ident>,
+    /// `cooperative(cube_dim = N)` clause, if declared — gates the
+    /// phase-split cooperative (workgroup-shared-memory) twin mode
+    /// (docs/design-shared-memory.md §7.1). The `Span` is the clause's, for
+    /// blaming a kernel that declares it but uses no cooperative topology; the
+    /// `Expr` is the pinned `cube_dim` (the launch block size and the prover's
+    /// `CUBE_DIM` binding).
+    cooperative: Option<(proc_macro2::Span, Expr)>,
 }
 
 fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
@@ -278,6 +286,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
     let mut gen_entries: Vec<GenEntry> = Vec::new();
     let mut instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)> = None;
     let mut uses: Vec<Ident> = Vec::new();
+    let mut cooperative: Option<(proc_macro2::Span, Expr)> = None;
 
     for meta in metas {
         match &meta {
@@ -388,11 +397,50 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
                     })?;
                 uses.extend(idents);
             }
+            Meta::List(list) if list.path.is_ident("cooperative") => {
+                if cooperative.is_some() {
+                    return Err(syn::Error::new(
+                        list.span(),
+                        "duplicate cooperative(...) clause; a kernel declares at most one",
+                    ));
+                }
+                let inner: Punctuated<Meta, Token![,]> = list
+                    .parse_args_with(Punctuated::parse_terminated)
+                    .map_err(|e| {
+                        syn::Error::new(
+                            list.span(),
+                            format!("cooperative(...) expects `cube_dim = N`: {e}"),
+                        )
+                    })?;
+                let mut cube_dim: Option<Expr> = None;
+                for m in &inner {
+                    match m {
+                        Meta::NameValue(nv) if nv.path.is_ident("cube_dim") => {
+                            cube_dim = Some(nv.value.clone());
+                        }
+                        other => {
+                            return Err(syn::Error::new(
+                                other.span(),
+                                "cooperative(...) only accepts `cube_dim = N` (the pinned \
+                                 workgroup block size — docs/design-shared-memory.md §7.1)",
+                            ));
+                        }
+                    }
+                }
+                let cube_dim = cube_dim.ok_or_else(|| {
+                    syn::Error::new(
+                        list.span(),
+                        "cooperative(...) requires `cube_dim = N` (the pinned workgroup block \
+                         size)",
+                    )
+                })?;
+                cooperative = Some((list.span(), cube_dim));
+            }
             other => {
                 return Err(syn::Error::new(
                     other.span(),
                     "expected `assumes(...)`, `compare(...)`, `gen(...)`, `instantiate(...)`, \
-                     `uses(...)`, or `wrapping`",
+                     `uses(...)`, `cooperative(...)`, or `wrapping`",
                 ));
             }
         }
@@ -406,6 +454,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
         gen_entries,
         instantiate,
         uses,
+        cooperative,
     })
 }
 
@@ -437,6 +486,7 @@ fn transform_body(
     ts: TokenStream2,
     subst: &GenericSubst,
     allow_absolute_pos: bool,
+    coop: bool,
     errors: &mut Vec<syn::Error>,
 ) -> TokenStream2 {
     let mut out = TokenStream2::new();
@@ -444,7 +494,12 @@ fn transform_body(
         match tt {
             TokenTree::Ident(id) => {
                 let s = id.to_string();
-                if s == "ABSOLUTE_POS" && allow_absolute_pos {
+                // The ordinary twin rewrites `ABSOLUTE_POS` to the flat
+                // sequential loop variable. The cooperative twin does NOT: it
+                // binds `ABSOLUTE_POS = CUBE_POS*cube_dim + unit_pos` per
+                // segment (see `coop::build_reference_body`), so it is left as a
+                // bare ident here.
+                if !coop && s == "ABSOLUTE_POS" && allow_absolute_pos {
                     out.extend(std::iter::once(TokenTree::Ident(Ident::new(
                         "__vericl_abs_pos",
                         id.span(),
@@ -455,7 +510,17 @@ fn transform_body(
                     out.extend(replacement.clone());
                     continue;
                 }
-                let is_banned_topology = s == "ABSOLUTE_POS" && !allow_absolute_pos;
+                // Under the `cooperative(...)` clause, the 1-D topology builtins
+                // and `SharedMemory`/`sync_cube` leave `BANNED_IDENTS` (§7.2) —
+                // but *only* for cooperative kernels; they stay banned
+                // everywhere else. The X/Y/Z variants, `sync_units`,
+                // `sync_storage`, `terminate`, `plane_*`, `Atomic`, etc. stay
+                // banned even here (1-D only, §7.3).
+                if coop && coop::COOP_ALLOWED.contains(&s.as_str()) {
+                    out.extend(std::iter::once(TokenTree::Ident(id)));
+                    continue;
+                }
+                let is_banned_topology = s == "ABSOLUTE_POS" && !allow_absolute_pos && !coop;
                 if is_banned_topology
                     || BANNED_IDENTS.contains(&s.as_str())
                     || BANNED_PREFIXES.iter().any(|p| s.starts_with(p))
@@ -466,6 +531,16 @@ fn transform_body(
                          thread\" is calling it; read positions in the kernel and pass them as \
                          plain scalar arguments instead"
                             .to_string()
+                    } else if COOP_CONSTRUCTS.contains(&s.as_str()) {
+                        // A cooperative construct in a NON-cooperative kernel:
+                        // point the author at the `cooperative(...)` clause
+                        // rather than the generic subset message (deliverable 1).
+                        format!(
+                            "`{s}` is a workgroup-cooperative construct outside the ordinary \
+                             vericl v0 subset; add a `cooperative(cube_dim = N)` clause to \
+                             `#[vericl::kernel(...)]` to opt this kernel into the phase-split \
+                             cooperative twin (docs/design-shared-memory.md §7.1)"
+                        )
                     } else {
                         format!(
                             "`{s}` is outside the vericl v0 kernel subset; unsupported constructs \
@@ -478,7 +553,7 @@ fn transform_body(
                 out.extend(std::iter::once(TokenTree::Ident(id)));
             }
             TokenTree::Group(g) => {
-                let inner = transform_body(g.stream(), subst, allow_absolute_pos, errors);
+                let inner = transform_body(g.stream(), subst, allow_absolute_pos, coop, errors);
                 let mut ng = Group::new(g.delimiter(), inner);
                 ng.set_span(g.span());
                 out.extend(std::iter::once(TokenTree::Group(ng)));
@@ -488,6 +563,13 @@ fn transform_body(
     }
     out
 }
+
+/// The cooperative constructs that a NON-cooperative kernel gets a targeted
+/// "add cooperative(...)" error for (deliverable 1), rather than the generic
+/// out-of-subset message — the subset of `BANNED_IDENTS` that the
+/// `cooperative(...)` clause specifically lifts.
+const COOP_CONSTRUCTS: &[&str] =
+    &["UNIT_POS", "CUBE_POS", "CUBE_DIM", "CUBE_COUNT", "SharedMemory", "sync_cube"];
 
 /// Token-wise generic substitution only (no ABSOLUTE_POS rewrite, no
 /// banned-construct check) — used on parameter *types*, which never contain
@@ -1538,13 +1620,77 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         }
     }
 
-    // --- derive the reference twin body: ABSOLUTE_POS rewrite + F -> f32
+    // --- cooperative(...) gate (docs/design-shared-memory.md §7). Under the
+    // clause the phase-split cooperative twin (coop.rs) replaces the ordinary
+    // loop-over-ABSOLUTE_POS twin; the cooperative topology builtins /
+    // SharedMemory / sync_cube leave BANNED_IDENTS (§7.2). The clause and the
+    // topology must agree both ways: a clause on a non-cooperative kernel is a
+    // contract lie, and a cooperative construct without the clause is caught by
+    // transform_body's targeted "add cooperative(...)" error (deliverable 1).
+    let is_coop = spec.cooperative.is_some();
+    if let Some((clause_span, cube_dim_expr)) = &spec.cooperative {
+        if !coop::kernel_uses_cooperative(&func.block) {
+            return Err(syn::Error::new(
+                *clause_span,
+                format!(
+                    "kernel `{fn_name_str}` declares cooperative(...) but uses no workgroup-\
+                     cooperative topology (UNIT_POS / CUBE_POS / CUBE_DIM / CUBE_COUNT / \
+                     sync_cube / SharedMemory) — remove the clause (an unused cooperative \
+                     declaration is a contract lie)"
+                ),
+            ));
+        }
+        // cooperative kernels are v1-restricted: no #[comptime] params (use
+        // data.len()/the CUBE_COUNT builtin), no uses(...)/wrapping composition
+        // (untested with the phase-split twin — rejected rather than mishandled).
+        if let Some(p) = params.iter().find(|p| matches!(p.kind, ParamKind::Comptime(_))) {
+            return Err(syn::Error::new(
+                p.name.span(),
+                format!(
+                    "kernel `{fn_name_str}`: #[comptime] parameters in a cooperative kernel are \
+                     outside the vericl v1 subset (use `data.len()` / the `CUBE_COUNT` builtin \
+                     instead) — deferred rather than mis-handled (docs/design-shared-memory.md \
+                     §7.4)"
+                ),
+            ));
+        }
+        if !spec.uses.is_empty() {
+            return Err(syn::Error::new(
+                *clause_span,
+                format!(
+                    "kernel `{fn_name_str}`: uses(...) helper composition combined with \
+                     cooperative(...) is outside the vericl v1 subset (composition inside the \
+                     phase-split twin is deferred — docs/design-shared-memory.md §7.4)"
+                ),
+            ));
+        }
+        // Best-effort: pin a power-of-two cube_dim when it is an integer literal
+        // (the tree reduction `half /= 2` only covers the block cleanly for a
+        // power of two — §7.1). A non-literal expr is left to the runtime launch.
+        if let Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(li), .. }) = cube_dim_expr {
+            if let Ok(v) = li.base10_parse::<u64>() {
+                if v == 0 || !v.is_power_of_two() {
+                    return Err(syn::Error::new(
+                        cube_dim_expr.span(),
+                        format!(
+                            "cooperative(cube_dim = {v}) must be a power of two (the tree \
+                             reduction halving covers a block cleanly only for a power of two — \
+                             docs/design-shared-memory.md §7.1)"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // --- derive the reference twin body: ABSOLUTE_POS rewrite (ordinary twin
+    // only — the cooperative twin binds ABSOLUTE_POS per segment) + F -> f32
     // token substitution + banned-construct rejection, then always parse as
     // a `syn::Block` so the twin-only Fold passes below (unroll-attribute
     // stripping, and optionally `wrapping`) can run.
     let mut errors = Vec::new();
     let ref_body_tokens =
-        transform_body(func.block.to_token_stream(), &plan.generic_subst, true, &mut errors);
+        transform_body(func.block.to_token_stream(), &plan.generic_subst, true, is_coop, &mut errors);
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
         a
@@ -1586,25 +1732,28 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         return Err(combined);
     }
 
-    // uses(...): rewrite calls to declared helpers to their `_vericl_ref`
-    // twin, and reject any other call this macro invocation can't account
-    // for — see `UsesRewriteFold`'s doc for exactly what "can't account
-    // for" means.
-    let uses_set: HashSet<String> = used_names.iter().cloned().collect();
-    let locals = collect_locals(&ref_block, &params);
-    let mut uses_rewrite = UsesRewriteFold { uses: &uses_set, locals: &locals, errors: Vec::new() };
-    ref_block = uses_rewrite.fold_block(ref_block);
-    if let Some(combined) = uses_rewrite.errors.into_iter().reduce(|mut a, b| {
-        a.combine(b);
-        a
-    }) {
-        return Err(combined);
-    }
+    if !is_coop {
+        // uses(...): rewrite calls to declared helpers to their `_vericl_ref`
+        // twin, and reject any other call this macro invocation can't account
+        // for — see `UsesRewriteFold`'s doc for exactly what "can't account
+        // for" means. (Cooperative kernels reject uses(...) above.)
+        let uses_set: HashSet<String> = used_names.iter().cloned().collect();
+        let locals = collect_locals(&ref_block, &params);
+        let mut uses_rewrite =
+            UsesRewriteFold { uses: &uses_set, locals: &locals, errors: Vec::new() };
+        ref_block = uses_rewrite.fold_block(ref_block);
+        if let Some(combined) = uses_rewrite.errors.into_iter().reduce(|mut a, b| {
+            a.combine(b);
+            a
+        }) {
+            return Err(combined);
+        }
 
-    // `wrapping`: fold the already-ABSOLUTE_POS-rewritten twin body, and
-    // ONLY the twin — the `#[cube]` kernel re-emitted above is untouched.
-    if spec.wrapping.is_some() {
-        ref_block = WrappingFold.fold_block(ref_block);
+        // `wrapping`: fold the already-ABSOLUTE_POS-rewritten twin body, and
+        // ONLY the twin — the `#[cube]` kernel re-emitted above is untouched.
+        if spec.wrapping.is_some() {
+            ref_block = WrappingFold.fold_block(ref_block);
+        }
     }
     let ref_body = ref_block.to_token_stream();
 
@@ -1763,17 +1912,54 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         quote!(::<#(#generic_types),*>)
     };
 
-    // --- conformance_case(): the macro-generated GPU launch/input-gen glue
-    // (README ergonomics milestone) — `generate_case` per the `gen(...)`
-    // clause, then run reference vs. GPU and compare every `&mut Array`.
-    let conformance_items = build_conformance_items(
-        &params,
-        &spec.gen_entries,
-        fn_name,
-        &fn_name_str,
-        &plan.comptime_values,
-        generic_types,
-    )?;
+    // --- reference() function + conformance_case(): the macro-generated GPU
+    // launch/input-gen glue (README ergonomics milestone). The cooperative
+    // clause swaps in the phase-split twin (coop.rs) and the cooperative
+    // launch/output model (§7.1: per-cube partials sized `cube_count`).
+    let (reference_fn, conformance_items): (TokenStream2, TokenStream2) = if is_coop {
+        let (_span, cube_dim_expr) = spec.cooperative.as_ref().expect("is_coop");
+        let coop_body = coop::build_reference_body(&ref_block, &params, &fn_name_str)?;
+        let reference_fn = quote! {
+            /// Phase-split cooperative reference execution (docs/design-shared-
+            /// memory.md §4): per cube, per barrier-delimited segment, per
+            /// `unit_pos`, with `SharedMemory` a per-cube poison-initialised
+            /// tile and `CUBE_*`/`UNIT_POS`/`ABSOLUTE_POS` bound to the loop
+            /// variables/constants. `cube_count` is derived by the caller
+            /// (`conformance_case`) from the case size; `cube_dim` is the
+            /// `cooperative(cube_dim = …)` pinned block size.
+            pub fn reference(#(#ref_params,)* cube_count: usize, cube_dim: usize) {
+                #coop_body
+            }
+        };
+        let conformance = coop::build_conformance_items(
+            &params,
+            &spec.gen_entries,
+            fn_name,
+            &fn_name_str,
+            cube_dim_expr,
+            generic_types,
+        )?;
+        (reference_fn, conformance)
+    } else {
+        let reference_fn = quote! {
+            /// Sequential scalar reference execution over
+            /// `ABSOLUTE_POS in 0..num_threads` — the same iteration space as
+            /// the GPU dispatch, in deterministic ascending order.
+            pub fn reference(#(#ref_params,)* num_threads: usize) {
+                #(#comptime_bindings)*
+                for __vericl_abs_pos in 0..num_threads #ref_body
+            }
+        };
+        let conformance = build_conformance_items(
+            &params,
+            &spec.gen_entries,
+            fn_name,
+            &fn_name_str,
+            &plan.comptime_values,
+            generic_types,
+        )?;
+        (reference_fn, conformance)
+    };
 
     let doc = if wrapping {
         format!(
@@ -1861,13 +2047,7 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 true #(&& (#assume_exprs))*
             }
 
-            /// Sequential scalar reference execution over
-            /// `ABSOLUTE_POS in 0..num_threads` — the same iteration space as
-            /// the GPU dispatch, in deterministic ascending order.
-            pub fn reference(#(#ref_params,)* num_threads: usize) {
-                #(#comptime_bindings)*
-                for __vericl_abs_pos in 0..num_threads #ref_body
-            }
+            #reference_fn
 
             /// Each array parameter's name and whether it's an output, in
             /// buffer-registration order — see `kernel_definition` below.
@@ -2148,7 +2328,7 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
     // work, not yet demanded by any dogfooded shape).
     let mut errors = Vec::new();
     let ref_body_tokens =
-        transform_body(func.block.to_token_stream(), &plan.generic_subst, false, &mut errors);
+        transform_body(func.block.to_token_stream(), &plan.generic_subst, false, false, &mut errors);
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
         a

@@ -458,6 +458,135 @@ pub fn stepped_loop_oob_write(x: &Array<u32>, y: &mut Array<u32>) {
     }
 }
 
+// ===================================================================
+// Cooperative (workgroup shared-memory) reduction kernels — the
+// shared-memory milestone M5 clean-room probes (docs/design-shared-
+// memory.md §3, §4.6). Deliberately NOT wired into `vericl::suite!` yet:
+// the coupling of the differential claim to the race-freedom proof is M6
+// and the suite wiring is M7. They exist here so the *generated*
+// phase-split cooperative twin (coop.rs) can be differential-tested
+// bit-exact against wgpu (see the `*_coop_*` tests below).
+// ===================================================================
+
+/// `block_sum_reduce` — the v1 reduction shape (docs/design-shared-memory.md
+/// §3): block-strided load into a per-cube `SharedMemory` tile, one barrier,
+/// a uniform tree reduction (one barrier per level), and a single-writer
+/// per-cube partial store guarded by `tid == 0`. One partial per workgroup, so
+/// the output is sized `cube_count` (not the flat thread count) — the
+/// cooperative launch/output model (§7.1).
+///
+/// The macro's `cooperative(cube_dim = 256)` clause opts this kernel into the
+/// phase-split twin: the body is split at each `sync_cube()` into segments, run
+/// per cube / per segment / per `unit_pos`, with the tile a poison-initialised
+/// per-cube array (§4.5). Bit-exact vs wgpu because the twin sums in the
+/// identical tree order (§4.6).
+#[vericl::kernel(
+    assumes(input.iter().all(|v| v.abs() <= 1000.0)),
+    compare(max_ulp = 0),
+    gen(input in -1000.0..=1000.0),
+    cooperative(cube_dim = 256)
+)]
+#[cube(launch)]
+pub fn block_sum_reduce(input: &Array<f32>, output: &mut Array<f32>) {
+    let tid = UNIT_POS as usize;
+    let mut tile = SharedMemory::<f32>::new(256usize);
+    if ABSOLUTE_POS < input.len() {
+        tile[tid] = input[ABSOLUTE_POS];
+    } else {
+        tile[tid] = 0.0f32;
+    }
+    sync_cube();
+
+    let mut half = CUBE_DIM as usize / 2;
+    while half > 0usize {
+        if tid < half {
+            let a = tile[tid];
+            let b = tile[tid + half];
+            tile[tid] = a + b;
+        }
+        sync_cube();
+        half /= 2usize;
+    }
+
+    if tid == 0usize && CUBE_POS < output.len() {
+        output[CUBE_POS] = tile[0usize];
+    }
+}
+
+/// `grid_stride_reduce` — the `reduce_rssi`-shaped reduction (docs/design-
+/// shared-memory.md §3): a *non-cooperative* grid-stride accumulation loop
+/// (`while k < data.len()`, no barrier inside — the shape §4 requires be
+/// transformable, appearing before the first barrier) squares and sums a
+/// strided slice into a per-thread `local`, which then feeds the same tree
+/// reduction as `block_sum_reduce`. Uses the `CUBE_COUNT` builtin for the
+/// grid stride (validated runtime value on wgpu), so no extra parameter is
+/// needed and the twin's `CUBE_COUNT` binds to the launch cube_count.
+#[vericl::kernel(
+    assumes(data.iter().all(|v| v.abs() <= 100.0)),
+    compare(max_ulp = 0),
+    gen(data in -100.0..=100.0),
+    cooperative(cube_dim = 256)
+)]
+#[cube(launch)]
+pub fn grid_stride_reduce(data: &Array<f32>, partials: &mut Array<f32>) {
+    let tid = UNIT_POS as usize;
+    let stride = CUBE_DIM as usize * CUBE_COUNT;
+    let n = data.len();
+    let mut k = ABSOLUTE_POS;
+    let mut local = 0.0f32;
+    while k < n {
+        local += data[k] * data[k];
+        k += stride;
+    }
+
+    let mut tile = SharedMemory::<f32>::new(256usize);
+    tile[tid] = local;
+    sync_cube();
+
+    let mut half = CUBE_DIM as usize / 2;
+    while half > 0usize {
+        if tid < half {
+            let a = tile[tid];
+            let b = tile[tid + half];
+            tile[tid] = a + b;
+        }
+        sync_cube();
+        half /= 2usize;
+    }
+
+    if tid == 0usize && CUBE_POS < partials.len() {
+        partials[CUBE_POS] = tile[0usize];
+    }
+}
+
+/// A deliberately-buggy cooperative kernel that **reads shared memory before
+/// writing it** (`tile[tid]` is read in `tile[tid] + input[ABSOLUTE_POS]`
+/// before any thread has written `tile[tid]`). On the GPU this reads
+/// uninitialised shared memory (garbage); the phase-split twin poison-
+/// initialises the tile (docs/design-shared-memory.md §4.5), so its
+/// `reference` **panics loudly** on the poison read instead of masking the bug
+/// with a zero — demonstrated by `shared_read_before_write_twin_panics_on_
+/// poison` below. Not suite-wired (it is a defect probe, never GPU-launched
+/// for evidence).
+#[vericl::kernel(
+    assumes(input.iter().all(|v| v.abs() <= 100.0)),
+    compare(max_ulp = 0),
+    gen(input in -100.0..=100.0),
+    cooperative(cube_dim = 256)
+)]
+#[cube(launch)]
+pub fn shared_read_before_write(input: &Array<f32>, output: &mut Array<f32>) {
+    let tid = UNIT_POS as usize;
+    let mut tile = SharedMemory::<f32>::new(256usize);
+    // BUG: `tile[tid]` is read here before any write to it.
+    let acc = tile[tid] + input[ABSOLUTE_POS];
+    tile[tid] = acc;
+    sync_cube();
+    if tid == 0usize && CUBE_POS < output.len() {
+        output[CUBE_POS] = tile[0usize];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,6 +1293,162 @@ mod tests {
         ) {
             vericl_ir::ProveResult::Proved { .. } => {}
             other => panic!("expected fir_pair_kernel to prove, got {other:?}"),
+        }
+    }
+
+    // =================================================================
+    // Cooperative reduction kernels (shared-memory milestone M5).
+    // =================================================================
+
+    /// Independently-written sequential block-strided tree reduction — the
+    /// cross-check reference for `block_sum_reduce`'s macro-derived twin. NOT
+    /// derived from the kernel tokens: written by hand from the reduction
+    /// algorithm, matching the GPU's tree order (so the check is bit-exact and
+    /// not circular — same posture as `fmix32` / `xorshift_twin_matches_
+    /// handwritten`).
+    fn handwritten_block_sum(input: &[f32], cube_count: usize, cube_dim: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; cube_count];
+        for (c, slot) in out.iter_mut().enumerate() {
+            let mut tile = vec![0.0f32; cube_dim];
+            for (tid, cell) in tile.iter_mut().enumerate() {
+                let abs = c * cube_dim + tid;
+                *cell = if abs < input.len() { input[abs] } else { 0.0 };
+            }
+            let mut half = cube_dim / 2;
+            while half > 0 {
+                for tid in 0..half {
+                    tile[tid] += tile[tid + half];
+                }
+                half /= 2;
+            }
+            *slot = tile[0];
+        }
+        out
+    }
+
+    /// Independently-written grid-stride squared-sum reduction — the
+    /// cross-check reference for `grid_stride_reduce`'s twin.
+    fn handwritten_grid_stride(data: &[f32], cube_count: usize, cube_dim: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; cube_count];
+        let stride = cube_dim * cube_count;
+        for (c, slot) in out.iter_mut().enumerate() {
+            let mut tile = vec![0.0f32; cube_dim];
+            for (tid, cell) in tile.iter_mut().enumerate() {
+                let mut k = c * cube_dim + tid;
+                let mut local = 0.0f32;
+                while k < data.len() {
+                    local += data[k] * data[k];
+                    k += stride;
+                }
+                *cell = local;
+            }
+            let mut half = cube_dim / 2;
+            while half > 0 {
+                for tid in 0..half {
+                    tile[tid] += tile[tid + half];
+                }
+                half /= 2;
+            }
+            *slot = tile[0];
+        }
+        out
+    }
+
+    /// The macro-derived phase-split twin of `block_sum_reduce` reproduces the
+    /// independent handwritten reduction bit-for-bit, across sizes that stress
+    /// the tail-guard (`n` not a multiple of `cube_dim`) and multi-cube
+    /// (`cube_count > 1`). Guards the source-to-twin derivation itself.
+    #[test]
+    fn block_sum_reduce_twin_matches_handwritten() {
+        let cube_dim = 256usize;
+        for &n in &[1usize, 3, 200, 256, 257, 512, 1000, 4096] {
+            let input: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.5 - 1.0).collect();
+            let cube_count = n.div_ceil(cube_dim).max(1);
+            let mut got = vec![0.0f32; cube_count];
+            block_sum_reduce_vericl::reference(&input, &mut got, cube_count, cube_dim);
+            let want = handwritten_block_sum(&input, cube_count, cube_dim);
+            for c in 0..cube_count {
+                assert_eq!(
+                    got[c].to_bits(),
+                    want[c].to_bits(),
+                    "n={n} cube {c}: twin={} handwritten={}",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
+    }
+
+    /// Same for `grid_stride_reduce`, including a small-`cube_count` /
+    /// large-`data` configuration so the pre-barrier grid-stride accumulation
+    /// loop runs many iterations (the `while k < data.len()` shape §4 requires
+    /// be transformable).
+    #[test]
+    fn grid_stride_reduce_twin_matches_handwritten() {
+        let cube_dim = 256usize;
+        // (cube_count, data_len) pairs — the second column forces multi-iter.
+        for &(cube_count, n) in &[(1usize, 300usize), (2, 700), (4, 4096), (3, 5000)] {
+            let data: Vec<f32> = (0..n).map(|i| (i % 11) as f32 * 0.25 - 1.0).collect();
+            let mut got = vec![0.0f32; cube_count];
+            grid_stride_reduce_vericl::reference(&data, &mut got, cube_count, cube_dim);
+            let want = handwritten_grid_stride(&data, cube_count, cube_dim);
+            for c in 0..cube_count {
+                assert_eq!(
+                    got[c].to_bits(),
+                    want[c].to_bits(),
+                    "cube_count={cube_count} n={n} cube {c}: twin={} handwritten={}",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
+    }
+
+    /// Shared-memory definedness (docs/design-shared-memory.md §4.5): the
+    /// generated twin poison-initialises shared memory, so a kernel that reads
+    /// `tile[tid]` before writing it makes the reference **panic loudly**
+    /// rather than silently reading a zero the GPU would read as garbage.
+    #[test]
+    #[should_panic(expected = "poison")]
+    fn shared_read_before_write_twin_panics_on_poison() {
+        let input = vec![1.0f32; 256];
+        let mut output = vec![0.0f32; 1];
+        shared_read_before_write_vericl::reference(&input, &mut output, 1, 256);
+    }
+
+    /// Twin/prover subset agreement: the exact clean-room kernels whose twin
+    /// M5 derives are also accepted by the race-freedom and cooperative bounds
+    /// provers (the two lanes cover the *same* kernels — §4.3). `block_sum_
+    /// reduce` proves data-race free and in-bounds at `cube_dim = 256`.
+    #[test]
+    fn block_sum_reduce_definition_is_race_free_and_in_bounds() {
+        let def = block_sum_reduce_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = block_sum_reduce_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        // The race walk discharges data-race freedom AND the tree-reduction
+        // bounds obligations that the single-thread cooperative bounds walk
+        // defers (a `Branch::Loop` carrying `sync_cube()` is `OutOfSubset` in
+        // the plain walk — see the prover module docs).
+        match vericl_ir::prove_race_freedom(&def, &buffers, &[], 256) {
+            vericl_ir::ProveResult::Proved { .. } => {}
+            other => panic!("expected race-free Proved, got {other:?}"),
+        }
+    }
+
+    /// Same agreement check for `grid_stride_reduce` (its extra pre-barrier
+    /// grid-stride accumulation loop is modeled by the same walker).
+    #[test]
+    fn grid_stride_reduce_definition_is_race_free() {
+        let def = grid_stride_reduce_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = grid_stride_reduce_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        match vericl_ir::prove_race_freedom(&def, &buffers, &[], 256) {
+            vericl_ir::ProveResult::Proved { .. } => {}
+            other => panic!("expected race-free Proved, got {other:?}"),
         }
     }
 }
