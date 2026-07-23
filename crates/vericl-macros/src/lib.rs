@@ -1205,7 +1205,15 @@ impl Fold for FloatMethodCheck {
     }
 
     fn fold_expr_call(&mut self, i: syn::ExprCall) -> syn::ExprCall {
-        if let Expr::Path(p) = i.func.as_ref() {
+        // Inspect the callee *through* any redundant parens/groups so a
+        // parenthesised intrinsic `(f32::cast_from)(x)` / `(u32::mul_hi)(a, b)`
+        // is checked exactly like the bare form (round-3/4 F1 paren-evasion
+        // standard). Borrow-only via `peel_paren`: unlike `ShimRewriteFold`
+        // this fold is a pure check (see the struct doc) and must not mutate
+        // the tree. Defense-in-depth — `ShimRewriteFold` already peels its own
+        // callee before this fold runs, but this fold rejects correctly even in
+        // isolation / under any reordering.
+        if let Expr::Path(p) = peel_paren(i.func.as_ref()) {
             // Skip our own shim calls (`::vericl::host_shims::mul_hi`, …): a
             // `ShimRewriteFold`-emitted shim's LAST segment can share a name
             // with a rejected intrinsic (`mul_hi`), but it is a verified host
@@ -1256,7 +1264,17 @@ impl Fold for FloatMethodCheck {
 struct ShimRewriteFold;
 
 impl ShimRewriteFold {
-    fn rewrite_call(call: ExprCall) -> Expr {
+    fn rewrite_call(mut call: ExprCall) -> Expr {
+        // Peel redundant parens/groups around the callee so a parenthesised
+        // intrinsic `(f32::cast_from)(x)` / `(u32::mul_hi)(a, b)` classifies
+        // exactly like the bare form — the round-3/4 F1 paren-evasion standard
+        // (see `peel_paren_group` / the `UsesRewriteFold` precedent), applied
+        // uniformly here so the shim rewrite cannot be evaded by wrapping the
+        // callee. Dropping the parens is semantically identity for the derived
+        // twin, and a no-op for the overwhelmingly common bare callee (leaves
+        // its tokens byte-identical).
+        let func = std::mem::replace(&mut call.func, Box::new(Expr::Verbatim(TokenStream2::new())));
+        call.func = Box::new(peel_paren_group(*func));
         let Expr::Path(ep) = call.func.as_ref() else {
             return Expr::Call(call);
         };
@@ -4989,6 +5007,56 @@ mod tests {
         assert!(
             err.to_string().contains("cast_from"),
             "the rejection must name the method: {err}"
+        );
+    }
+
+    /// Round-7 F1 (defense-in-depth): a *parenthesised* intrinsic callee
+    /// `(f32::cast_from)(x)` / `(u32::mul_hi)(a, b)` must be rewritten to its
+    /// verified shim exactly like the bare form — the same round-3/4 paren-peel
+    /// standard `UsesRewriteFold` already applies. Pre-fix `rewrite_call` saw
+    /// `Expr::Paren` at the callee and returned the call unrewritten (the shim
+    /// evaded), leaving a `unexpanded!()` intrinsic that panics loudly host-side.
+    #[test]
+    fn shim_rewrite_peels_parenthesised_callee() {
+        assert_eq!(shim("(f32::cast_from)(x)"), "::vericl::host_shims::cast_to_f32(x)");
+        assert_eq!(shim("(u32::mul_hi)(a,b)"), "::vericl::host_shims::mul_hi(a,b)");
+        // Nested parens/groups peel to the same result as the bare form.
+        assert_eq!(shim("((f32::cast_from))(x)"), "::vericl::host_shims::cast_to_f32(x)");
+        assert_eq!(shim("((u32::mul_hi))(a,b)"), "::vericl::host_shims::mul_hi(a,b)");
+    }
+
+    fn float_check_errs(src: &str) -> Vec<String> {
+        let expr: Expr = syn::parse_str(src).expect("valid expr");
+        let mut chk = FloatMethodCheck::default();
+        let _ = chk.fold_expr(expr);
+        chk.errors.iter().map(|e| e.to_string()).collect()
+    }
+
+    /// Round-7 F1 (defense-in-depth): `FloatMethodCheck` rejects a rejected
+    /// intrinsic through a parenthesised callee exactly like the bare form,
+    /// on its own — independent of `ShimRewriteFold`'s peel. `inverse_sqrt`
+    /// (a `FLOAT_METHOD_REJECT` name that `ShimRewriteFold` never rewrites)
+    /// and `mul_hi` (checked here in isolation, before any shim rewrite) both
+    /// reject in bare and parenthesised form; a non-rejected callee does not.
+    #[test]
+    fn float_method_check_peels_parenthesised_callee() {
+        for (bare, paren) in
+            [("f32::inverse_sqrt(x)", "(f32::inverse_sqrt)(x)"), ("u32::mul_hi(a,b)", "(u32::mul_hi)(a,b)")]
+        {
+            let bare_errs = float_check_errs(bare);
+            let paren_errs = float_check_errs(paren);
+            assert_eq!(bare_errs.len(), 1, "bare `{bare}` must be rejected once");
+            assert_eq!(
+                paren_errs.len(),
+                1,
+                "parenthesised `{paren}` must reject identically to the bare form"
+            );
+            assert_eq!(bare_errs, paren_errs, "paren form must produce the same rejection");
+        }
+        // Negative control: a parenthesised *non*-rejected callee is untouched.
+        assert!(
+            float_check_errs("(some_helper)(x)").is_empty(),
+            "a non-rejected parenthesised callee must not be rejected"
         );
     }
 

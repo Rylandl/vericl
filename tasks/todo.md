@@ -1547,3 +1547,108 @@ unchanged; +4 kernels justified). `VERICL_UPDATE` run cpu-then-default LAST per 
 lesson — committed evidence is default (non-cpu) shape. Negative test per positive (macro-level
 white-box + example-level twin guards + the neg-control helper). No prover changes (taint suffices
 v1, documented).
+
+## Round-7 adversarial review (2026-07-23) — MERGE-READY
+
+Verdict: **MERGE-READY, no false-`Proved`** — the review attacked batches 1+2 together (the
+shim/comptime/helper-wrapping surface) plus the whole prior stack. **No confirmed CRITICAL; no
+suspected soundness defect.** Two LOW findings were closed here (one defense-in-depth, one
+pre-existing blast-radius-class), and one pre-existing loud-only hazard was classified and queued.
+The surfaces the reviewer probed **held under attack with real machinery**: signed-scrutinee
+default reachability (a `match` on a signed value with an unreachable-looking default still walked
+and defended), the divmod nonzero/nonnegativity gate protecting the `Switch` lowering, the
+taint-union write machinery across branch/switch merges, huge-`K`/zero-length `LenPlusConstLe`
+handling (the `K` literal never wraps the length leaf), shim discrimination proven by an injected
+1-ULP defect (the twin's shim vs the real intrinsic caught it), and the comptime-laundering
+rejections (a runtime-value or nested-macro `comptime!` still rejected by name). None flipped.
+
+**F1 (LOW, defense-in-depth) — paren-wrapped intrinsic evasion of the shim rewrite / float-method
+reject (`crates/vericl-macros/src/lib.rs`).** `(f32::cast_from)(x)` / `(u32::mul_hi)(a, b)` (a
+parenthesised callee) slipped past `ShimRewriteFold::rewrite_call` and `FloatMethodCheck::
+fold_expr_call` — both inspected only `Expr::Path` at the immediate callee, so a `Expr::Paren`/
+`Expr::Group` wrapper classified as neither a recognized intrinsic (→ shim rewrite) nor a rejected
+name. The result was never silent — the un-rewritten `unexpanded!()` intrinsic panics loudly
+host-side in the twin — but the round-3/4 paren-peel standard (F1 audit, the `UsesRewriteFold`
+precedent) must apply uniformly. Fix: peel `Paren`/`Group` on the callee in **both** folds before
+classifying — `ShimRewriteFold::rewrite_call` now peels in place via the existing `peel_paren_group`
+(identity for the twin; byte-identical for the common bare callee), and `FloatMethodCheck::
+fold_expr_call` peels **borrow-only** via `peel_paren` (that fold is a pure check and must not mutate
+the tree). Defense-in-depth: `ShimRewriteFold` runs first and already un-parens the callee, but
+`FloatMethodCheck` now rejects correctly in isolation / under any reordering. Tests (`vericl-macros`,
++2): `shim_rewrite_peels_parenthesised_callee` (`(f32::cast_from)(x)`, `(u32::mul_hi)(a,b)`, and
+doubly-nested, all rewrite identically to the bare form) and `float_method_check_peels_
+parenthesised_callee` (`(f32::inverse_sqrt)(x)` and `(u32::mul_hi)(a,b)` reject identically bare vs
+parenthesised, with a non-rejected `(some_helper)(x)` negative control) — both fail pre-fix.
+
+**F1 sweep — newer scans since the round-4 audit (the reviewer asked for a sweep, not a point
+fix).** The round-4 F1 audit table (roadmap item 10) covers the older sites; the scans added since
+(comptime, coop, composition) were re-audited and are **NOT paren-vulnerable**: (1)
+**`rewrite_comptime_blocks`** operates at the TOKEN level and recurses into **every** `Group`
+(delimiter-agnostic), so a `comptime!` inside any paren/brace/bracket group is still found and
+rewritten — paren-safe by construction, not by a shape gate. (2) **`ComptimeRefCheck`** (a
+`syn::Visit`) reaches inner `ExprPath`/`Macro` nodes THROUGH `Expr::Paren`/`Expr::Group` via the
+visitor's default recursion, so `comptime!{ (runtime_val) + 1 }` still rejects the wrapped
+`runtime_val` and a wrapped nested macro still rejects — paren-safe by construction. (3) The
+positive assume-recognizers (`recognize_elem_assume`, the `len`/`all` matchers) and attribute
+parsers (`reference = <path>`, `instantiate` type-value classification) key on exact `Expr::Path`/
+`Expr::MethodCall` shapes, but non-recognition there is **conservative** (a rejected clause or a
+string-only/tainted model — the prover simply never receives the fact), never an evasion of a
+rejection. Only the two intrinsic-classifying folds had the dangerous direction (non-peel = evade a
+reject/rewrite), and both are now peeled.
+
+**F2 (LOW, pre-existing round-4 blast-radius class) — degenerate element bound vacuously proves
+(`crates/vericl-ir/src/prover.rs`).** `ElemsBelowConst { bound: 0 }` on an **unsigned** array makes
+every modeled read `offsets[i]` carry `0 <= v ∧ v < 0` (`model_element_read`'s `declare_leaf` gives
+the unsigned `0 <= v`, the bound gives `v < 0`) — an infeasible per-read context that vacuously
+discharges every obligation emitted under the read (the read's OWN bounds obligation included),
+minting a confirmed false **`Proved{3}`** on an otherwise-OOB gather (demonstrated by temporarily
+disabling the new gate: both degenerate shapes returned `Proved{3}`; scratch not committed). The
+length-only infeasibility gate does not cover element bounds by design — element assumes assert
+nothing global (they only populate `elem_bounds`), so the outermost length check-sat is SAT. Fix
+(soundly, minimally, in the gate): after the length check-sat, `assert_element_bounds_feasible`
+probes each array carrying bounds with a fresh **witness** element of that array's scalar type
+(`buffer_tys[id]`, threaded from `def.buffers[id].ty` — the same signedness/width `declare_leaf`
+would give a real read: `0 <= w` for unsigned, `type_min <= w` for signed, plus `w < b` for every
+recorded bound). It tests exactly "could ANY element satisfy the bounds" — which is precisely what
+modeling a read assumes — so an unsatisfiable-for-any-element bound (unsigned `< 0`, or a chained
+`len_of` pinned `0`) makes the probe UNSAT → `OutOfSubset` "contradictory assumptions". A signed
+element bounded `< 0` is genuinely satisfiable (`w = -1`), so it is NOT rejected (its later index
+obligation fails honestly on `0 <= idx` instead). The probe is isolated in a `push`/`pop` with the
+witness declared **raw** (a fixed `__elem_feas_{id}` name, outside `self.declared`/`self.fresh`), so
+a satisfiable bound perturbs neither the walk nor any later counterexample — confirmed by
+`gather_oob`'s `demo-defects` counterexample staying byte-identical (`elem5=8`, no `__elem_feas`
+leak). The reviewer-flagged comment ("tests exactly the assumption feasibility") was corrected to
+state precisely that the length check-sat tests *length-fact* feasibility only, with element-range
+feasibility handled by the separate witness gate. Tests (`vericl-ir::prover::tests`, +3):
+`degenerate_zero_element_bound_is_out_of_subset` (the reviewer's bound-0 vacuous shape → OutOfSubset,
+was `Proved{3}`), `satisfiable_constant_element_bound_still_proves` (`offsets[·] < 8` with `x.len()`
+pinned `8` → `Proved{3}`, the witness is a no-op), `element_bound_forced_to_zero_by_length_chain_
+is_out_of_subset` (the chained `ElemsBelowLen{offsets,x}` + `x.len()==0` case that guard (1) misses
+and the element witness catches).
+
+**Classified + queued (not fixed here) — predeclaration hazard in the loop handlers.** The reviewer
+noted that a symbol first resolved lazily inside a loop-body arm can, in the same shape the round-5
+`abs_pos_sym` predeclaration fix addressed, reference a scope-dropped declaration. In the current
+loop handlers this surfaces as a **loud `SolverError`** only (z3 errors on the undeclared symbol —
+never a silent `Proved`), it is **pre-existing** (predates v1.1, unrelated to batches 1/2), and no
+evidence-producing flow reaches it. Classified LOW, **queued as cleanup, not urgency** — the same
+predeclaration discipline `predeclare_coop_leaves`/`race_walk` already apply, extended to the loop
+leaves, is the eventual tidy-up; it cannot mint a false certificate as-is.
+
+**Verification.** `cargo test --workspace` green (vericl 29, vericl-examples lib 75, vericl-ir 87
+[+3], vericl-macros 46 [+2], integration all pass — conformance 1, conformance_f64 0/1, cooperative
+6, cooperative_fallback 1, f64_wgpu_unsound 1, float_method_whitelist 2, float_method_whitelist_f64
+2, host_shim_gpu_ground_truth 1); `-p vericl-examples --features cpu` green incl. the 34s cpu
+conformance/evidence lane + the cpu GPU-ground-truth lane (host_shim_gpu_ground_truth 2). `cargo
+clippy --workspace --all-targets` and `-p vericl-examples --features cpu --all-targets` both zero
+warnings. `conform demo-defects` exits 0, output unchanged — every defect still caught, `gather_oob`
+still `Refuted` with a byte-identical element-symbol counterexample. **Evidence byte-identical** —
+`git status` shows only `prover.rs` + `lib.rs` (macros) modified, no `evidence/*.json` touched; the
+cpu conformance evidence-verify lane passes **without `VERICL_UPDATE`** (the witness addition is a
+no-op for every satisfiable suite assume — F1 only changes macro-time *rejection*/rewrite of a
+paren shape no shipped kernel uses, F2 only adds an isolated feasibility probe that never enters the
+walk). All seven rounds' regression tests green (spot-checked: `mul_overflow_divisor_is_out_of_
+subset`, `add_overflow_guard_refutes`, `cooperative_abspos_guard_cubepos_index_refutes`,
+`shifted_read_selfguard_refutes_at_type_max`, `elem_assume_truncating_cast_chain_is_string_only`,
+`uses_rewrite_fold_rewrites_parenthesised_helper_call`, `gather_copy_is_not_provable_without_
+element_assume`).

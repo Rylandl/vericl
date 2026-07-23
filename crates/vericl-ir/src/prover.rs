@@ -772,7 +772,9 @@ fn prove_bounds_freedom_impl(
         walk_depth: 0,
     };
 
-    if let Err(e) = prover.assert_structured_assumes(assumes) {
+    let buffer_tys: Vec<Type> =
+        def.buffers.iter().map(|a| Type::scalar(a.ty.elem_type())).collect();
+    if let Err(e) = prover.assert_structured_assumes(assumes, &buffer_tys) {
         return e.into_result();
     }
     // Pre-declare the cooperative leaves (if any) at the outermost SMT scope,
@@ -871,7 +873,9 @@ fn prove_race_freedom_detailed(
         walk_depth: 0,
     };
 
-    if let Err(e) = prover.assert_structured_assumes(assumes) {
+    let buffer_tys: Vec<Type> =
+        def.buffers.iter().map(|a| Type::scalar(a.ty.elem_type())).collect();
+    if let Err(e) = prover.assert_structured_assumes(assumes, &buffer_tys) {
         return e.into_coop();
     }
     if let Err(e) = prover.race_setup() {
@@ -1176,7 +1180,15 @@ impl<'a, 'b> Prover<'a, 'b> {
         Ok(e)
     }
 
-    fn assert_structured_assumes(&mut self, assumes: &[Assume]) -> Result<(), Stop> {
+    /// Assert every recognized structured assume, then gate the assumption set
+    /// for feasibility. `buffer_tys` gives each array's scalar element type
+    /// (indexed by buffer id, in the same order as `self.buffers`); it is used
+    /// only by the element-range feasibility probe (guard (2) below).
+    fn assert_structured_assumes(
+        &mut self,
+        assumes: &[Assume],
+        buffer_tys: &[Type],
+    ) -> Result<(), Stop> {
         for assume in assumes {
             match *assume {
                 Assume::LenEq { a, b } => {
@@ -1231,26 +1243,122 @@ impl<'a, 'b> Prover<'a, 'b> {
             }
         }
         // Infeasible-assumption guard (round-1 "infeasible context vacuously
-        // proves" trap, generalized to the assume context): if the declared
-        // assumptions are mutually contradictory — their conjunction, over the
-        // buffer-length range facts asserted above, is UNSAT — then EVERY
-        // bounds obligation would discharge vacuously, minting a false `Proved`.
-        // The single-clause form `A.len() + K <= A.len()` (K > 0) is the most
-        // insidious (one clause), but a contradictory *pair* (`y.len() == 1` and
-        // `y.len() == 2`, or two `LenPlusConstLe` clauses that transitively
-        // contradict) is the same class. Reject any unsatisfiable assumption set
-        // as `OutOfSubset` rather than yield a vacuous certificate. This runs at
-        // the outermost scope, before any obligation is emitted, and only the
-        // *global* length facts are in scope here (element-range assumes populate
-        // `elem_bounds` and assert nothing global), so it tests exactly the
-        // assumption feasibility. Real kernels' assumes are satisfiable, so it
-        // never fires for them (`check-sat` returns SAT); `Unknown` is treated as
-        // "not provably contradictory" and allowed through (conservative).
+        // proves" trap, generalized to the assume context). A contradictory
+        // assumption set vacuously discharges every bounds obligation and mints
+        // a false `Proved`, so it must be rejected `OutOfSubset`. There are two
+        // distinct vacuity channels, gated separately because the two assume
+        // families reach the solver differently:
+        //
+        // (1) GLOBAL LENGTH FACTS. `LenEq`/`LenEqConst`/`LenPlusConstLe` assert
+        //     length constraints at the outermost scope (in force for the whole
+        //     walk). If their conjunction, over the buffer-length range facts, is
+        //     UNSAT — the single-clause `A.len() + K <= A.len()` (K > 0), or a
+        //     contradictory *pair* like `y.len() == 1` ∧ `y.len() == 2`, or two
+        //     transitively-contradictory `LenPlusConstLe`s — every obligation
+        //     discharges vacuously. The outermost `check-sat` below catches this.
+        //     Precisely (correcting the reviewer-flagged wording): only the
+        //     *global length* facts are asserted globally here — element-range
+        //     assumes assert nothing global (they only populate `elem_bounds`) —
+        //     so this check tests exactly *length-fact* feasibility, and NOTHING
+        //     about element-range feasibility, which guard (2) handles. `Unknown`
+        //     is treated as "not provably contradictory" and allowed through
+        //     (conservative). Real kernels' length facts are satisfiable, so it
+        //     never fires for them.
         if self.smt.check().map_err(smt_err)? == Response::Unsat {
             return Err(Stop::OutOfSubset(
                 "the declared assumptions are mutually contradictory (their conjunction is \
                  unsatisfiable) — a contradictory contract would vacuously discharge every bounds \
                  obligation, so it is rejected rather than yielding a false `Proved`"
+                    .into(),
+            ));
+        }
+        // (2) ELEMENT-RANGE BOUNDS. An element bound asserts nothing global — it
+        //     is consulted only at a read of `arr`, where `model_element_read`
+        //     models the read value `v` as a fresh element of `arr`'s type
+        //     (`declare_leaf`: `type_min <= v <= type_max`, i.e. `0 <= v` for an
+        //     unsigned element) with `v < b` for every recorded bound `b`. A
+        //     degenerate bound that no element value can satisfy — an unsigned
+        //     element with `bound == 0` (`0 <= v ∧ v < 0`), or a bound forced to
+        //     `0` through a chain (`ElemsBelowLen` whose `len_of` a `LenEqConst`
+        //     pins to `0`) — makes that per-read context infeasible, so every
+        //     obligation emitted under the read (the read's OWN bounds obligation
+        //     included) discharges vacuously: a confirmed false `Proved` on an
+        //     otherwise-OOB gather. The check-sat above cannot see this (no global
+        //     fact was asserted), so probe it directly with a per-array witness
+        //     element that must satisfy the bounds — see
+        //     `assert_element_bounds_feasible`.
+        self.assert_element_bounds_feasible(buffer_tys)?;
+        Ok(())
+    }
+
+    /// Element-range feasibility probe — soundness gate (2) of
+    /// `assert_structured_assumes`. For each global array carrying element
+    /// bounds, declare a fresh *witness* element of that array's scalar type
+    /// (`buffer_tys[id]`; its `is_unsigned`/`type_max`/`type_min` mirror exactly
+    /// the range `model_element_read`'s `declare_leaf` gives a real read),
+    /// assert every recorded bound on it, and — with the global length facts
+    /// already in scope — require the conjunction satisfiable. This tests
+    /// precisely "could ANY element of the type satisfy the array's bounds",
+    /// which is exactly what modeling a read of `arr` assumes: a satisfiable
+    /// bound (`v < 5`, or `v < len` for a non-zero `len`) admits a witness and
+    /// is a no-op; a bound no element can satisfy makes the probe UNSAT.
+    ///
+    /// It is isolated in a `push`/`pop`, and each witness is declared raw (a
+    /// fixed `__elem_feas_{id}` name, NOT via `declare_int`) so it never enters
+    /// `self.declared`/`self.fresh` — a satisfiable probe therefore perturbs
+    /// neither the walk nor any later counterexample, keeping the suite's
+    /// obligation counts and evidence bytes byte-for-byte unchanged. An empty
+    /// assumed array trivially satisfies the raw `all(...)` predicate, but the
+    /// prover only ever uses the bound at a read, and a read implies a non-empty
+    /// array; the witness models exactly that read, so array emptiness is
+    /// correctly irrelevant to this feasibility question.
+    fn assert_element_bounds_feasible(&mut self, buffer_tys: &[Type]) -> Result<(), Stop> {
+        if self.elem_bounds.is_empty() {
+            return Ok(());
+        }
+        // Deterministic iteration (a `HashMap` has no stable order); correctness
+        // does not depend on it — any single infeasible array makes the whole
+        // probe UNSAT and rejects.
+        let mut arr_ids: Vec<Id> = self.elem_bounds.keys().copied().collect();
+        arr_ids.sort_unstable();
+        // Sound-strong fallback element type for the (unreachable in practice —
+        // element assumes are only recognized on integer arrays) case of a
+        // missing or non-integer element type: `u32` is unsigned, so its witness
+        // carries the `0 <= w` lower bound, which can only make the probe fire
+        // MORE often, never less (never an unsound under-fire).
+        let fallback_ty = address_type();
+        self.smt.push().map_err(smt_err)?;
+        for arr_id in arr_ids {
+            let elem_ty = match buffer_tys.get(arr_id as usize) {
+                Some(t) if is_modeled_int(t) => t,
+                _ => &fallback_ty,
+            };
+            let bounds = self.elem_bounds[&arr_id].clone();
+            // Raw witness declaration mirroring `declare_leaf`'s type-range
+            // facts, but kept out of `self.declared`/`self.fresh` (see the doc).
+            let name = format!("__elem_feas_{arr_id}");
+            let sort = self.smt.int_sort();
+            let w = self.smt.declare_const(&name, sort).map_err(smt_err)?;
+            let max = self.smt.numeral(type_max(elem_ty));
+            let le_max = self.smt.lte(w, max);
+            self.smt.assert(le_max).map_err(smt_err)?;
+            let min = int_const(self.smt, type_min(elem_ty));
+            let ge_min = self.smt.gte(w, min);
+            self.smt.assert(ge_min).map_err(smt_err)?;
+            for b in bounds {
+                let lt = self.smt.lt(w, b);
+                self.smt.assert(lt).map_err(smt_err)?;
+            }
+        }
+        let feasible = self.smt.check().map_err(smt_err)?;
+        self.smt.pop().map_err(smt_err)?;
+        if feasible == Response::Unsat {
+            return Err(Stop::OutOfSubset(
+                "a declared element-range assumption is unsatisfiable for every value of the \
+                 array's element type (e.g. an unsigned element bounded below `0`, or a length \
+                 bound whose length another assume pins to `0`) — modeling any read of that array \
+                 would give an infeasible per-read context that vacuously discharges every bounds \
+                 obligation, so the contract is rejected rather than yielding a false `Proved`"
                     .into(),
             ));
         }
@@ -6138,6 +6246,76 @@ mod tests {
                 );
             }
             other => panic!("expected Refuted (element overruns x), got {other:?}"),
+        }
+    }
+
+    /// Round-7 F2 (degenerate element bound vacuously proves). A bound of `0`
+    /// on the UNSIGNED `offsets` array means every modeled read `offsets[i]`
+    /// carries `0 <= v ∧ v < 0` — an infeasible per-read context that (pre-fix)
+    /// vacuously discharged the inner `x[offsets[i]]` obligation, a confirmed
+    /// false `Proved{3}` on an otherwise-OOB gather. The element-range
+    /// feasibility gate now rejects it: no `u32` element is below `0`.
+    #[test]
+    fn degenerate_zero_element_bound_is_out_of_subset() {
+        let def = build_gather();
+        let assumes = [
+            Assume::LenEq { a: "offsets", b: "y" },
+            Assume::ElemsBelowConst { arr: "offsets", bound: 0 },
+        ];
+        match prove_bounds_freedom(&def, GATHER_BUFFERS, &assumes) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("element-range assumption is unsatisfiable"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (no u32 element is < 0), got {other:?}"),
+        }
+    }
+
+    /// The gate is a no-op for a *satisfiable* constant bound: with `x.len()`
+    /// pinned to `8` and `offsets[·] < 8`, a witness element exists (`w = 0`),
+    /// so the probe passes and the gather proves all three obligations — the
+    /// witness addition never disturbs a legitimate contract.
+    #[test]
+    fn satisfiable_constant_element_bound_still_proves() {
+        let def = build_gather();
+        let assumes = [
+            Assume::LenEq { a: "offsets", b: "y" },
+            Assume::LenEqConst { a: "x", value: 8 },
+            Assume::ElemsBelowConst { arr: "offsets", bound: 8 },
+        ];
+        match prove_bounds_freedom(&def, GATHER_BUFFERS, &assumes) {
+            // offsets[pos] read, x[elem] read, y[pos] write.
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved (bound within pinned x.len()), got {other:?}"),
+        }
+    }
+
+    /// The chained vacuity the length-only guard (1) misses: `offsets[·] <
+    /// x.len()` is a legitimate shape, but a second assume `x.len() == 0` forces
+    /// the element bound to `0`, so every `offsets[i]` read is again vacuous.
+    /// The length facts alone are satisfiable (`len_x == 0` is a valid empty
+    /// array), so guard (1)'s check-sat passes — it is the element witness
+    /// `0 <= w < len_x == 0` that makes guard (2) fire.
+    #[test]
+    fn element_bound_forced_to_zero_by_length_chain_is_out_of_subset() {
+        let def = build_gather();
+        let assumes = [
+            Assume::LenEq { a: "offsets", b: "y" },
+            Assume::ElemsBelowLen { arr: "offsets", len_of: "x" },
+            Assume::LenEqConst { a: "x", value: 0 },
+        ];
+        match prove_bounds_freedom(&def, GATHER_BUFFERS, &assumes) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("element-range assumption is unsatisfiable"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => {
+                panic!("expected OutOfSubset (len_x==0 forces an empty element range), got {other:?}")
+            }
         }
     }
 
