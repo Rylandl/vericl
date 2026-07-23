@@ -145,12 +145,93 @@
 //!   `Index`/`IndexAssign` bounds obligations `ProveResult::Proved` reports):
 //!   it's an internal precondition for soundly *modeling* div/mod, not a
 //!   bounds check the caller asked for.
+//! - **Cooperative mode (shared-memory milestone M1):** a second entry point
+//!   `prove_bounds_freedom_cooperative(def, buffers, assumes, cube_dim)` opts
+//!   the walk into *workgroup-cooperative* modeling by pinning `CUBE_DIM` to a
+//!   concrete `cube_dim` constant (the `cooperative(cube_dim = …)` contract
+//!   clause, docs/design-shared-memory.md §7.1). This flips on modeling for
+//!   the 1-D topology builtins that the plain (`coop == None`) walk leaves
+//!   tainted: `UnitPos` is a fresh `[0, cube_dim)` symbol (the per-thread
+//!   leaf); `CubePos`/`CubeCount` are fresh nonnegative symbols (cube-uniform
+//!   leaves); `CubeDim` is the concrete numeral `cube_dim`; and `AbsolutePos`
+//!   is *recomputed* as `CubePos*cube_dim + UnitPos` (the 1-D identity)
+//!   instead of the plain walk's opaque fresh leaf, so a `tile[UnitPos]`
+//!   access and an `input[AbsolutePos]` access in the same kernel share one
+//!   `UnitPos` symbol. All of these are memoized on `VariableKind`, so every
+//!   occurrence of a given builtin resolves to the same symbol. **The three
+//!   leaf symbols are pre-declared at the outermost SMT scope** (see
+//!   `predeclare_coop_leaves`) rather than lazily on first use: SMT-LIB `pop`
+//!   discards *declarations* made since the matching `push`, so a leaf first
+//!   resolved inside a branch arm would have its `declare-const` and its range
+//!   assertion (`0 <= unit_pos < cube_dim`, `cube_pos >= 0`) scoped to that
+//!   arm and silently dropped for a later use after the branch closes.
+//!   Pre-declaring keeps the leaves and their range facts in force for the
+//!   whole walk. When `coop == None` every one of these builtins stays
+//!   tainted, byte-for-byte as before this milestone (only `AbsolutePos` was,
+//!   and still is, modeled — as a plain fresh leaf).
+//! - **Shared arrays (M1):** `Index`/`IndexAssign` on a `VariableKind::
+//!   SharedArray { id, length, .. }` list are modeled the same way as a global
+//!   array access, except the bound is the **compile-time `length` carried in
+//!   the `VariableKind`** (a `SharedMemory::<T>::new(N)` literal, §2.2), not a
+//!   runtime `Length` symbol: the obligation is `0 <= index < length` against
+//!   that concrete numeral. So `tile[UnitPos]` with `cube_dim <= length`
+//!   discharges, and an undersized tile (`cube_dim > length`) is a genuine
+//!   `Refuted`. A shared array is not a kernel parameter, so it carries no
+//!   `BufferParam`; its name in obligations/counterexamples is
+//!   `shared_array(id)`. This modeling is independent of `coop`: a shared
+//!   access resolved with `coop == None` still checks the constant bound, but
+//!   its index (`UnitPos`) is tainted there, so it fails as `OutOfSubset` at
+//!   the index rather than proving — only cooperative mode makes `UnitPos`
+//!   modeled enough to discharge.
+//! - **`Branch::Loop` recognition (M2).** A `Branch::Loop` is CubeCL's
+//!   desugaring of a `while`/`loop`, not the range-`for` that becomes
+//!   `RangeLoop`. Two shapes are recognized, both keyed on the canonical
+//!   `while cond { … }` desugaring — a **leading break-guard**: the first three
+//!   body instructions are `c = <cond>`, `nc = Not c`, `if nc { break }`
+//!   (§2.4), validated against the probe IR dumps. `recognize_break_guard`
+//!   matches exactly that prefix (anything else — e.g. a `loop { body; if c {
+//!   break } }` with a *trailing* break — is not recognized and stays the
+//!   pre-existing `OutOfSubset`, so a bare unbounded loop is never modeled).
+//!   * A loop whose body (recursively) contains a `SyncCube` is a
+//!     **cooperative** loop (a barrier-carrying tree reduction). It cannot be
+//!     modeled by a single-thread bounds pass without the two-thread race
+//!     walker (deliverable B, milestone M3), so it is rejected `OutOfSubset`
+//!     with a targeted "race walker not yet implemented (milestone M3)" reason
+//!     — deferred, never silently mismodeled. This check runs *first*, so any
+//!     barrier-carrying loop defers regardless of its guard shape.
+//!   * A **non-cooperative** loop (no `SyncCube` inside) is modeled
+//!     RangeLoop-style. The loop guard `c` is asserted as a path condition for
+//!     the body (the body only runs while `c` holds), and the body is walked
+//!     once symbolically. Carried variables (reused from `scope_reassigned_
+//!     vars`, exactly as `process_range_loop`) split two ways: a carried,
+//!     integer-typed variable that the guard comparison **upper-bounds** (the
+//!     `v` in the ascending `while v < n` / `while n > v` shape) is the loop's
+//!     *induction variable* — it gets a fresh symbol (nonnegative if unsigned)
+//!     whose upper bound comes from the asserted guard, sound for the same
+//!     reason `RangeLoop`'s `i` is (proving an obligation for an arbitrary
+//!     in-range value covers every concrete iteration, and the fresh symbol
+//!     *over*-approximates the actual arithmetic progression of induction
+//!     values). A guard operand the guard does *not* upper-bound (a
+//!     lower-bound `v > 0`, an `==`/`!=`) is **not** promoted — it stays
+//!     tainted, so a descending or non-monotone loop resolves `OutOfSubset`
+//!     rather than a fresh symbol bounded only from below manufacturing a
+//!     spurious `Refuted` on a safe loop. Every *other* carried
+//!     variable is an accumulator whose per-iteration value a single symbolic
+//!     pass cannot represent, so it is **tainted**, identically to
+//!     `process_range_loop`. As there, a write to any carried variable
+//!     (induction included) inside the body re-taints it via `carried_stack`,
+//!     so an induction value is fresh only for reads *before* its own in-body
+//!     update (e.g. `data[k]` before `k += stride`); a read after the update
+//!     resolves to taint, never a bogus post-update bound. If the guard itself
+//!     depends on unmodeled state (does not resolve), the loop is rejected
+//!     `OutOfSubset` rather than walked with an unconstrained induction symbol
+//!     (which could manufacture a false `Refuted`).
 
 use std::collections::{HashMap, HashSet};
 
 use cubecl::ir::{
-    Arithmetic, Branch, Comparison, ConstantValue, Id, Instruction, Metadata, Operation, Operator,
-    Scope, Type, Variable, VariableKind,
+    Arithmetic, Branch, Builtin, Comparison, ConstantValue, Id, Instruction, Loop, Metadata,
+    Operation, Operator, Scope, Synchronization, Type, Variable, VariableKind,
 };
 use cubecl::prelude::KernelDefinition;
 use easy_smt::{Context, ContextBuilder, Response, SExpr};
@@ -219,6 +300,37 @@ pub fn prove_bounds_freedom(
     buffers: &[BufferParam],
     assumes: &[Assume],
 ) -> ProveResult {
+    prove_bounds_freedom_impl(def, buffers, assumes, None)
+}
+
+/// Prove out-of-bounds freedom for a **workgroup-cooperative** `def`, pinning
+/// `CUBE_DIM` to `cube_dim` (the `cooperative(cube_dim = …)` contract clause,
+/// docs/design-shared-memory.md §7.1).
+///
+/// This is the shared-memory milestone entry point: relative to
+/// `prove_bounds_freedom` it additionally models the 1-D topology builtins
+/// (`UnitPos`/`CubePos`/`CubeDim`/`CubeCount`, with `AbsolutePos` recomputed as
+/// `CubePos*cube_dim + UnitPos`) and accepts `SharedMemory` (`SharedArray`)
+/// indexing bounded by the array's compile-time length (see the module docs'
+/// "Cooperative mode" / "Shared arrays" bullets). `cube_dim` must be the block
+/// size the kernel is actually launched with — binding it to a value the launch
+/// does not use would be unsound (§9 risk 5), which the harness prevents by
+/// sourcing both from the single `cooperative(...)` clause.
+pub fn prove_bounds_freedom_cooperative(
+    def: &KernelDefinition,
+    buffers: &[BufferParam],
+    assumes: &[Assume],
+    cube_dim: u32,
+) -> ProveResult {
+    prove_bounds_freedom_impl(def, buffers, assumes, Some(cube_dim))
+}
+
+fn prove_bounds_freedom_impl(
+    def: &KernelDefinition,
+    buffers: &[BufferParam],
+    assumes: &[Assume],
+    coop: Option<u32>,
+) -> ProveResult {
     let mut smt = match ContextBuilder::new().solver("z3").solver_args(["-smt2", "-in"]).build() {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -238,9 +350,16 @@ pub fn prove_bounds_freedom(
         obligations: 0,
         carried_stack: Vec::new(),
         write_log_stack: Vec::new(),
+        coop,
     };
 
     if let Err(e) = prover.assert_structured_assumes(assumes) {
+        return e.into_result();
+    }
+    // Pre-declare the cooperative leaves (if any) at the outermost SMT scope,
+    // before `process_scope` opens any branch push — see the module docs'
+    // "Cooperative mode" bullet for why lazy declaration would be unsound.
+    if let Err(e) = prover.predeclare_coop_leaves() {
         return e.into_result();
     }
 
@@ -274,6 +393,14 @@ fn smt_err(e: std::io::Error) -> Stop {
     Stop::SolverError(format!("z3 I/O error: {e}"))
 }
 
+/// An indexable array operand: a global input/output buffer (bounded by a
+/// runtime `Length`), or a `SharedMemory` tile (bounded by its compile-time
+/// `length`). See the module docs' "Shared arrays" bullet.
+enum ArrayRef {
+    Global { id: Id },
+    Shared { id: Id, length: usize },
+}
+
 struct Prover<'a, 'b> {
     smt: &'a mut Context,
     buffers: &'a [BufferParam<'b>],
@@ -305,6 +432,12 @@ struct Prover<'a, 'b> {
     /// discarded. Empty outside of (nested) branches, so this costs
     /// nothing for a kernel with no `If`/`IfElse` at all.
     write_log_stack: Vec<HashSet<VariableKind>>,
+    /// `Some(cube_dim)` in cooperative mode (the pinned `CUBE_DIM` constant),
+    /// `None` for the plain single-thread bounds walk. Gates all the
+    /// shared-memory-milestone leaf modeling (module docs' "Cooperative
+    /// mode"); when `None`, `UnitPos`/`CubePos`/`CubeDim`/`CubeCount` stay
+    /// tainted exactly as before this milestone.
+    coop: Option<u32>,
 }
 
 impl<'a, 'b> Prover<'a, 'b> {
@@ -372,6 +505,92 @@ impl<'a, 'b> Prover<'a, 'b> {
                     "structured assume refers to unknown buffer parameter `{name}`"
                 ))
             })
+    }
+
+    // -- cooperative leaves (shared-memory milestone M1) ----------------
+
+    /// Declare the cooperative leaf symbols at the outermost SMT scope so
+    /// their `declare-const`s and range assertions outlive every branch
+    /// push/pop (module docs' "Cooperative mode"). No-op when `coop` is
+    /// `None`. Declaring an unused leaf (e.g. `CubeCount` in a kernel that
+    /// never reads it) is harmless — a free nonnegative constant no
+    /// obligation references.
+    fn predeclare_coop_leaves(&mut self) -> Result<(), Stop> {
+        if self.coop.is_none() {
+            return Ok(());
+        }
+        self.unit_pos_sym()?;
+        self.cube_pos_sym()?;
+        self.cube_count_sym()?;
+        Ok(())
+    }
+
+    /// The `UnitPos` leaf: a fresh symbol constrained to `[0, cube_dim)`.
+    /// Memoized on `VariableKind::Builtin(UnitPos)` so `AbsolutePos`'s
+    /// recomputation and every direct `tile[UnitPos]` share one symbol.
+    fn unit_pos_sym(&mut self) -> Result<SExpr, Stop> {
+        let kind = VariableKind::Builtin(Builtin::UnitPos);
+        if let Some(Some(e)) = self.memo.get(&kind) {
+            return Ok(*e);
+        }
+        let cube_dim = self.coop.expect("unit_pos_sym only reachable in cooperative mode");
+        let sym = self.declare_int("unit_pos", true)?;
+        let bound = self.smt.numeral(cube_dim as u64);
+        let lt = self.smt.lt(sym, bound);
+        self.smt.assert(lt).map_err(smt_err)?;
+        self.memo.insert(kind, Some(sym));
+        Ok(sym)
+    }
+
+    /// The `CubePos` leaf: a fresh nonnegative (cube-uniform) symbol.
+    fn cube_pos_sym(&mut self) -> Result<SExpr, Stop> {
+        let kind = VariableKind::Builtin(Builtin::CubePos);
+        if let Some(Some(e)) = self.memo.get(&kind) {
+            return Ok(*e);
+        }
+        let sym = self.declare_int("cube_pos", true)?;
+        self.memo.insert(kind, Some(sym));
+        Ok(sym)
+    }
+
+    /// The `CubeCount` leaf: a fresh nonnegative (cube-uniform) symbol.
+    fn cube_count_sym(&mut self) -> Result<SExpr, Stop> {
+        let kind = VariableKind::Builtin(Builtin::CubeCount);
+        if let Some(Some(e)) = self.memo.get(&kind) {
+            return Ok(*e);
+        }
+        let sym = self.declare_int("cube_count", true)?;
+        self.memo.insert(kind, Some(sym));
+        Ok(sym)
+    }
+
+    /// Resolve a topology builtin. In cooperative mode the 1-D leaves are
+    /// modeled (module docs' "Cooperative mode"); otherwise only
+    /// `AbsolutePos` is (a plain fresh leaf), everything else tainted —
+    /// byte-for-byte the pre-milestone behavior.
+    fn builtin_value(&mut self, b: Builtin) -> Option<SExpr> {
+        let Some(cube_dim) = self.coop else {
+            return match b {
+                Builtin::AbsolutePos => self.declare_int("abs_pos", true).ok(),
+                _ => None,
+            };
+        };
+        match b {
+            Builtin::UnitPos => self.unit_pos_sym().ok(),
+            Builtin::CubePos => self.cube_pos_sym().ok(),
+            Builtin::CubeCount => self.cube_count_sym().ok(),
+            Builtin::CubeDim => Some(self.smt.numeral(cube_dim as u64)),
+            // AbsolutePos = CubePos*cube_dim + UnitPos (the 1-D identity).
+            Builtin::AbsolutePos => {
+                let unit = self.unit_pos_sym().ok()?;
+                let cube = self.cube_pos_sym().ok()?;
+                let cd = self.smt.numeral(cube_dim as u64);
+                let scaled = self.smt.times(cube, cd);
+                Some(self.smt.plus(scaled, unit))
+            }
+            // X/Y/Z, plane, cluster builtins: out of the 1-D subset.
+            _ => None,
+        }
     }
 
     // -- control-flow walk ---------------------------------------------
@@ -648,14 +867,31 @@ impl<'a, 'b> Prover<'a, 'b> {
         Ok(())
     }
 
-    fn buffer_of(&self, list: &Variable) -> Result<(Id, bool), Stop> {
+    /// Classify an index *list* operand. Globals key their bound off a runtime
+    /// `Length` symbol; a `SharedArray` keys it off the compile-time `length`
+    /// carried in its `VariableKind` (module docs' "Shared arrays"). Anything
+    /// else is outside the subset.
+    fn array_ref(&self, list: &Variable) -> Result<ArrayRef, Stop> {
         match list.kind {
-            VariableKind::GlobalInputArray(id) => Ok((id, false)),
-            VariableKind::GlobalOutputArray(id) => Ok((id, true)),
+            VariableKind::GlobalInputArray(id) | VariableKind::GlobalOutputArray(id) => {
+                Ok(ArrayRef::Global { id })
+            }
+            VariableKind::SharedArray { id, length, .. } => Ok(ArrayRef::Shared { id, length }),
             other => Err(Stop::OutOfSubset(format!(
-                "indexing into `{other:?}` (not a global input/output array) is outside the \
-                 vericl v0 subset"
+                "indexing into `{other:?}` (not a global input/output or shared array) is outside \
+                 the vericl v0 subset"
             ))),
+        }
+    }
+
+    /// The bound SExpr and display name for an array reference. Global length
+    /// is a (declared) runtime symbol; shared length is a concrete numeral.
+    fn array_len_and_name(&mut self, aref: &ArrayRef) -> Result<(SExpr, String), Stop> {
+        match *aref {
+            ArrayRef::Global { id } => Ok((self.length_of(id)?, self.buffer_name(id))),
+            ArrayRef::Shared { id, length } => {
+                Ok((self.smt.numeral(length as u64), format!("shared_array({id})")))
+            }
         }
     }
 
@@ -666,14 +902,14 @@ impl<'a, 'b> Prover<'a, 'b> {
         list: Variable,
     ) -> Result<(), Stop> {
         self.check_trivial_vectorization(io.vector_size, io.unroll_factor)?;
-        let (buf_id, _is_output) = self.buffer_of(&list)?;
+        let aref = self.array_ref(&list)?;
+        let (len, name) = self.array_len_and_name(&aref)?;
         let idx = self.value_of(&io.index).ok_or_else(|| {
             Stop::OutOfSubset(format!(
-                "read index for `{}[...]` depends on a construct outside the vericl v0 subset",
-                self.buffer_name(buf_id)
+                "read index for `{name}[...]` depends on a construct outside the vericl v0 subset"
             ))
         })?;
-        self.emit_obligation(buf_id, idx, "read")?;
+        self.emit_obligation(len, &name, idx, "read")?;
         // The value *read* from the array is unknown (this checker has no
         // model of array contents) — taint, don't bind.
         self.taint_out(inst);
@@ -687,30 +923,31 @@ impl<'a, 'b> Prover<'a, 'b> {
         list: Variable,
     ) -> Result<(), Stop> {
         self.check_trivial_vectorization(io.vector_size, io.unroll_factor)?;
-        let (buf_id, _is_output) = self.buffer_of(&list)?;
+        let aref = self.array_ref(&list)?;
+        let (len, name) = self.array_len_and_name(&aref)?;
         let idx = self.value_of(&io.index).ok_or_else(|| {
             Stop::OutOfSubset(format!(
-                "write index for `{}[...] = ...` depends on a construct outside the vericl v0 \
-                 subset",
-                self.buffer_name(buf_id)
+                "write index for `{name}[...] = ...` depends on a construct outside the vericl v0 \
+                 subset"
             ))
         })?;
-        self.emit_obligation(buf_id, idx, "write")?;
+        self.emit_obligation(len, &name, idx, "write")?;
         self.taint_out(inst);
         Ok(())
     }
 
-    fn emit_obligation(&mut self, buf_id: Id, idx: SExpr, kind: &str) -> Result<(), Stop> {
-        let len = self.length_of(buf_id)?;
+    fn emit_obligation(
+        &mut self,
+        len: SExpr,
+        name: &str,
+        idx: SExpr,
+        kind: &str,
+    ) -> Result<(), Stop> {
         let zero = self.smt.numeral(0);
         let ge0 = self.smt.gte(idx, zero);
         let lt_len = self.smt.lt(idx, len);
         let in_bounds = self.smt.and(ge0, lt_len);
-        let description = format!(
-            "0 <= index < {}.len() ({kind} access to `{}`)",
-            self.buffer_name(buf_id),
-            self.buffer_name(buf_id)
-        );
+        let description = format!("0 <= index < {name}.len() ({kind} access to `{name}`)");
         self.check_obligation(description, in_bounds)
     }
 
@@ -800,10 +1037,7 @@ impl<'a, 'b> Prover<'a, 'b> {
                 Ok(())
             }
             Branch::RangeLoop(rl) => self.process_range_loop(rl),
-            Branch::Loop(_) => Err(Stop::OutOfSubset(
-                "`Branch::Loop` (unbounded/break-terminated loop) is outside the vericl v0 subset"
-                    .into(),
-            )),
+            Branch::Loop(l) => self.process_loop(l),
             Branch::Switch(_) => {
                 Err(Stop::OutOfSubset("`Branch::Switch` is outside the vericl v0 subset".into()))
             }
@@ -903,6 +1137,109 @@ impl<'a, 'b> Prover<'a, 'b> {
         r
     }
 
+    /// A `Branch::Loop` (CubeCL's `while`/`loop` desugaring). See the module
+    /// docs' "`Branch::Loop` recognition (M2)" bullet.
+    fn process_loop(&mut self, l: &Loop) -> Result<(), Stop> {
+        // Cooperative loop (barrier inside the body): defer to the two-thread
+        // race walker (milestone M3), which does not exist yet. Rejected
+        // rather than modeled by a single-thread pass — checked FIRST, so any
+        // barrier-carrying loop defers regardless of its guard shape.
+        if scope_contains_sync_cube(&l.scope) {
+            return Err(Stop::OutOfSubset(
+                "cooperative loop (a `Branch::Loop` containing `sync_cube()`) — race walker not \
+                 yet implemented (milestone M3); rejected rather than modeled without race \
+                 analysis"
+                    .into(),
+            ));
+        }
+        // Non-cooperative: recognize the canonical `while` desugaring (leading
+        // break-guard). Anything else (a trailing-break `loop`, an unbounded
+        // loop) is not modeled — the pre-milestone rejection, unchanged.
+        let Some(bg) = recognize_break_guard(&l.scope) else {
+            return Err(Stop::OutOfSubset(
+                "`Branch::Loop` (unbounded/break-terminated loop) is outside the vericl v0 subset"
+                    .into(),
+            ));
+        };
+        self.process_noncoop_loop(l, &bg)
+    }
+
+    /// Model a recognized non-cooperative `while` loop RangeLoop-style: the
+    /// induction variable (a carried, integer guard operand) gets a fresh
+    /// symbol bounded by the asserted guard; every other carried variable is
+    /// tainted (module docs). Structured like `process_range_loop` so the
+    /// `carried_stack` push/pop and defensive re-taint are unconditional.
+    fn process_noncoop_loop(&mut self, l: &Loop, bg: &BreakGuard) -> Result<(), Stop> {
+        let outer: HashSet<VariableKind> = self.memo.keys().copied().collect();
+        let carried = scope_reassigned_vars(&l.scope, &outer);
+
+        // Induction variables: carried, integer-typed operands the guard
+        // *upper-bounds* (the ascending shape). Everything else carried is an
+        // accumulator (tainted).
+        let mut induction: HashMap<VariableKind, bool> = HashMap::new();
+        for v in &bg.induction_candidates {
+            if carried.contains(&v.kind) && is_modeled_int(&v.ty) {
+                induction.insert(v.kind, is_unsigned(&v.ty));
+            }
+        }
+
+        // Pre-bind before the body walk (like `process_range_loop`): induction
+        // vars to a fresh symbol, every other carried var to taint — so a
+        // read-before-write of an accumulator sees taint, not the stale
+        // pre-loop value.
+        for &k in &carried {
+            if let Some(&unsigned) = induction.get(&k) {
+                let sym = self.declare_int("loop_iv_", unsigned)?;
+                self.set_var(k, Some(sym));
+            } else {
+                self.set_var(k, None);
+            }
+        }
+        self.carried_stack.push(carried.clone());
+
+        let r = self.process_noncoop_loop_body(l, bg);
+
+        self.carried_stack.pop();
+        // Defensive re-taint after the loop (same rationale as
+        // `process_range_loop`): every carried variable — induction included —
+        // is unknown once the loop is left.
+        for &k in &carried {
+            self.set_var(k, None);
+        }
+        r
+    }
+
+    /// The guard-assert + body-walk portion of `process_noncoop_loop`,
+    /// factored out so the caller unconditionally pops `carried_stack`.
+    fn process_noncoop_loop_body(&mut self, l: &Loop, bg: &BreakGuard) -> Result<(), Stop> {
+        let insts = &l.scope.instructions;
+        // Bind the guard comparison (before opening any SMT scope), then
+        // resolve it. A guard that depends on unmodeled state is rejected
+        // rather than walked with an unconstrained induction symbol (which
+        // could manufacture a false `Refuted`).
+        self.process_instruction(&insts[bg.guard_idx])?;
+        let Some(guard) = self.value_of(&bg.guard_var) else {
+            return Err(Stop::OutOfSubset(
+                "loop guard condition depends on a construct outside the vericl v0 subset".into(),
+            ));
+        };
+
+        self.smt.push().map_err(smt_err)?;
+        self.smt.assert(guard).map_err(smt_err)?;
+        // Walk the real body under the asserted guard. The `nc = Not c` and
+        // the `if nc { break }` scaffolding are skipped: `nc` feeds only the
+        // break, and the break arm carries no obligation.
+        let mut result = Ok(());
+        for inst in &insts[bg.body_start..] {
+            if let Err(e) = self.process_instruction(inst) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.smt.pop().map_err(smt_err)?;
+        result
+    }
+
     fn check_obligation(&mut self, description: String, obligation: SExpr) -> Result<(), Stop> {
         self.smt.push().map_err(smt_err)?;
         let negated = self.smt.not(obligation);
@@ -953,9 +1290,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         }
         let resolved = match var.kind {
             VariableKind::Constant(cv) => self.constant_expr(cv, &var.ty),
-            VariableKind::Builtin(cubecl::ir::Builtin::AbsolutePos) => {
-                self.declare_int("abs_pos", true).ok()
-            }
+            VariableKind::Builtin(b) => self.builtin_value(b),
             VariableKind::GlobalScalar(id) => {
                 if is_modeled_int(&var.ty) {
                     self.declare_int(&format!("scalar{id}_"), is_unsigned(&var.ty)).ok()
@@ -963,8 +1298,8 @@ impl<'a, 'b> Prover<'a, 'b> {
                     None
                 }
             }
-            // Locals not yet bound by a modeled instruction, arrays used as
-            // scalar values, and every other builtin: unsupported here.
+            // Locals not yet bound by a modeled instruction, and arrays used as
+            // scalar values: unsupported here.
             _ => None,
         };
         self.memo.insert(var.kind, resolved);
@@ -1053,6 +1388,109 @@ fn collect_reassigned_vars(
             }
         }
     }
+}
+
+/// The recognized leading break-guard of a canonical `while` desugaring (§2.4,
+/// module docs' "`Branch::Loop` recognition"). See `recognize_break_guard`.
+struct BreakGuard {
+    /// Index of the guard comparison in the loop body (the `c = <cond>`
+    /// instruction, always `0`).
+    guard_idx: usize,
+    /// The comparison's `out` variable `c` — the condition that holds
+    /// throughout the body (the loop continues while `c`).
+    guard_var: Variable,
+    /// Guard operands the guard *upper-bounds* (the `v` in `v < n` / `n > v`)
+    /// — the only induction-variable candidates. A carried, integer one of
+    /// these gets a fresh symbol bounded above by the asserted guard; a
+    /// lower-bound guard (`v > 0`) or a `!=`/`==` guard yields no candidate,
+    /// so its operand stays tainted (→ `OutOfSubset`) rather than a symbol
+    /// bounded only from below — which could manufacture a spurious
+    /// `Refuted` on a safe descending loop.
+    induction_candidates: Vec<Variable>,
+    /// Index at which the real body begins (just past the `if nc { break }`).
+    body_start: usize,
+}
+
+/// Match the canonical `while cond { … }` desugaring's leading break-guard:
+/// `[0] c = <cmp>`, `[1] nc = Not c`, `[2] if nc { break }`, then the body.
+/// Returns `None` for anything else (a trailing-break `loop`, an unbounded
+/// loop, a non-canonical shape) — such a `Branch::Loop` is not modeled.
+fn recognize_break_guard(scope: &Scope) -> Option<BreakGuard> {
+    let insts = &scope.instructions;
+    if insts.len() < 3 {
+        return None;
+    }
+    // [0] c = <comparison>
+    let Operation::Comparison(cmp) = &insts[0].operation else {
+        return None;
+    };
+    let guard_var = insts[0].out?;
+    let induction_candidates = guard_upper_bounded_operands(cmp);
+    // [1] nc = Not c
+    let Operation::Operator(Operator::Not(u)) = &insts[1].operation else {
+        return None;
+    };
+    if u.input.kind != guard_var.kind {
+        return None;
+    }
+    let nc = insts[1].out?;
+    // [2] if nc { break }
+    let Operation::Branch(Branch::If(if_)) = &insts[2].operation else {
+        return None;
+    };
+    if if_.cond.kind != nc.kind || !scope_is_single_break(&if_.scope) {
+        return None;
+    }
+    Some(BreakGuard { guard_idx: 0, guard_var, induction_candidates, body_start: 3 })
+}
+
+/// The operand(s) a guard comparison, asserted true in the loop body, bounds
+/// from *above* — the ascending `while v < n` / `while n > v` shape. Only such
+/// a variable can be a sound induction variable: a fresh symbol bounded above
+/// by the asserted guard over-approximates the actual induction values (module
+/// docs). A lower-bound guard (`v > 0`), or an `==`/`!=`/`IsNan`/`IsInf`
+/// guard, yields no candidate — its operand stays tainted.
+fn guard_upper_bounded_operands(cmp: &Comparison) -> Vec<Variable> {
+    match cmp {
+        // v < n  /  v <= n  →  n upper-bounds the lhs.
+        Comparison::Lower(b) | Comparison::LowerEqual(b) => vec![b.lhs],
+        // n > v  /  n >= v  →  n upper-bounds the rhs.
+        Comparison::Greater(b) | Comparison::GreaterEqual(b) => vec![b.rhs],
+        Comparison::Equal(_)
+        | Comparison::NotEqual(_)
+        | Comparison::IsNan(_)
+        | Comparison::IsInf(_) => vec![],
+    }
+}
+
+/// Whether `scope` is exactly a single `break`.
+fn scope_is_single_break(scope: &Scope) -> bool {
+    scope.instructions.len() == 1
+        && matches!(scope.instructions[0].operation, Operation::Branch(Branch::Break))
+}
+
+/// Whether `scope` (recursively, through nested branches and loops) contains
+/// a `SyncCube` barrier — i.e. whether a loop is *cooperative* (module docs'
+/// "`Branch::Loop` recognition"). Recursive so a barrier nested inside an
+/// `if` within the loop still marks it cooperative.
+fn scope_contains_sync_cube(scope: &Scope) -> bool {
+    scope.instructions.iter().any(|inst| match &inst.operation {
+        Operation::Synchronization(Synchronization::SyncCube) => true,
+        Operation::Branch(b) => match b {
+            Branch::If(if_) => scope_contains_sync_cube(&if_.scope),
+            Branch::IfElse(ie) => {
+                scope_contains_sync_cube(&ie.scope_if) || scope_contains_sync_cube(&ie.scope_else)
+            }
+            Branch::Switch(sw) => {
+                scope_contains_sync_cube(&sw.scope_default)
+                    || sw.cases.iter().any(|(_, s)| scope_contains_sync_cube(s))
+            }
+            Branch::RangeLoop(rl) => scope_contains_sync_cube(&rl.scope),
+            Branch::Loop(l) => scope_contains_sync_cube(&l.scope),
+            Branch::Return | Branch::Break | Branch::Unreachable => false,
+        },
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -1922,6 +2360,439 @@ mod tests {
         match prove_bounds_freedom(&def, AXPY_BUFFERS, &[]) {
             ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
             other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Shared-memory milestone M1 — cooperative leaves + shared arrays.
+    // (docs/design-shared-memory.md §8 M1.)
+    // -----------------------------------------------------------------
+
+    /// The loop-free portion of `block_sum_reduce`: the guarded shared load
+    /// plus the single-writer partial store, with the tree-reduction *loop*
+    /// omitted (that loop is cooperative — it carries a `sync_cube` — so it
+    /// defers to the M3 race walker; see `block_sum_reduce_defers_to_m3`).
+    /// This is the M1 positive control: it exercises every M1 mechanism —
+    /// `UnitPos`/`CubePos`/`AbsolutePos` cooperative leaves and a
+    /// `SharedMemory` tile bounded by its compile-time length — and proves.
+    #[cube(launch)]
+    fn prover_test_shared_load_guarded(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        sync_cube();
+        if CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    fn build_shared_load_guarded() -> KernelDefinition {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let input =
+            <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let output = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_shared_load_guarded::expand(&mut builder.scope, input, output);
+        builder.build(KernelSettings::default())
+    }
+
+    const SHARED_BUFFERS: &[BufferParam] = &[
+        BufferParam { name: "input", is_output: false },
+        BufferParam { name: "output", is_output: true },
+    ];
+
+    /// M1 positive control (§8): a single-thread symbolic pass over the
+    /// loop-free reduction shape `Proved` with `CUBE_DIM = 256`. Obligations:
+    /// `input[ABSOLUTE_POS]` read (guarded), `tile[UnitPos]` write (if arm),
+    /// `tile[UnitPos]` write (else arm), `tile[0]` read, `output[CUBE_POS]`
+    /// write (guarded) — five, all in bounds: `UnitPos < 256 == tile length`,
+    /// `ABSOLUTE_POS`/`CUBE_POS` guarded against their buffers.
+    #[test]
+    fn cooperative_shared_load_proves() {
+        let def = build_shared_load_guarded();
+        match prove_bounds_freedom_cooperative(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 5),
+            other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    /// Cooperative gating control: the *same* kernel run through the plain
+    /// (non-cooperative) entry point is `OutOfSubset`, because without a
+    /// pinned `CUBE_DIM` the `tile[UnitPos]` write index is unmodeled — the
+    /// shared-array bound machinery is active either way, but only cooperative
+    /// mode makes `UnitPos` modeled enough to discharge it. Confirms the M1
+    /// leaf modeling is genuinely gated on `coop`, not leaking into the plain
+    /// walk (whose behavior must stay byte-identical).
+    #[test]
+    fn shared_load_without_cooperative_is_out_of_subset() {
+        let def = build_shared_load_guarded();
+        match prove_bounds_freedom(&def, SHARED_BUFFERS, &[]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("write index") && reason.contains("shared_array"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (UnitPos unmodeled without cube_dim), got {other:?}"),
+        }
+    }
+
+    /// M1 negative control (§8): an undersized tile — `SharedMemory::new(128)`
+    /// launched at `CUBE_DIM = 256` — is a genuine OOB shared store, since
+    /// `tile[UnitPos]` with `UnitPos` up to `255` exceeds the 128-element tile
+    /// (§7.1's `cube_dim <= SharedMemory::new(N)` check, violated). The
+    /// checker must `Refuted` with a counterexample exhibiting `unit_pos >=
+    /// 128`, not vacuously prove.
+    #[cube(launch)]
+    fn prover_test_shared_undersized_tile(output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(128usize);
+        tile[tid] = 1.0f32;
+        if tid == 0usize {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn cooperative_undersized_tile_refutes() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let output = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_shared_undersized_tile::expand(&mut builder.scope, output);
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [BufferParam { name: "output", is_output: true }];
+        match prove_bounds_freedom_cooperative(&def, &buffers, &[], 256) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains("shared_array"), "unexpected obligation: {obligation}");
+                assert!(
+                    counterexample.contains("unit_pos"),
+                    "counterexample should exhibit the offending unit_pos: {counterexample}"
+                );
+            }
+            other => panic!("expected Refuted (undersized tile), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Shared-memory milestone M2 — `Branch::Loop` recognition.
+    // (docs/design-shared-memory.md §8 M2.)
+    // -----------------------------------------------------------------
+
+    /// The grid-stride accumulation phase in isolation: one non-cooperative
+    /// `while` loop (no barrier inside) whose induction variable `k` starts at
+    /// `ABSOLUTE_POS`, strides by `CUBE_DIM * num_cubes`, and is bounded by the
+    /// guard `k < n`. `n` is a comptime constant (folded to `4096`), so
+    /// `data[k]` reads discharge under `n <= data.len()`. The float
+    /// accumulator `local` is carried but never indexes anything.
+    #[cube(launch)]
+    fn prover_test_grid_stride_accumulate(
+        data: &Array<f32>,
+        out: &mut Array<f32>,
+        num_cubes: u32,
+        #[comptime] n: usize,
+    ) {
+        let stride = CUBE_DIM as usize * num_cubes as usize;
+        let mut k = ABSOLUTE_POS;
+        let mut local = 0.0f32;
+        while k < n {
+            local += data[k] * data[k];
+            k += stride;
+        }
+        if ABSOLUTE_POS < out.len() {
+            out[ABSOLUTE_POS] = local;
+        }
+    }
+
+    fn build_grid_stride_accumulate() -> KernelDefinition {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let data =
+            <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let out = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        let num_cubes = <u32 as LaunchArg>::expand(&Default::default(), &mut builder);
+        prover_test_grid_stride_accumulate::expand(&mut builder.scope, data, out, num_cubes, 4096);
+        builder.build(KernelSettings::default())
+    }
+
+    /// M2 positive control (§8): the phase-0 accumulation loop's `data[k]`
+    /// reads `Proved` under `n <= data.len()` — i.e. the non-cooperative
+    /// `Branch::Loop` is modeled RangeLoop-style, with `k` a fresh symbol
+    /// bounded by the asserted guard `k < 4096`. Obligations: `data[k]` read
+    /// twice (`data[k] * data[k]`), `out[ABSOLUTE_POS]` write (guarded) —
+    /// three. `data.len() == 4096` supplies `n <= data.len()`.
+    #[test]
+    fn noncooperative_loop_data_read_proves() {
+        let def = build_grid_stride_accumulate();
+        let buffers = [
+            BufferParam { name: "data", is_output: false },
+            BufferParam { name: "out", is_output: true },
+        ];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "data", value: 4096 }]) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    /// Without `n <= data.len()`, the same loop's `data[k]` read `Refuted`:
+    /// `k` (bounded only by `k < 4096`) can exceed an unconstrained
+    /// `data.len()`. Confirms the guard-derived bound is the *only* thing
+    /// making the positive control prove — the loop model doesn't vacuously
+    /// pass.
+    #[test]
+    fn noncooperative_loop_without_len_assume_refutes() {
+        let def = build_grid_stride_accumulate();
+        let buffers = [
+            BufferParam { name: "data", is_output: false },
+            BufferParam { name: "out", is_output: true },
+        ];
+        match prove_bounds_freedom(&def, &buffers, &[]) {
+            ProveResult::Refuted { obligation, .. } => {
+                assert!(obligation.contains("data"), "unexpected obligation: {obligation}");
+            }
+            other => panic!("expected Refuted, got {other:?}"),
+        }
+    }
+
+    /// M2 negative control (§8): a `Branch::Loop` with a *trailing* break
+    /// (`loop { body; if c { break } }`) has no leading break-guard, so it is
+    /// not the recognized `while` shape — it stays `OutOfSubset` with the
+    /// pre-milestone "unbounded/break-terminated loop" reason, unchanged. A
+    /// bare unbounded loop is never modeled.
+    #[cube(launch)]
+    fn prover_test_bare_loop_trailing_break(x: &Array<u32>, y: &mut Array<u32>) {
+        loop {
+            y[ABSOLUTE_POS] = x[ABSOLUTE_POS];
+            if ABSOLUTE_POS == 0usize {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn bare_loop_trailing_break_is_out_of_subset() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let x = <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let y = <Array<u32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_bare_loop_trailing_break::expand(&mut builder.scope, x, y);
+        let def = builder.build(KernelSettings::default());
+
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("unbounded/break-terminated"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (no leading break-guard), got {other:?}"),
+        }
+    }
+
+    /// Honesty control for the induction-variable restriction: a *descending*
+    /// loop (`while k > 0 { …k…; k -= 1 }`) has a leading break-guard and no
+    /// barrier, so it is recognized and non-cooperative — but its guard `k >
+    /// 0` bounds `k` from *below*, not above. `k` is therefore NOT promoted to
+    /// an induction symbol (which, bounded only from below, could manufacture
+    /// a spurious `Refuted` on a safe loop); it stays tainted, and the `x[k]`
+    /// read fails cleanly as `OutOfSubset` at the use site. Never a spurious
+    /// `Refuted`, never a `Proved`.
+    #[cube(launch)]
+    fn prover_test_descending_loop(x: &Array<u32>, y: &mut Array<u32>) {
+        let mut k = ABSOLUTE_POS;
+        while k > 0usize {
+            y[k] = x[k];
+            k -= 1usize;
+        }
+    }
+
+    #[test]
+    fn descending_loop_is_out_of_subset_not_refuted() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let x = <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let y = <Array<u32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_descending_loop::expand(&mut builder.scope, x, y);
+        let def = builder.build(KernelSettings::default());
+
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("depends on a construct outside"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (descending induction not promoted), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The two probe reduction kernels, whole. Under M1+M2 both reach their
+    // cooperative tree-reduction loop (a `Branch::Loop` carrying `sync_cube`)
+    // and defer to the M3 race walker — nothing past a barrier-carrying loop
+    // is modeled by a single-thread bounds pass. (These are the exact
+    // clean-room probe kernels from the design's scratchpad.)
+    // -----------------------------------------------------------------
+
+    #[cube(launch)]
+    fn prover_test_block_sum_reduce(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        sync_cube();
+
+        let mut half = CUBE_DIM as usize / 2;
+        while half > 0usize {
+            if tid < half {
+                let a = tile[tid];
+                let b = tile[tid + half];
+                tile[tid] = a + b;
+            }
+            sync_cube();
+            half /= 2usize;
+        }
+
+        if tid == 0usize {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    /// `block_sum_reduce`, whole, in cooperative mode: the guarded load and
+    /// its shared writes are modeled (M1), the top-level barrier is a no-op,
+    /// but the tree-reduction `while` loop carries a `sync_cube` — cooperative
+    /// — so the walk defers to M3 rather than mismodeling it. This is why the
+    /// §8 M1 phrase "block_sum_reduce Proved" is, under the M2 decision to
+    /// defer cooperative loops, satisfiable only for the loop-free portion
+    /// (`cooperative_shared_load_proves`); the whole kernel correctly stops at
+    /// the barrier-carrying loop.
+    #[test]
+    fn block_sum_reduce_defers_to_m3() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let input =
+            <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let output = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_block_sum_reduce::expand(&mut builder.scope, input, output);
+        let def = builder.build(KernelSettings::default());
+
+        match prove_bounds_freedom_cooperative(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("milestone M3") && reason.contains("cooperative loop"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (cooperative loop deferred to M3), got {other:?}"),
+        }
+    }
+
+    #[cube(launch)]
+    fn prover_test_grid_stride_reduce(
+        data: &Array<f32>,
+        partials: &mut Array<f32>,
+        num_cubes: u32,
+        #[comptime] n: usize,
+    ) {
+        let tid = UNIT_POS as usize;
+        let stride = CUBE_DIM as usize * num_cubes as usize;
+        let mut k = ABSOLUTE_POS;
+        let mut local = 0.0f32;
+        while k < n {
+            local += data[k] * data[k];
+            k += stride;
+        }
+
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        tile[tid] = local;
+        sync_cube();
+
+        let mut half = CUBE_DIM as usize / 2;
+        while half > 0usize {
+            if tid < half {
+                let a = tile[tid];
+                let b = tile[tid + half];
+                tile[tid] = a + b;
+            }
+            sync_cube();
+            half /= 2usize;
+        }
+
+        if tid == 0usize {
+            partials[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    /// `grid_stride_reduce`, whole, in cooperative mode with `data.len() ==
+    /// 4096`: the non-cooperative accumulation loop is modeled and its
+    /// `data[k]` reads discharge (M2), the `tile[UnitPos]` store proves (M1),
+    /// but the subsequent tree-reduction `while` loop carries `sync_cube` —
+    /// cooperative — so the walk defers to M3. Demonstrates the two loop
+    /// shapes side by side in one kernel: the first modeled, the second
+    /// deferred.
+    #[test]
+    fn grid_stride_reduce_defers_to_m3() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let data =
+            <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let partials = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        let num_cubes = <u32 as LaunchArg>::expand(&Default::default(), &mut builder);
+        prover_test_grid_stride_reduce::expand(&mut builder.scope, data, partials, num_cubes, 4096);
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [
+            BufferParam { name: "data", is_output: false },
+            BufferParam { name: "partials", is_output: true },
+        ];
+        match prove_bounds_freedom_cooperative(
+            &def,
+            &buffers,
+            &[Assume::LenEqConst { a: "data", value: 4096 }],
+            256,
+        ) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("milestone M3") && reason.contains("cooperative loop"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (tree loop deferred to M3), got {other:?}"),
         }
     }
 }

@@ -13,4 +13,7 @@ mod hash;
 mod prover;
 
 pub use hash::kernel_ir_hash;
-pub use prover::{Assume, BufferParam, ProveResult, prove_bounds_freedom, z3_version};
+pub use prover::{
+    Assume, BufferParam, ProveResult, prove_bounds_freedom, prove_bounds_freedom_cooperative,
+    z3_version,
+};
