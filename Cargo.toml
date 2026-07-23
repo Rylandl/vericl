@@ -25,7 +25,7 @@ serde_json = "1"
 sha2 = "0.10"
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full", "extra-traits", "fold"] }
+syn = { version = "2", features = ["full", "extra-traits", "fold", "visit"] }
 easy-smt = "0.3"
 
 [profile.dev]

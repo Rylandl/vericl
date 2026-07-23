@@ -193,6 +193,169 @@ pub fn flatten_decode_scale(x: &Array<f32>, y: &mut Array<f32>, width: u32, scal
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kernel composition: #[vericl::helper] + uses(...) — the milestone this
+// section demonstrates (docs/dogfood-2026-07.md Tier-1 gap #2, blocking
+// 16/22 dogfooded kernels). See README "Kernel composition" for the design.
+//
+// A note on why every helper below is fully monomorphized via its own
+// instantiate(...) clause rather than left generic (a first draft of this
+// design tried the latter): `FLOAT_METHOD_WHITELIST`'s host-safety proof
+// (crates/vericl-macros' module doc) relies on Rust preferring an inherent
+// method over a trait method for a *concrete* receiver type. A bound-but-
+// unsubstituted generic type parameter `F: Float` has no inherent methods
+// at all, so a whitelisted call like `.abs()`/`.sqrt()` inside a still-
+// generic host fn resolves purely through the `Float`/`Numeric` trait,
+// which (confirmed by reading cubecl-core's `impl_unary_func!` macro, and
+// empirically: a scratch generic `fn g<F: Float>(x: F) -> F { x.sqrt() }`
+// panics on host calling `g(2.5f32)`, as does `.abs()`) is exactly the
+// unverified `unexpanded!()` panic path the whitelist exists to keep out of
+// a twin. Monomorphizing via instantiate(...) — reusing the exact same
+// resolve_instantiate/FloatMethodCheck machinery a kernel already uses —
+// closes that gap the same proven way instead of introducing a second,
+// weaker safety story. The cost: a helper's twin is pinned to one concrete
+// type (only `f32` is supported anywhere in vericl v0 today, so this is
+// free in practice); a `#[comptime]` parameter, unlike a generic type
+// parameter, is never pinned by a helper's instantiate(...) — it stays an
+// ordinary pass-through parameter, since it carries no host-callability
+// hazard (it's just a plain integer value) and the caller's own twin
+// already has the concrete pinned value in hand to pass along.
+
+/// Scales one scalar by a gain factor — the simplest possible helper (no
+/// array parameters, no other helper calls), reused by two kernels below
+/// (`gain_kernel` directly, `fir_pair_scaled` transitively).
+#[vericl::helper(instantiate(F = f32))]
+#[cube]
+pub fn single_tap<F: Float>(a: F, gain: F) -> F {
+    a * gain
+}
+
+/// A 2-tap FIR pair returning a tuple — the milestone's headline "helper
+/// returning a tuple" shape (docs/dogfood-2026-07.md's suggested candidate
+/// example). Tuple returns are plain Rust; no special handling needed.
+#[vericl::helper(instantiate(F = f32))]
+#[cube]
+pub fn fir_pair<F: Float>(a: F, b: F) -> (F, F) {
+    (a + b, a - b)
+}
+
+/// Calls two OTHER `#[vericl::helper]`-annotated functions —
+/// helper-calling-helper composition, supported via the exact same
+/// `uses(...)` rewrite mechanism a kernel gets (no special-casing). Its
+/// twin's identity recursively folds in both `fir_pair`'s and
+/// `single_tap`'s (see `fir_pair_scaled_vericl::identity_hash`).
+#[vericl::helper(instantiate(F = f32), uses(fir_pair, single_tap))]
+#[cube]
+pub fn fir_pair_scaled<F: Float>(a: F, b: F, gain: F) -> (F, F) {
+    let sum_diff: (F, F) = fir_pair::<F>(a, b);
+    (single_tap::<F>(sum_diff.0, gain), single_tap::<F>(sum_diff.1, gain))
+}
+
+/// Reads a value AND its right neighbor — unlike the helpers above, the
+/// array access genuinely lives *inside the helper's own body*, not the
+/// caller's. Pins the prover-composition boundary (see
+/// `tap_pair_guarded_kernel`/`tap_pair_unguarded_kernel` below): whether the
+/// SMT bounds prover, walking a kernel's inlined IR, discharges an
+/// obligation that only exists because of what a composed helper does.
+#[vericl::helper(instantiate(F = f32))]
+#[cube]
+pub fn tap_pair<F: Float>(x: &Array<F>, idx: usize) -> F {
+    x[idx] + x[idx + 1]
+}
+
+/// Composed kernel A: calls `single_tap` directly. Wired into
+/// `vericl::suite!` — carries both `tested` (differential) and `proved`
+/// (SMT bounds) claims, same as any honest non-composed kernel; composition
+/// needed zero prover changes (cube expansion inlines the helper's IR
+/// directly into this kernel's own `Scope` — see
+/// `crates/vericl-ir/src/prover.rs`'s module doc, "Soundness notes").
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-5),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, gain in -4.0..=4.0),
+    instantiate(F = f32),
+    uses(single_tap)
+)]
+#[cube(launch)]
+pub fn gain_kernel<F: Float + CubeElement>(x: &Array<F>, y: &mut Array<F>, gain: F) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = single_tap::<F>(x[ABSOLUTE_POS], gain);
+    }
+}
+
+/// Composed kernel B: calls `fir_pair_scaled`, which itself calls
+/// `fir_pair` and `single_tap` — two levels of composition end to end, and
+/// `single_tap` reused across both `gain_kernel` (directly) and this kernel
+/// (transitively). Two `&mut Array` outputs, one per tuple element — the
+/// macro-generated `conformance_case`/comparison machinery already handles
+/// N output buffers generically, so this needed no new machinery either.
+/// Wired into `vericl::suite!`: the composed kernel carrying tested + proved
+/// claims the milestone asks for.
+#[vericl::kernel(
+    assumes(x.len() == sum_out.len(), x.len() == diff_out.len()),
+    compare(abs = 1e-5),
+    gen(x in -10.0..=10.0, sum_out in 0.0..=0.0, diff_out in 0.0..=0.0, gain in -4.0..=4.0),
+    instantiate(F = f32),
+    uses(fir_pair_scaled)
+)]
+#[cube(launch)]
+pub fn fir_pair_kernel<F: Float + CubeElement>(
+    x: &Array<F>,
+    sum_out: &mut Array<F>,
+    diff_out: &mut Array<F>,
+    gain: F,
+) {
+    if ABSOLUTE_POS + 1 < x.len() {
+        let s_d: (F, F) = fir_pair_scaled::<F>(x[ABSOLUTE_POS], x[ABSOLUTE_POS + 1], gain);
+        sum_out[ABSOLUTE_POS] = s_d.0;
+        diff_out[ABSOLUTE_POS] = s_d.1;
+    }
+}
+
+/// Prover-composition positive control (docs/dogfood-2026-07.md-style, not
+/// wired into `vericl::suite!` — mirrors the `stepped_loop_*` precedent
+/// below of a kernel that exists purely to pin a prover finding, not to
+/// carry evidence): the guard `ABSOLUTE_POS + 1 < x.len()` covers BOTH
+/// reads `tap_pair`'s own body performs (`x[idx]`, `x[idx + 1]`) even
+/// though those accesses live inside the composed helper, not here. Must
+/// discharge `Proved` — see
+/// `tap_pair_guarded_kernel_kernel_definition_is_provably_in_bounds` below.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-5),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0),
+    instantiate(F = f32),
+    uses(tap_pair)
+)]
+#[cube(launch)]
+pub fn tap_pair_guarded_kernel<F: Float + CubeElement>(x: &Array<F>, y: &mut Array<F>) {
+    if ABSOLUTE_POS + 1 < x.len() {
+        y[ABSOLUTE_POS] = tap_pair::<F>(x, ABSOLUTE_POS);
+    }
+}
+
+/// Prover-composition negative control: same shape as
+/// `tap_pair_guarded_kernel` and the same helper (`tap_pair` — demonstrating
+/// helper reuse together with the kernel above), but the guard only
+/// establishes `ABSOLUTE_POS < x.len()`, one short of what `tap_pair`'s own
+/// unguarded `x[idx + 1]` read needs at the top position. Must `Refuted`,
+/// never `Proved` — the obligation genuinely lives inside the helper's
+/// body, and the prover must not silently drop it just because it's
+/// composed rather than written directly in the kernel.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-5),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0),
+    instantiate(F = f32),
+    uses(tap_pair)
+)]
+#[cube(launch)]
+pub fn tap_pair_unguarded_kernel<F: Float + CubeElement>(x: &Array<F>, y: &mut Array<F>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = tap_pair::<F>(x, ABSOLUTE_POS);
+    }
+}
+
 /// DEFECTIVE: boundary guard is `<=`, reading and writing one element past
 /// the end. WGSL robustness silently clamps this on the GPU, so a GPU-only
 /// test can pass; the sequential reference panics deterministically.
@@ -677,6 +840,265 @@ mod tests {
             // x[pos] read, y[row*width+col] write.
             vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
             other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Kernel composition: #[vericl::helper] + uses(...).
+    // -----------------------------------------------------------------
+
+    /// The `single_tap`/`fir_pair` helper twins compute exactly what their
+    /// (very simple) bodies say — guards against the twin derivation itself
+    /// going wrong for a helper, same purpose as `fir_handwritten`/`fmix32`
+    /// above for kernels.
+    #[test]
+    fn helper_twins_match_hand_computed() {
+        assert_eq!(single_tap_vericl_ref(3.0f32, 2.0f32), 6.0);
+        assert_eq!(fir_pair_vericl_ref(5.0f32, 2.0f32), (7.0, 3.0));
+    }
+
+    /// `fir_pair_scaled` calls two OTHER helpers (`fir_pair`, `single_tap`)
+    /// — its twin must genuinely compose their `_vericl_ref` twins, not
+    /// silently fall back to something else. Cross-checked two ways: against
+    /// a hand-composed value, and against literally calling the other two
+    /// twins directly and combining them the same way the helper's own body
+    /// does — the latter is only a meaningful check because it's the exact
+    /// call chain `uses(fir_pair, single_tap)`'s rewrite is supposed to
+    /// produce.
+    #[test]
+    fn fir_pair_scaled_twin_composes_its_own_helpers() {
+        let (a, b, gain) = (5.0f32, 2.0f32, 10.0f32);
+        let got = fir_pair_scaled_vericl_ref(a, b, gain);
+
+        let (sum, diff) = fir_pair_vericl_ref(a, b);
+        let expected = (single_tap_vericl_ref(sum, gain), single_tap_vericl_ref(diff, gain));
+        assert_eq!(got, expected);
+        assert_eq!(got, (70.0, 30.0));
+    }
+
+    /// `tap_pair`'s twin reads its own two elements — the shape the
+    /// composition-prover tests below rely on.
+    #[test]
+    fn tap_pair_twin_matches_hand_computed() {
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        assert_eq!(tap_pair_vericl_ref(&x, 0), 3.0);
+        assert_eq!(tap_pair_vericl_ref(&x, 2), 7.0);
+    }
+
+    /// `gain_kernel`'s twin honors its guard and matches a hand computation
+    /// that never goes through `single_tap_vericl_ref` at all — guards
+    /// against the composed kernel's *own* derivation (ABSOLUTE_POS rewrite,
+    /// instantiate(...) substitution, uses(...) rewrite all combined) being
+    /// wrong in a way an isolated helper-twin test wouldn't catch.
+    #[test]
+    fn gain_kernel_twin_matches_hand_computed() {
+        let x = vec![1.0f32, -2.0, 3.0];
+        let mut y = vec![0.0f32; x.len()];
+        gain_kernel_vericl::reference(&x, &mut y, 2.0, x.len());
+        assert_eq!(y, vec![2.0, -4.0, 6.0]);
+    }
+
+    /// Threads past the guard write nothing — same discipline as every
+    /// other kernel's twin.
+    #[test]
+    fn gain_kernel_twin_respects_guard() {
+        let x = vec![1.0f32; 3];
+        let mut y = vec![9.0f32; 3];
+        gain_kernel_vericl::reference(&x, &mut y, 2.0, 256);
+        assert_eq!(y, vec![2.0, 2.0, 2.0]);
+    }
+
+    /// `fir_pair_kernel`'s twin (two-level composition: kernel ->
+    /// `fir_pair_scaled` -> `fir_pair`/`single_tap`, two `&mut Array`
+    /// outputs) matches an independent hand computation.
+    #[test]
+    fn fir_pair_kernel_twin_matches_hand_computed() {
+        let x = vec![1.0f32, 3.0, -2.0, 5.0];
+        let mut sum_out = vec![0.0f32; x.len()];
+        let mut diff_out = vec![0.0f32; x.len()];
+        let gain = 2.0f32;
+        fir_pair_kernel_vericl::reference(&x, &mut sum_out, &mut diff_out, gain, x.len());
+        // Guard is ABSOLUTE_POS + 1 < x.len(), so only positions 0..len-2
+        // write; last position(s) stay at their initial value.
+        for pos in 0..x.len() - 2 {
+            let (a, b) = (x[pos], x[pos + 1]);
+            assert_eq!(sum_out[pos], (a + b) * gain, "sum_out[{pos}]");
+            assert_eq!(diff_out[pos], (a - b) * gain, "diff_out[{pos}]");
+        }
+        assert_eq!(sum_out[x.len() - 1], 0.0);
+        assert_eq!(diff_out[x.len() - 1], 0.0);
+    }
+
+    /// `uses(...)` is recorded on the contract, and `tap_pair` is reused
+    /// verbatim by two different kernels (the milestone's explicit "two
+    /// kernels using the same helper" ask) — both list exactly `["tap_pair"]`.
+    #[test]
+    fn uses_clause_is_recorded_and_helper_is_reused_by_two_kernels() {
+        assert_eq!(gain_kernel_vericl::contract().uses, &["single_tap"]);
+        assert_eq!(fir_pair_kernel_vericl::contract().uses, &["fir_pair_scaled"]);
+        assert_eq!(tap_pair_guarded_kernel_vericl::contract().uses, &["tap_pair"]);
+        assert_eq!(tap_pair_unguarded_kernel_vericl::contract().uses, &["tap_pair"]);
+        // A non-composing kernel's uses() is empty.
+        assert!(axpy_vericl::contract().uses.is_empty());
+        // A helper composing two other helpers records both, in clause order.
+        assert_eq!(fir_pair_scaled_vericl::USES, &["fir_pair", "single_tap"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Composition identity: uses(...) must make a helper body change
+    // visible in the composing kernel's (and helper's) recorded identity,
+    // without leaking into anything that doesn't use() it.
+    // -----------------------------------------------------------------
+
+    /// A composing kernel's *recorded* identity (`identity()`) is NOT the
+    /// same as its own compile-time-only `SOURCE_HASH` — composition
+    /// genuinely changes what gets recorded, and does so by exactly folding
+    /// in the declared helper's own `identity_hash()` (verified by
+    /// reproducing the combine independently via
+    /// `vericl::combine_source_hash` and asserting byte-for-byte equality,
+    /// not just "differs from something").
+    #[test]
+    fn composed_kernel_identity_folds_in_its_helpers_hash() {
+        let recorded = gain_kernel_vericl::identity().source_hash;
+        assert_ne!(recorded, gain_kernel_vericl::SOURCE_HASH);
+        let expected = vericl::combine_source_hash(
+            gain_kernel_vericl::SOURCE_HASH,
+            &[single_tap_vericl::identity_hash()],
+        );
+        assert_eq!(recorded, expected);
+    }
+
+    /// A NON-composing kernel's recorded identity is an exact pass-through
+    /// of its own `SOURCE_HASH` — proving `identity()` folds in exactly the
+    /// `uses(...)`-declared set and nothing else, regardless of how many
+    /// unrelated helpers exist elsewhere in this same crate. This is the
+    /// "changing a helper's unused sibling changes neither hash" guarantee,
+    /// checked structurally (identity() provably can't see an undeclared
+    /// helper at all) rather than by an actual source edit + rebuild —
+    /// which was additionally exercised by hand (not committed; see the
+    /// task's verification report) by editing `single_tap`'s body and
+    /// confirming `gain_kernel`'s identity()/ir_hash moved while
+    /// `axpy`'s/`flatten_decode_scale`'s did not, then reverting.
+    #[test]
+    fn unused_helper_does_not_affect_an_unrelated_kernels_identity() {
+        assert_eq!(axpy_vericl::identity().source_hash, axpy_vericl::SOURCE_HASH);
+        assert_eq!(
+            flatten_decode_scale_vericl::identity().source_hash,
+            flatten_decode_scale_vericl::SOURCE_HASH,
+        );
+    }
+
+    /// Helper-calling-helper: `fir_pair_scaled`'s OWN `identity_hash()`
+    /// recursively folds in both `fir_pair`'s and `single_tap`'s hashes —
+    /// verified by reproducing the combine independently, exactly as for
+    /// the kernel-level test above.
+    #[test]
+    fn helper_calling_helper_identity_is_recursive() {
+        let recorded = fir_pair_scaled_vericl::identity_hash();
+        assert_ne!(recorded, fir_pair_scaled_vericl::SOURCE_HASH);
+        let expected = vericl::combine_source_hash(
+            fir_pair_scaled_vericl::SOURCE_HASH,
+            &[fir_pair_vericl::identity_hash(), single_tap_vericl::identity_hash()],
+        );
+        assert_eq!(recorded, expected);
+    }
+
+    /// The two-level composition case (`fir_pair_kernel` -> `fir_pair_scaled`
+    /// -> `fir_pair`/`single_tap`): the KERNEL's own recorded identity only
+    /// ever combines with its *direct* dependency's already-recursive
+    /// `identity_hash()` — it never needs to know about `fir_pair`/
+    /// `single_tap` by name at all, yet a change two levels deep still
+    /// reaches it, because `fir_pair_scaled_vericl::identity_hash()` (used
+    /// here) already covers its own `uses(...)` the same way (pinned by
+    /// `helper_calling_helper_identity_is_recursive` above).
+    #[test]
+    fn composed_kernel_identity_is_recursive_through_the_helper_chain() {
+        let recorded = fir_pair_kernel_vericl::identity().source_hash;
+        let expected = vericl::combine_source_hash(
+            fir_pair_kernel_vericl::SOURCE_HASH,
+            &[fir_pair_scaled_vericl::identity_hash()],
+        );
+        assert_eq!(recorded, expected);
+    }
+
+    // -----------------------------------------------------------------
+    // Composition + the SMT bounds prover (README claim: composition needs
+    // zero prover changes, since cube expansion inlines a used helper's IR
+    // directly into the composing kernel's own Scope).
+    // -----------------------------------------------------------------
+
+    /// Positive control: `tap_pair`'s own `x[idx]`/`x[idx + 1]` reads live
+    /// entirely inside the composed helper's body, not the kernel's — and
+    /// the guard `ABSOLUTE_POS + 1 < x.len()` the KERNEL establishes still
+    /// gets combined with them correctly. Must discharge `Proved` — this is
+    /// the milestone's positive composition-prover result.
+    #[test]
+    fn tap_pair_guarded_kernel_definition_is_provably_in_bounds() {
+        let def = tap_pair_guarded_kernel_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = tap_pair_guarded_kernel_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Proved { .. } => {}
+            other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    /// Negative control: same helper, same kernel shape, but the guard only
+    /// covers `ABSOLUTE_POS < x.len()` — one short of what `tap_pair`'s own
+    /// unguarded `x[idx + 1]` read needs at the top position. Must
+    /// `Refuted`, proving the obligation from inside the helper's body is
+    /// genuinely walked and not silently dropped because it's composed
+    /// rather than written directly in the kernel — the milestone's
+    /// negative composition-prover result.
+    #[test]
+    fn tap_pair_unguarded_kernel_definition_refutes() {
+        let def = tap_pair_unguarded_kernel_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = tap_pair_unguarded_kernel_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Refuted { .. } => {}
+            other => panic!("expected Refuted, got {other:?}"),
+        }
+    }
+
+    /// The suite-wired composed kernels also prove — carrying both tested
+    /// (differential, via `vericl::suite!`) and proved claims is the
+    /// milestone's "composed kernel carries tested + proved claims" ask.
+    #[test]
+    fn suite_wired_composed_kernels_prove() {
+        let gain_buffers: Vec<vericl_ir::BufferParam> = gain_kernel_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        match vericl_ir::prove_bounds_freedom(
+            &gain_kernel_vericl::kernel_definition(),
+            &gain_buffers,
+            &[vericl_ir::Assume::LenEq { a: "x", b: "y" }],
+        ) {
+            vericl_ir::ProveResult::Proved { .. } => {}
+            other => panic!("expected gain_kernel to prove, got {other:?}"),
+        }
+
+        let fir_buffers: Vec<vericl_ir::BufferParam> = fir_pair_kernel_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        match vericl_ir::prove_bounds_freedom(
+            &fir_pair_kernel_vericl::kernel_definition(),
+            &fir_buffers,
+            &[
+                vericl_ir::Assume::LenEq { a: "x", b: "sum_out" },
+                vericl_ir::Assume::LenEq { a: "x", b: "diff_out" },
+            ],
+        ) {
+            vericl_ir::ProveResult::Proved { .. } => {}
+            other => panic!("expected fir_pair_kernel to prove, got {other:?}"),
         }
     }
 }

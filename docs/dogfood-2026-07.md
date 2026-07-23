@@ -27,7 +27,7 @@ Tier 1 — macro gates (compile-time rejection):
 | Gap | Blocks | Notes |
 |---|---|---|
 | Generic kernels (`<F: Float>`) | 20/22 | The dominant gap by far; production kernels are float-generic almost universally |
-| Kernel composition (calling other `#[cube]` fns) | 16/22 | Twin derivation has no route through helper calls |
+| Kernel composition (calling other `#[cube]` fns) | 16/22 | **[implemented, 2026-07]** `#[vericl::helper]` + a kernel-side `uses(...)` clause — see `crates/vericl-macros/src/lib.rs`'s composition doc and README "Kernel composition" |
 | `#[comptime]` parameters | 15/22 | Used for unroll counts, feature toggles, emitter counts |
 | `usize` scalar params | 0 today, next wall | Every current use hides behind `#[comptime]`; surfaces the moment that gate lifts |
 | Shared-memory topology (`UNIT_POS`, `CUBE_DIM`, `SharedMemory`, `sync_cube`) | 2/22 directly | The reduction-kernel shape; both also blocked by the gates above |
@@ -64,7 +64,7 @@ guard. Unreachable today (all users also hit other gates) but now banned explici
 1. Generic kernel support via an `instantiate(...)` contract clause (monomorphized twin,
    launch, and IR at declared concrete types) — unblocks 20/22.
 2. `#[comptime]` parameter pinning through the same clause — unblocks most of the 15/22.
-3. Kernel composition (annotated helpers contribute twins) — unblocks 16/22.
+3. [DONE 2026-07] Kernel composition (annotated helpers contribute twins) — unblocks 16/22.
 4. Prover: div/mod index modeling (cheap), loop-carry refinement, then value-dependent
    indices via quantified assumes.
 5. Shared-memory reduction shape — last, hardest, and the gateway to race-freedom proofs.

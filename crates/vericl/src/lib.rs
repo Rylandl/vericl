@@ -23,7 +23,10 @@ pub use compare::{
     CompareReport, Mismatch, compare_exact_u32, compare_f32, compare_f32_absrel,
     compare_f32_with, compare_u32_with, ulp_distance_f32,
 };
-pub use contract::{Compare, Contract, ContractRecord, Identity, StructuredAssume};
+pub use contract::{
+    Compare, Contract, ContractRecord, Identity, MAX_HELPER_COMPOSITION_DEPTH, StructuredAssume,
+    check_helper_composition_depth, combine_source_hash,
+};
 pub use evidence::{
     CaseOutcome, Claim, ClaimKind, ClaimResult, Entry, Manifest, describe_case_outcome,
     differential_config, proved_config, verify,
@@ -34,7 +37,7 @@ pub use trust::{
     GPU_HARDWARE_TRUST, backend_buffer_trust, proved_bounds_trust, reference_twin_trust,
     shared_frontend_lane_trust,
 };
-pub use vericl_macros::{kernel, suite};
+pub use vericl_macros::{helper, kernel, suite};
 
 /// VeriCL version, recorded in every identity and manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

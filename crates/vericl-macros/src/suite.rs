@@ -293,7 +293,7 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
             __trusted.push(::vericl::backend_buffer_trust(&__vericl_backend));
             __trusted.push(::vericl::GPU_HARDWARE_TRUST.to_string());
 
-            let mut __identity = #kmod::contract().identity();
+            let mut __identity = #kmod::identity();
 
             if __vericl_prove {
                 let __def = #kmod::kernel_definition();

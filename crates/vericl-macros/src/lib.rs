@@ -16,7 +16,8 @@
 //! Kernels outside the supported v0 subset are rejected at compile time
 //! rather than silently approximated.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use proc_macro::TokenStream;
 use proc_macro2::{Group, Ident, TokenStream as TokenStream2, TokenTree};
@@ -26,9 +27,11 @@ use syn::fold::Fold;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
+use syn::visit::Visit;
 use syn::{
-    BinOp, Expr, ExprBinary, ExprForLoop, ExprLoop, ExprRange, ExprWhile, FnArg, GenericParam,
-    ItemFn, Meta, Pat, PatType, RangeLimits, ReturnType, Token, Type, parse_macro_input,
+    BinOp, Expr, ExprBinary, ExprCall, ExprForLoop, ExprLoop, ExprRange, ExprWhile, FnArg,
+    GenericParam, ItemFn, Meta, Pat, PatIdent, PatType, RangeLimits, ReturnType, Token, Type,
+    parse_macro_input,
 };
 
 mod suite;
@@ -75,6 +78,20 @@ const BANNED_IDENTS: &[&str] = &[
 ];
 
 const BANNED_PREFIXES: &[&str] = &["plane_", "Atomic"];
+
+/// Free functions (called bare, e.g. `range_stepped(...)`, never as a
+/// method or via a qualified path) empirically known to be host-callable
+/// and used by an existing kernel body — `stepped_loop_descending_copy`
+/// calls `range_stepped`. `uses(...)`-aware call scanning (see
+/// `UsesRewriteFold`) needs to tell "a call to an unlisted #[vericl::helper]
+/// the author forgot to declare" apart from "an ordinary free-function call
+/// that has always worked in a twin body"; since a macro invocation cannot
+/// see whether some other ident in scope is itself a `#[cube]` fn (that
+/// would require whole-crate visibility no `#[proc_macro_attribute]` has —
+/// see `UsesRewriteFold`'s doc), this is the explicit, demand-driven
+/// allowlist for the latter category. Grow it as real kernels need more
+/// entries — never by removing the ambiguity check itself.
+const KNOWN_HOST_SAFE_FREE_FNS: &[&str] = &["range_stepped"];
 
 /// `cubecl::prelude::Float`/`Numeric` trait method names empirically
 /// verified as host-callable on `f32` — safe to appear in a reference
@@ -244,6 +261,10 @@ struct ContractSpec {
     /// params and no clause is an error, as is a clause on a kernel with
     /// neither).
     instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)>,
+    /// `uses(...)` clause entries — the names of `#[vericl::helper]`-
+    /// annotated functions this kernel calls (kernel composition). `[]`
+    /// when the clause is absent.
+    uses: Vec<Ident>,
 }
 
 fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
@@ -256,6 +277,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
     let mut wrapping = None;
     let mut gen_entries: Vec<GenEntry> = Vec::new();
     let mut instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)> = None;
+    let mut uses: Vec<Ident> = Vec::new();
 
     for meta in metas {
         match &meta {
@@ -352,11 +374,25 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
                     })?;
                 instantiate = Some((list.span(), entries.into_iter().collect()));
             }
+            Meta::List(list) if list.path.is_ident("uses") => {
+                let idents: Punctuated<Ident, Token![,]> = list
+                    .parse_args_with(Punctuated::parse_terminated)
+                    .map_err(|e| {
+                        syn::Error::new(
+                            list.span(),
+                            format!(
+                                "uses(...) expects comma-separated names of #[vericl::helper]-\
+                                 annotated functions this kernel calls: {e}"
+                            ),
+                        )
+                    })?;
+                uses.extend(idents);
+            }
             other => {
                 return Err(syn::Error::new(
                     other.span(),
-                    "expected `assumes(...)`, `compare(...)`, `gen(...)`, `instantiate(...)`, or \
-                     `wrapping`",
+                    "expected `assumes(...)`, `compare(...)`, `gen(...)`, `instantiate(...)`, \
+                     `uses(...)`, or `wrapping`",
                 ));
             }
         }
@@ -369,6 +405,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
         wrapping,
         gen_entries,
         instantiate,
+        uses,
     })
 }
 
@@ -380,18 +417,34 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
 type GenericSubst = HashMap<String, TokenStream2>;
 
 /// Walk a token stream, rewriting `ABSOLUTE_POS` to the sequential loop
-/// variable, substituting any generic type parameter ident per `subst`
-/// (`F` -> `f32`, token-wise — see the `instantiate(...)` design), and
-/// rejecting out-of-subset constructs. Used for both the reference twin's
-/// body and (via [`subst_type_tokens`]) its signature's parameter types, so
-/// an instantiated kernel's twin never mentions the original generic ident.
-fn transform_body(ts: TokenStream2, subst: &GenericSubst, errors: &mut Vec<syn::Error>) -> TokenStream2 {
+/// variable (kernels only — see `allow_absolute_pos`), substituting any
+/// generic type parameter ident per `subst` (`F` -> `f32`, token-wise — see
+/// the `instantiate(...)` design), and rejecting out-of-subset constructs.
+/// Used for both the reference twin's body and (via [`subst_type_tokens`])
+/// its signature's parameter types, so an instantiated kernel's twin never
+/// mentions the original generic ident.
+///
+/// `allow_absolute_pos`: `true` for a launch kernel's twin, where
+/// `ABSOLUTE_POS` becomes the sequential loop variable (see `reference`'s
+/// codegen). `false` for a `#[vericl::helper]` device fn's twin: a pure
+/// device function reading global thread position would make the twin's
+/// calling convention ambiguous (which thread's position does a
+/// host-called `foo_vericl_ref(...)` see?), so helpers ban it outright —
+/// same treatment as every other topology builtin. The dogfood survey
+/// found zero helpers using topology, so this costs nothing real (see
+/// docs/dogfood-2026-07.md).
+fn transform_body(
+    ts: TokenStream2,
+    subst: &GenericSubst,
+    allow_absolute_pos: bool,
+    errors: &mut Vec<syn::Error>,
+) -> TokenStream2 {
     let mut out = TokenStream2::new();
     for tt in ts {
         match tt {
             TokenTree::Ident(id) => {
                 let s = id.to_string();
-                if s == "ABSOLUTE_POS" {
+                if s == "ABSOLUTE_POS" && allow_absolute_pos {
                     out.extend(std::iter::once(TokenTree::Ident(Ident::new(
                         "__vericl_abs_pos",
                         id.span(),
@@ -402,22 +455,30 @@ fn transform_body(ts: TokenStream2, subst: &GenericSubst, errors: &mut Vec<syn::
                     out.extend(replacement.clone());
                     continue;
                 }
-                if BANNED_IDENTS.contains(&s.as_str())
+                let is_banned_topology = s == "ABSOLUTE_POS" && !allow_absolute_pos;
+                if is_banned_topology
+                    || BANNED_IDENTS.contains(&s.as_str())
                     || BANNED_PREFIXES.iter().any(|p| s.starts_with(p))
                 {
-                    errors.push(syn::Error::new(
-                        id.span(),
+                    let msg = if is_banned_topology {
+                        "`ABSOLUTE_POS` is outside the vericl v0 subset for a #[vericl::helper] \
+                         device function — a helper's host twin has no notion of \"which \
+                         thread\" is calling it; read positions in the kernel and pass them as \
+                         plain scalar arguments instead"
+                            .to_string()
+                    } else {
                         format!(
                             "`{s}` is outside the vericl v0 kernel subset; unsupported constructs \
                              are rejected rather than silently approximated (see README \
                              \"First release\")"
-                        ),
-                    ));
+                        )
+                    };
+                    errors.push(syn::Error::new(id.span(), msg));
                 }
                 out.extend(std::iter::once(TokenTree::Ident(id)));
             }
             TokenTree::Group(g) => {
-                let inner = transform_body(g.stream(), subst, errors);
+                let inner = transform_body(g.stream(), subst, allow_absolute_pos, errors);
                 let mut ng = Group::new(g.delimiter(), inner);
                 ng.set_span(g.span());
                 out.extend(std::iter::once(TokenTree::Group(ng)));
@@ -646,6 +707,192 @@ impl Fold for FloatMethodCheck {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kernel composition: uses(...) call rewriting + a best-effort compile-time
+// cycle guard over the declared helper-composition graph.
+// ---------------------------------------------------------------------------
+
+/// Process-local registry of every kernel's/helper's `uses(...)` dependency
+/// edges seen so far in this compilation, keyed by fn name. Used only for
+/// [`register_and_check_cycle`]'s best-effort cycle detection — see that
+/// function's doc for exactly what "best-effort" means here.
+static USES_REGISTRY: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+
+/// Register `name -> deps` (this kernel's/helper's `uses(...)` list) and
+/// check whether that closes a cycle detectable from every edge registered
+/// so far, returning the cycle path (`name -> a -> b -> name`) if so.
+///
+/// This is necessarily *best-effort*, not a soundness-critical gate — see
+/// module docs / README for why: a `#[proc_macro_attribute]` invocation for
+/// one item has no visibility into another item's own macro invocation (no
+/// whole-crate view), so the only way to see "the graph so far" at all is a
+/// process-local registry that accumulates across invocations *within one
+/// compilation of one crate* (a persistent proc-macro server process is
+/// reused across the macro invocations of a single crate compilation, but
+/// nothing guarantees a specific expansion order). What this DOES reliably
+/// catch: a cycle where every node's `uses(...)` edges have already been
+/// registered by the time the cycle-closing node is processed — which, for
+/// ordinary top-to-bottom source in one file (the only realistic way to
+/// write a set of mutually-referential helpers, since Rust item order
+/// doesn't otherwise matter), is every cycle, because the *last* of the
+/// cycle's nodes to be macro-expanded always closes it and by definition
+/// every other node in the cycle has already registered by then. Empirically
+/// confirmed: `#[cube]` itself does not reject direct or mutual recursion at
+/// compile time (verified by hand: a self-recursive and a two-function
+/// mutually-recursive `#[cube] fn` both compile cleanly — the former only
+/// gets rustc's ordinary `unconditional_recursion` *lint warning*, the
+/// latter not even that), so vericl cannot rely on cubecl to catch this
+/// upstream. What this does NOT guarantee to catch: a cycle that is somehow
+/// registered out of order relative to expansion (not expected in practice
+/// for a single crate, but not provable from the proc-macro API alone) — as
+/// a backstop for exactly that residual gap, the runtime hash-combine
+/// (`vericl::combine_source_hash`'s callers) carries its own depth cap
+/// (`vericl::check_helper_composition_depth`) so a cycle that slips past
+/// this check fails loudly (a named panic) instead of hanging.
+fn register_and_check_cycle(name: &str, deps: &[String]) -> Option<Vec<String>> {
+    let registry = USES_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    reg.insert(name.to_string(), deps.to_vec());
+
+    // DFS from each direct dependency, looking for a path back to `name`.
+    let mut stack: Vec<Vec<String>> =
+        deps.iter().map(|d| vec![name.to_string(), d.clone()]).collect();
+    let mut visited: HashSet<String> = HashSet::new();
+    while let Some(path) = stack.pop() {
+        let cur = path.last().expect("path always has at least one element").clone();
+        if cur == name && path.len() > 1 {
+            return Some(path);
+        }
+        if !visited.insert(cur.clone()) {
+            continue;
+        }
+        if let Some(next_deps) = reg.get(&cur) {
+            for d in next_deps {
+                let mut p = path.clone();
+                p.push(d.clone());
+                stack.push(p);
+            }
+        }
+    }
+    None
+}
+
+/// Collects every identifier bound as a plain local within a twin body —
+/// `let` patterns (including tuple/struct-destructuring sub-bindings), `for`
+/// loop patterns, and closure parameters — via `syn::visit::Visit` over
+/// every [`Pat::Ident`] regardless of nesting. Deliberately over-inclusive
+/// (collects names from nested scopes too, ignoring Rust's actual block
+/// scoping) — see [`UsesRewriteFold`]'s doc for why that's the sound
+/// direction to err in.
+#[derive(Default)]
+struct LocalCollector {
+    names: HashSet<String>,
+}
+
+impl<'ast> Visit<'ast> for LocalCollector {
+    fn visit_pat_ident(&mut self, i: &'ast PatIdent) {
+        self.names.insert(i.ident.to_string());
+        syn::visit::visit_pat_ident(self, i);
+    }
+}
+
+/// Every local binding a twin body's call-expression scan should treat as
+/// "plausibly a local closure/fn-pointer value, not a helper" — see
+/// [`UsesRewriteFold`].
+fn collect_locals(block: &syn::Block, params: &[Param]) -> HashSet<String> {
+    let mut collector = LocalCollector::default();
+    collector.visit_block(block);
+    for p in params {
+        collector.names.insert(p.name.to_string());
+    }
+    collector.names
+}
+
+/// Rewrites calls to `uses(...)`-listed helpers (`foo(args)` ->
+/// `foo_vericl_ref(args)`, `foo::<F>(args)` -> `foo_vericl_ref::<F>(args)`)
+/// in a twin body, and rejects any other bare (single-segment, e.g. not
+/// `Type::method`) call whose callee isn't recognized as either a local
+/// binding or a small, explicit allowlist of known host-safe free functions
+/// (`KNOWN_HOST_SAFE_FREE_FNS`).
+///
+/// **What's detectable at macro-expansion time, and why this is "as sound
+/// as possible" rather than perfect:** a `#[proc_macro_attribute]`
+/// invocation sees only the one annotated item's tokens — it cannot see
+/// whether some other bare ident in scope names a `#[cube]` fn, a
+/// `#[vericl::helper]`-annotated one, an ordinary host-callable free
+/// function, or nothing at all (that would need whole-crate name
+/// resolution, which proc-macros don't get). So this can only classify a
+/// call into three buckets: (1) explicitly declared via `uses(...)` — safe
+/// to rewrite; (2) a plausible non-helper (a local binding, most commonly a
+/// closure — collected by [`collect_locals`] before this pass runs — or a
+/// member of the tiny known-safe-free-fn allowlist); (3) everything else,
+/// rejected with a targeted error naming the callee and suggesting
+/// `uses(...)` + `#[vericl::helper]`, instead of letting it fall through to
+/// whatever confusing error the *original* macro-transformed item (which
+/// this crate always re-emits untouched, so the name really does exist in
+/// scope) would produce when called as ordinary Rust — this is exactly the
+/// residual the task calls out: a compile error either way, but this one
+/// names the actual problem instead of surfacing cubecl's internal
+/// expand-time types.
+///
+/// Bucket (2)'s allowlist is deliberately small and demand-driven rather
+/// than an attempt to enumerate "all of std" — see its doc. Being
+/// over-inclusive there (missing a real free function) only ever produces a
+/// worse-but-safe compile error (bucket 3), never a silently wrong twin;
+/// this is why [`collect_locals`] is deliberately over-inclusive about
+/// scope too (a spurious local match just avoids flagging something that
+/// might otherwise still not compile for unrelated reasons — real rustc
+/// still has the final word).
+struct UsesRewriteFold<'a> {
+    uses: &'a HashSet<String>,
+    locals: &'a HashSet<String>,
+    errors: Vec<syn::Error>,
+}
+
+impl Fold for UsesRewriteFold<'_> {
+    fn fold_expr_call(&mut self, mut i: ExprCall) -> ExprCall {
+        if let Expr::Path(p) = i.func.as_mut() {
+            if p.path.leading_colon.is_none() && p.path.segments.len() == 1 {
+                // Rewrite the ident in place, preserving whatever turbofish
+                // generic arguments the call had (e.g. `foo::<F>(...)` — a
+                // generic helper call site often needs one for inference
+                // even though the caller's own args already pin the type;
+                // confirmed empirically building the composition examples).
+                let seg = &mut p.path.segments[0];
+                let name = seg.ident.to_string();
+                let span = seg.ident.span();
+                if self.uses.contains(&name) {
+                    seg.ident = Ident::new(&format!("{name}_vericl_ref"), span);
+                    // The twin target is always fully monomorphized (see
+                    // `#[vericl::helper]`'s instantiate(...) requirement) —
+                    // it has no generic parameters at all, so any turbofish
+                    // the real generic call site needed for inference
+                    // (`foo::<F>(...)`, common when calling a generic
+                    // helper from another generic #[cube] fn) must be
+                    // dropped here rather than substituted, or the twin
+                    // would try to instantiate a concrete function's
+                    // nonexistent generics.
+                    seg.arguments = syn::PathArguments::None;
+                } else if !self.locals.contains(&name)
+                    && !KNOWN_HOST_SAFE_FREE_FNS.contains(&name.as_str())
+                {
+                    self.errors.push(syn::Error::new(
+                        span,
+                        format!(
+                            "call to `{name}` in the reference twin is not recognized as a \
+                             local binding, a declared helper, or a known host-safe free \
+                             function; if `{name}` is a #[vericl::helper]-annotated function \
+                             this item calls, add it to a `uses({name})` clause; otherwise \
+                             this construct may be outside the vericl v0 subset"
+                        ),
+                    ));
+                }
+            }
+        }
+        syn::fold::fold_expr_call(self, i)
+    }
+}
+
 enum ParamKind {
     /// Plain scalar passed by value (f32, u32, i32, ...).
     Scalar(Type),
@@ -800,23 +1047,29 @@ struct InstantiatePlan {
 ///   comptime param must get exactly one value, and no clause entry may name
 ///   anything else.
 fn resolve_instantiate(
-    spec: &ContractSpec,
+    instantiate: &Option<(proc_macro2::Span, Vec<InstantiateEntry>)>,
     sig_span: proc_macro2::Span,
+    item_kind: &str,
     fn_name_str: &str,
     generic_params: &[Ident],
     comptime_params: &[Ident],
 ) -> syn::Result<InstantiatePlan> {
     let needs_instantiate = !generic_params.is_empty() || !comptime_params.is_empty();
 
-    let Some((clause_span, entries)) = &spec.instantiate else {
+    let Some((clause_span, entries)) = instantiate else {
         if needs_instantiate {
             return Err(syn::Error::new(
                 sig_span,
                 format!(
-                    "kernel `{fn_name_str}` has generic type parameters and/or #[comptime] \
-                     parameters but no instantiate(...) contract clause; add one naming a \
-                     concrete value for each, e.g. `instantiate(F = f32, N = 8)`, so vericl can \
-                     monomorphize the reference twin, launch, and IR at those values"
+                    "{item_kind} `{fn_name_str}` has generic type parameters and/or \
+                     #[comptime] parameters but no instantiate(...) contract clause; add one \
+                     naming a concrete value for each, e.g. `instantiate(F = f32, N = 8)`, so \
+                     vericl can monomorphize the reference twin{}",
+                    if item_kind == "helper" {
+                        "" // the twin is the only thing a helper monomorphizes
+                    } else {
+                        ", launch, and IR at those values"
+                    }
                 ),
             ));
         }
@@ -832,7 +1085,7 @@ fn resolve_instantiate(
         return Err(syn::Error::new(
             *clause_span,
             format!(
-                "kernel `{fn_name_str}` declares instantiate(...) but has no generic type \
+                "{item_kind} `{fn_name_str}` declares instantiate(...) but has no generic type \
                  parameters or #[comptime] parameters to instantiate — remove the clause (an \
                  unused instantiation is a contract lie)"
             ),
@@ -889,6 +1142,16 @@ fn resolve_instantiate(
             }
         } else if comptime_params.contains(&entry.name) {
             comptime_values.insert(key, entry.value.to_token_stream());
+        } else if item_kind == "helper" {
+            errors.push(syn::Error::new(
+                entry.name.span(),
+                format!(
+                    "instantiate(...) names `{key}`, which is not a generic type parameter of \
+                     helper `{fn_name_str}` — a helper's #[comptime] parameters (if any) are not \
+                     pinned by instantiate(...); they stay ordinary pass-through parameters and \
+                     the caller supplies the already-pinned value at the call site"
+                ),
+            ));
         } else {
             errors.push(syn::Error::new(
                 entry.name.span(),
@@ -906,7 +1169,7 @@ fn resolve_instantiate(
                 *clause_span,
                 format!(
                     "instantiate(...) is missing a value for generic type parameter `{g}` of \
-                     kernel `{fn_name_str}`"
+                     {item_kind} `{fn_name_str}`"
                 ),
             ));
         }
@@ -917,7 +1180,7 @@ fn resolve_instantiate(
                 *clause_span,
                 format!(
                     "instantiate(...) is missing a value for #[comptime] parameter `{n}` of \
-                     kernel `{fn_name_str}`"
+                     {item_kind} `{fn_name_str}`"
                 ),
             ));
         }
@@ -1041,12 +1304,29 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         .collect::<syn::Result<_>>()?;
 
     let plan = resolve_instantiate(
-        &spec,
+        &spec.instantiate,
         func.sig.span(),
+        "kernel",
         &fn_name_str,
         &generic_param_names,
         &comptime_param_names,
     )?;
+
+    // --- uses(...): register this kernel's helper-composition dependency
+    // edges and reject a cycle detectable from what's registered so far —
+    // see `register_and_check_cycle`'s doc for exactly what this does and
+    // does not catch.
+    let used_names: Vec<String> = spec.uses.iter().map(|i| i.to_string()).collect();
+    if let Some(cycle) = register_and_check_cycle(&fn_name_str, &used_names) {
+        return Err(syn::Error::new(
+            func.sig.ident.span(),
+            format!(
+                "uses(...) declares a cyclic helper-composition graph: {} — recursive/mutually- \
+                 recursive helper composition is outside the vericl v0 subset",
+                cycle.join(" -> ")
+            ),
+        ));
+    }
 
     // --- derive the substituted (F -> f32, etc.) parameter list, then
     // classify it exactly as before — every downstream site (gen(...),
@@ -1092,7 +1372,8 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     // a `syn::Block` so the twin-only Fold passes below (unroll-attribute
     // stripping, and optionally `wrapping`) can run.
     let mut errors = Vec::new();
-    let ref_body_tokens = transform_body(func.block.to_token_stream(), &plan.generic_subst, &mut errors);
+    let ref_body_tokens =
+        transform_body(func.block.to_token_stream(), &plan.generic_subst, true, &mut errors);
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
         a
@@ -1134,6 +1415,21 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         return Err(combined);
     }
 
+    // uses(...): rewrite calls to declared helpers to their `_vericl_ref`
+    // twin, and reject any other call this macro invocation can't account
+    // for — see `UsesRewriteFold`'s doc for exactly what "can't account
+    // for" means.
+    let uses_set: HashSet<String> = used_names.iter().cloned().collect();
+    let locals = collect_locals(&ref_block, &params);
+    let mut uses_rewrite = UsesRewriteFold { uses: &uses_set, locals: &locals, errors: Vec::new() };
+    ref_block = uses_rewrite.fold_block(ref_block);
+    if let Some(combined) = uses_rewrite.errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
+
     // `wrapping`: fold the already-ABSOLUTE_POS-rewritten twin body, and
     // ONLY the twin — the `#[cube]` kernel re-emitted above is untouched.
     if spec.wrapping.is_some() {
@@ -1149,6 +1445,12 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     hasher.update(b"||vericl:");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     let hash = format!("sha256:{:x}", hasher.finalize());
+
+    // --- uses(...): each used helper's generated module, for `USES`/
+    // `identity()` codegen below (see `vericl::combine_source_hash`).
+    let uses_strs: &[String] = &used_names;
+    let used_helper_mods: Vec<Ident> =
+        used_names.iter().map(|n| format_ident!("{}_vericl", n)).collect();
 
     // --- generated signatures ---
     let mod_name = Ident::new(&format!("{fn_name}_vericl"), fn_name.span());
@@ -1326,9 +1628,15 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         #vis mod #mod_name {
             use super::*;
 
-            /// Identity of the exact kernel definition + contract this
-            /// module's artifacts belong to.
+            /// Identity of this kernel's own definition + contract — does
+            /// NOT include any `uses(...)`-listed helper's identity (see
+            /// `identity()` below for the recorded, composition-aware hash).
             pub const SOURCE_HASH: &str = #hash;
+
+            /// Names of the `#[vericl::helper]`-annotated functions this
+            /// kernel calls via `uses(...)`. `[]` for a non-composing
+            /// kernel.
+            pub const USES: &[&str] = &[#(#uses_strs),*];
 
             pub fn contract() -> ::vericl::Contract {
                 ::vericl::Contract {
@@ -1339,7 +1647,37 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                     compare: #compare,
                     wrapping: #wrapping,
                     instantiate: &[#(#instantiate_strs),*],
+                    uses: USES,
                 }
+            }
+
+            /// This kernel's recorded identity: `contract().identity()` with
+            /// `source_hash` additionally folded (via
+            /// `::vericl::combine_source_hash`) with every `uses(...)`-listed
+            /// helper's own `identity_hash()` — so identity goes stale when
+            /// a used helper's body changes, even though `SOURCE_HASH` above
+            /// (this kernel's own source tokens only) can't see that change
+            /// at macro-expansion time. A no-op wrapper (returns exactly
+            /// `contract().identity()`) when `USES` is empty. Depth-guarded
+            /// (`::vericl::check_helper_composition_depth`) against a
+            /// helper-composition cycle that slipped past vericl-macros'
+            /// best-effort compile-time check — see that check's doc.
+            ///
+            /// Defense in depth, not the only place composition affects
+            /// identity: cube expansion inlines every `uses(...)`-listed
+            /// helper's IR directly into this kernel's own `Scope`, so
+            /// `ir_hash` (computed elsewhere, over `kernel_definition()`)
+            /// already changes on a helper body edit too — this function
+            /// additionally makes the *source-level* hash honor composition
+            /// the same way, rather than leaving that half silently stale.
+            pub fn identity() -> ::vericl::Identity {
+                ::vericl::check_helper_composition_depth(#fn_name_str, 0);
+                let mut __vericl_id = contract().identity();
+                __vericl_id.source_hash = ::vericl::combine_source_hash(
+                    SOURCE_HASH,
+                    &[#(#used_helper_mods::identity_hash_at(1)),*],
+                );
+                __vericl_id
             }
 
             /// The `assumes(...)` clauses as an executable predicate.
@@ -1380,6 +1718,411 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             }
 
             #conformance_items
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// #[vericl::helper]: non-launch #[cube] device functions contributing a
+// host twin other kernels'/helpers' twins can call — kernel composition.
+// ---------------------------------------------------------------------------
+
+/// `#[vericl::helper(...)]` — placed above a plain `#[cube]` device
+/// function (never `#[cube(launch)]`; that's what `#[vericl::kernel]` is
+/// for). Re-emits the function untouched and generates, as siblings: a host
+/// twin `fn <name>_vericl_ref(...)` other kernels'/helpers' twins call once
+/// they declare `uses(<name>)`, and a `<name>_vericl` module carrying its
+/// `SOURCE_HASH` and composition-aware `identity_hash()`.
+///
+/// Grammar: `instantiate(...)` (same shape as the kernel attribute's
+/// clause, required exactly when the function has generic type
+/// parameters — see the module-level composition doc for why a helper's
+/// twin must be fully monomorphized rather than left generic, unlike a
+/// first draft of this design) and `uses(...)` (names of OTHER
+/// `#[vericl::helper]`-annotated functions this one calls — the same
+/// mechanism a kernel's `uses(...)` uses, so helper-calling-helper falls
+/// out for free with no special-casing).
+///
+/// **A mismatched instantiate(...) between a kernel and a helper it
+/// `uses(...)`** (e.g. a kernel pinned `instantiate(F = f32)` calling a
+/// helper pinned `instantiate(F = f64)`) is caught by ordinary Rust type
+/// checking in the generated twin, not by vericl-macros itself — a kernel's
+/// macro invocation cannot see another item's `instantiate(...)` clause (no
+/// cross-macro-invocation visibility; see `register_and_check_cycle`'s doc
+/// for the same limitation applied to cycle detection). Empirically checked
+/// (scratch, not committed) what the resulting rustc error looks like: it
+/// is an ordinary `E0308` (mismatched types) at the exact call-site
+/// argument, plus a "function defined here" note — both land on
+/// comprehensible, real source spans (the call expression's own span, and
+/// the callee's *name* span, which vericl's token-substituting codegen
+/// deliberately preserves from the original `fn` item — see how
+/// `ref_fn_name` is built from `fn_name.span()`) rather than pointing into
+/// opaque macro-internal code, precisely because every generated identifier
+/// here reuses a real source span instead of a synthesized one. It does
+/// NOT, on its own, say "these two instantiate(...) clauses disagree" —
+/// that inference is left to the reader. Mitigation: the generated twin's
+/// doc comment (see `pin_note` below) always states the concrete type a
+/// helper was monomorphized at, discoverable via hover/go-to-definition on
+/// the "function defined here" note. A targeted, cross-invocation-aware
+/// error is not implementable without whole-crate visibility this crate
+/// doesn't have; this is a documented residual, not a silent one.
+#[proc_macro_attribute]
+pub fn helper(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr2: TokenStream2 = attr.into();
+    let func = parse_macro_input!(item as ItemFn);
+
+    match expand_helper(attr2, &func) {
+        Ok(generated) => {
+            let mut out = func.to_token_stream();
+            out.extend(generated);
+            out.into()
+        }
+        Err(e) => {
+            let mut out = func.to_token_stream();
+            out.extend(e.to_compile_error());
+            out.into()
+        }
+    }
+}
+
+/// A `#[vericl::helper(...)]` clause set. Only `instantiate(...)` and
+/// `uses(...)` are recognized — a helper is not launched and has no
+/// independent conformance case, so the kernel-only clauses
+/// (`assumes(...)`, `compare(...)`, `gen(...)`, `wrapping`) are rejected
+/// outright rather than silently parsed and ignored (an accepted-but-inert
+/// clause would be exactly the kind of quiet lie this project's contract
+/// surface exists to prevent).
+struct HelperSpec {
+    instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)>,
+    uses: Vec<Ident>,
+}
+
+fn parse_helper_attr(attr: TokenStream2) -> syn::Result<HelperSpec> {
+    let metas: Punctuated<Meta, Token![,]> =
+        syn::parse::Parser::parse2(Punctuated::parse_terminated, attr)?;
+
+    let mut instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)> = None;
+    let mut uses: Vec<Ident> = Vec::new();
+
+    for meta in metas {
+        match &meta {
+            Meta::List(list) if list.path.is_ident("instantiate") => {
+                if instantiate.is_some() {
+                    return Err(syn::Error::new(
+                        list.span(),
+                        "duplicate instantiate(...) clause; vericl v0 supports exactly one \
+                         instantiate(...) clause per helper",
+                    ));
+                }
+                let entries: Punctuated<InstantiateEntry, Token![,]> = list
+                    .parse_args_with(Punctuated::parse_terminated)
+                    .map_err(|e| {
+                        syn::Error::new(
+                            list.span(),
+                            format!(
+                                "instantiate(...) expects comma-separated `name = value` \
+                                 entries, one per generic type parameter: {e}"
+                            ),
+                        )
+                    })?;
+                instantiate = Some((list.span(), entries.into_iter().collect()));
+            }
+            Meta::List(list) if list.path.is_ident("uses") => {
+                let idents: Punctuated<Ident, Token![,]> = list
+                    .parse_args_with(Punctuated::parse_terminated)
+                    .map_err(|e| {
+                        syn::Error::new(
+                            list.span(),
+                            format!(
+                                "uses(...) expects comma-separated names of #[vericl::helper]-\
+                                 annotated functions this helper calls: {e}"
+                            ),
+                        )
+                    })?;
+                uses.extend(idents);
+            }
+            other => {
+                return Err(syn::Error::new(
+                    other.span(),
+                    "#[vericl::helper(...)] only accepts `instantiate(...)` and `uses(...)` — a \
+                     helper is not launched and has no independent conformance case, so \
+                     assumes(...)/compare(...)/gen(...)/wrapping (kernel-only contract clauses) \
+                     are not accepted here",
+                ));
+            }
+        }
+    }
+
+    Ok(HelperSpec { instantiate, uses })
+}
+
+fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
+    let spec = parse_helper_attr(attr.clone())?;
+
+    if let Some(wc) = &func.sig.generics.where_clause {
+        return Err(syn::Error::new(
+            wc.span(),
+            "where-clauses on helper generics are outside the vericl v0 subset",
+        ));
+    }
+    for gp in &func.sig.generics.params {
+        if !matches!(gp, GenericParam::Type(_)) {
+            return Err(syn::Error::new(
+                gp.span(),
+                "only type generic parameters (e.g. `F: Float`) are supported via \
+                 instantiate(...); lifetime and const generic parameters are outside the vericl \
+                 v0 subset",
+            ));
+        }
+    }
+
+    let fn_name = &func.sig.ident;
+    let fn_name_str = fn_name.to_string();
+
+    // A helper must be a plain #[cube] device function, never
+    // #[cube(launch)] — #[vericl::kernel] is for launch-annotated kernels
+    // and has the launch/conformance machinery a device fn doesn't need.
+    for a in &func.attrs {
+        if !a.path().is_ident("cube") {
+            continue;
+        }
+        let is_launch = matches!(&a.meta, Meta::List(list)
+            if list.tokens.to_string().split(',').any(|t| t.trim() == "launch"));
+        if is_launch {
+            return Err(syn::Error::new(
+                a.span(),
+                format!(
+                    "`{fn_name_str}` is #[cube(launch)] — #[vericl::helper] is for plain \
+                     #[cube] device functions only; use #[vericl::kernel] for a launchable \
+                     kernel"
+                ),
+            ));
+        }
+    }
+
+    let generic_param_names: Vec<Ident> = func
+        .sig
+        .generics
+        .params
+        .iter()
+        .map(|gp| {
+            let GenericParam::Type(tp) = gp else {
+                unreachable!("non-type generics rejected above")
+            };
+            tp.ident.clone()
+        })
+        .collect();
+
+    // Unlike a kernel, a helper's #[comptime] params are never pinned by
+    // instantiate(...): they stay ordinary value parameters in the twin's
+    // signature, and the CALLER's own twin (which, if it's a kernel, has
+    // already baked its own #[comptime] params to `let` consts) just passes
+    // its already-resolved value at the call site — see the composition
+    // design doc. Passing an empty comptime-params list here means
+    // `resolve_instantiate` only ever requires instantiate(...) for genuine
+    // generic type parameters, and rejects an instantiate(...) entry naming
+    // a #[comptime] param with a targeted error (see its `item_kind ==
+    // "helper"` branch) rather than silently accepting a pin this design
+    // never uses.
+    let plan = resolve_instantiate(
+        &spec.instantiate,
+        func.sig.span(),
+        "helper",
+        &fn_name_str,
+        &generic_param_names,
+        &[],
+    )?;
+
+    // --- uses(...): same registration + best-effort cycle check a kernel's
+    // uses(...) gets — see `register_and_check_cycle`'s doc.
+    let used_names: Vec<String> = spec.uses.iter().map(|i| i.to_string()).collect();
+    if let Some(cycle) = register_and_check_cycle(&fn_name_str, &used_names) {
+        return Err(syn::Error::new(
+            func.sig.ident.span(),
+            format!(
+                "uses(...) declares a cyclic helper-composition graph: {} — recursive/mutually- \
+                 recursive helper composition is outside the vericl v0 subset",
+                cycle.join(" -> ")
+            ),
+        ));
+    }
+
+    let subst_args: Vec<FnArg> = func
+        .sig
+        .inputs
+        .iter()
+        .map(|arg| substitute_fn_arg(arg, &plan.generic_subst))
+        .collect::<syn::Result<_>>()?;
+    let params: Vec<Param> = subst_args.iter().map(classify_param).collect::<syn::Result<_>>()?;
+
+    // --- twin body: the same ABSOLUTE_POS-banned (see `transform_body`'s
+    // `allow_absolute_pos` doc) + generic-substituted + banned-construct
+    // pipeline as a kernel's, minus `wrapping` (not part of the helper
+    // design — a helper wanting wrap-on-overflow arithmetic is future
+    // work, not yet demanded by any dogfooded shape).
+    let mut errors = Vec::new();
+    let ref_body_tokens =
+        transform_body(func.block.to_token_stream(), &plan.generic_subst, false, &mut errors);
+    if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
+
+    let mut ref_block: syn::Block = syn::parse2(ref_body_tokens).map_err(|e| {
+        syn::Error::new(
+            e.span(),
+            format!(
+                "internal error deriving helper `{fn_name_str}`'s reference twin: the rewritten \
+                 body did not parse as a block ({e})"
+            ),
+        )
+    })?;
+
+    let mut strip_unroll = StripUnrollFold::default();
+    ref_block = strip_unroll.fold_block(ref_block);
+    if let Some(combined) = strip_unroll.errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
+
+    // Reject any call to a Float/Numeric method whose host-callability
+    // isn't verified — the exact same check a kernel twin gets, now genuinely
+    // sound for a helper too because `instantiate(...)` above has already
+    // substituted any generic type parameter to a concrete type (see the
+    // module-level composition doc for why that's required: the whitelist's
+    // safety relies on Rust preferring an inherent method over a trait
+    // method for a *concrete* receiver type, a preference that does not
+    // apply to a bound-but-unsubstituted generic type parameter).
+    let mut float_check = FloatMethodCheck::default();
+    ref_block = float_check.fold_block(ref_block);
+    if let Some(combined) = float_check.errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
+
+    // uses(...): rewrite calls to declared sub-helpers, reject anything else
+    // this invocation can't account for — same mechanism a kernel gets, so
+    // helper-calling-helper needs no special casing.
+    let uses_set: HashSet<String> = used_names.iter().cloned().collect();
+    let locals = collect_locals(&ref_block, &params);
+    let mut uses_rewrite = UsesRewriteFold { uses: &uses_set, locals: &locals, errors: Vec::new() };
+    ref_block = uses_rewrite.fold_block(ref_block);
+    if let Some(combined) = uses_rewrite.errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
+
+    // --- identity hash: the same recipe as a kernel's own SOURCE_HASH
+    // (source tokens + raw contract attribute tokens + vericl version) —
+    // this is the helper's OWN local hash only; `identity_hash`/
+    // `identity_hash_at` below fold in used sub-helpers' hashes at runtime.
+    let mut hasher = Sha256::new();
+    hasher.update(func.to_token_stream().to_string().as_bytes());
+    hasher.update(b"||contract:");
+    hasher.update(attr.to_string().as_bytes());
+    hasher.update(b"||vericl:");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    let hash = format!("sha256:{:x}", hasher.finalize());
+
+    let uses_strs: &[String] = &used_names;
+    let used_helper_mods: Vec<Ident> =
+        used_names.iter().map(|n| format_ident!("{}_vericl", n)).collect();
+
+    let mod_name = Ident::new(&format!("{fn_name}_vericl"), fn_name.span());
+    let ref_fn_name = Ident::new(&format!("{fn_name}_vericl_ref"), fn_name.span());
+    let vis = &func.vis;
+
+    // Unlike a kernel twin's `ref_params` (which drops #[comptime] params
+    // entirely and bakes them as `let` consts — see `expand`), a helper
+    // twin keeps them as ordinary value parameters: there is no per-helper
+    // pinned value to bake, since #[comptime] isn't instantiate(...)-pinned
+    // here (see the doc above `plan`'s construction).
+    let ref_params: Vec<TokenStream2> = params
+        .iter()
+        .map(|p| {
+            let name = &p.name;
+            match &p.kind {
+                ParamKind::Scalar(ty) | ParamKind::Comptime(ty) => quote!(#name: #ty),
+                ParamKind::ArrayRef(elem) => quote!(#name: &[#elem]),
+                ParamKind::ArrayMut(elem) => quote!(#name: &mut [#elem]),
+            }
+        })
+        .collect();
+
+    let ref_output: TokenStream2 = match &func.sig.output {
+        ReturnType::Default => TokenStream2::new(),
+        ReturnType::Type(arrow, ty) => {
+            let ty_tokens = subst_type_tokens(ty.to_token_stream(), &plan.generic_subst);
+            quote!(#arrow #ty_tokens)
+        }
+    };
+
+    let pin_note = if plan.pretty.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Monomorphized via `instantiate({})` — see crate docs on why a helper's generic \
+             type parameter(s) must be pinned to a concrete type here rather than kept generic \
+             in the twin.",
+            plan.pretty.join(", ")
+        )
+    };
+    let doc = format!(
+        "VeriCL-generated host twin for helper `{fn_name_str}`.{pin_note}\n\n\
+         An ordinary Rust function derived from the same source tokens as the #[cube] device \
+         function above; shares no CubeCL machinery. A kernel or helper that declares \
+         `uses({fn_name_str})` has its calls to `{fn_name_str}(...)` rewritten to call this \
+         function directly."
+    );
+
+    Ok(quote! {
+        #[doc = #doc]
+        #[allow(non_snake_case, unused_variables, clippy::all)]
+        #vis fn #ref_fn_name(#(#ref_params),*) #ref_output #ref_block
+
+        #[doc = "VeriCL identity metadata for the helper function above."]
+        #[allow(non_snake_case, clippy::all)]
+        #vis mod #mod_name {
+            use super::*;
+
+            /// Identity of this helper's own definition + `instantiate(...)`/
+            /// `uses(...)` clause — does NOT include any used sub-helper's
+            /// identity on its own; see `identity_hash`/`identity_hash_at`.
+            pub const SOURCE_HASH: &str = #hash;
+
+            /// Names of the `#[vericl::helper]`-annotated functions this
+            /// helper itself calls via `uses(...)`. `[]` when it calls none.
+            pub const USES: &[&str] = &[#(#uses_strs),*];
+
+            /// This helper's identity, recursively folded (via
+            /// `::vericl::combine_source_hash`) with every used sub-helper's
+            /// own identity — the mechanism a composing kernel's
+            /// `identity()` calls into, and the reason a change two levels
+            /// deep in a helper-call chain still moves the top-level
+            /// kernel's recorded source hash.
+            pub fn identity_hash() -> ::std::string::String {
+                identity_hash_at(0)
+            }
+
+            /// `depth`-threaded so a composing kernel/helper can pass its
+            /// own place in the chain — see
+            /// `::vericl::check_helper_composition_depth`'s doc for why this
+            /// is guarded rather than left to recurse unbounded.
+            pub fn identity_hash_at(depth: u32) -> ::std::string::String {
+                ::vericl::check_helper_composition_depth(#fn_name_str, depth);
+                ::vericl::combine_source_hash(
+                    SOURCE_HASH,
+                    &[#(#used_helper_mods::identity_hash_at(depth + 1)),*],
+                )
+            }
         }
     })
 }

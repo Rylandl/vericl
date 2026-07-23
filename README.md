@@ -88,8 +88,9 @@ executable `check_assumes` predicate; a `SOURCE_HASH` identity that evidence bin
 the `gen(...)` clause — a `conformance_case` function that generates inputs, runs the reference and
 the real kernel, and compares them, so no kernel needs hand-written GPU launch/input-gen glue.
 Kernels using constructs the twin cannot model (`UNIT_POS`, `SharedMemory`, `plane_*`, `comptime!`
-blocks, vectors, `return`) are rejected at compile time rather than silently approximated; kernel
-*composition* (calling another `#[cube]` fn) is likewise out of scope.
+blocks, vectors, `return`) are rejected at compile time rather than silently approximated. Kernel
+*composition* — calling another `#[cube]` fn — is supported via `#[vericl::helper]` and a
+kernel-side `uses(...)` clause; see "Kernel composition" below.
 
 ### The `instantiate(...)` clause: monomorphizing generic + `#[comptime]` kernels
 
@@ -137,6 +138,95 @@ macro time, any twin body calling a method outside the verified whitelist:
 subset`. This is an explicit rejection, not a best-effort attempt — a twin that silently miscomputes
 or panics on a method vericl never verified is exactly the failure mode this project exists to
 prevent.
+
+### Kernel composition: `#[vericl::helper]` and `uses(...)`
+
+Real kernels call other `#[cube]` functions — the July 2026 dogfooding survey found this blocking
+16/22 production kernels, the largest gap after generics/`#[comptime]` (see
+`docs/dogfood-2026-07.md`). `#[vericl::helper]` extends the same derivation story to non-launch
+`#[cube]` device functions:
+
+```rust
+#[vericl::helper(instantiate(F = f32))]
+#[cube]
+pub fn single_tap<F: Float>(a: F, gain: F) -> F {
+    a * gain
+}
+
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-5),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, gain in -4.0..=4.0),
+    instantiate(F = f32),
+    uses(single_tap)
+)]
+#[cube(launch)]
+pub fn gain_kernel<F: Float + CubeElement>(x: &Array<F>, y: &mut Array<F>, gain: F) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = single_tap(x[ABSOLUTE_POS], gain);
+    }
+}
+```
+
+`#[vericl::helper]` re-emits the `#[cube]` function untouched and generates a host twin
+`fn single_tap_vericl_ref(...)` plus a `single_tap_vericl` module carrying its own `SOURCE_HASH`.
+The kernel's `uses(single_tap)` clause rewrites its twin's calls to `single_tap(...)` into calls to
+`single_tap_vericl_ref(...)`; a call to a function that's neither `uses(...)`-listed, a local
+binding, nor a small allowlist of known host-safe free functions is a targeted compile error
+naming the function and suggesting `uses(...)` + `#[vericl::helper]`, instead of the confusing
+type error that would otherwise surface deep in cubecl's generated code. Helpers may call other
+`#[vericl::helper]`-annotated functions via their own `uses(...)` clause — the identical mechanism,
+so helper-calling-helper needs no special casing. `#[comptime]` parameters on a helper stay
+ordinary pass-through parameters (the caller's own twin already has the pinned value in hand to
+pass along); `ABSOLUTE_POS` and every other topology builtin are banned in a helper's body — a pure
+device function reading global thread position would make its twin's calling convention ambiguous
+(the dogfood survey found zero helpers using topology, so this costs nothing real).
+
+**A helper's generic type parameter must be monomorphized via its own `instantiate(...)`, exactly
+like a kernel's — it cannot be left generic**, even though an early draft of this design tried
+that. The reason is the same Float-method-whitelist story above, taken one step further: on a
+*concrete* receiver (`x: f32`), Rust prefers the inherent `f32::sqrt` over the trait method, which
+is what makes the whitelist host-safe. On a still-generic, merely-bound receiver (`x: F` with
+`F: Float`), there is no inherent method to prefer — the call resolves purely through the `Float`
+trait, whose default body is the same `unexpanded!()` panic the whitelist exists to keep out.
+Verified empirically (not just reasoned about): a scratch `fn g<F: Float>(x: F) -> F { x.sqrt() }`
+panics on host calling `g(2.5f32)`, as does `.abs()` — reading cubecl-core's `impl_unary_func!`
+macro confirms why (`impl Sqrt for f32 {}` inherits the panicking default rather than overriding
+it). Monomorphizing a helper via its own `instantiate(...)` reuses the exact machinery already
+verified safe for kernels instead of introducing a second, weaker safety story. The practical cost
+is small: a helper's twin is pinned to one concrete type (today, `f32` is the only type any part of
+vericl v0 supports, so this is free in practice — revisit if/when an `f64` tier is added).
+
+**Identity and composition.** A kernel's `SOURCE_HASH` constant only ever covers its own source
+tokens, computed at macro-expansion time — it cannot see a change to a helper's body, since that
+lives in a separate macro invocation vericl-macros has no way to observe. `<kernel>_vericl::identity()`
+closes this gap at ordinary Rust runtime: it folds `SOURCE_HASH` together with every `uses(...)`-listed
+helper's own `identity_hash()` (via `vericl::combine_source_hash`, a small SHA-256 combine — the
+one place core `vericl` depends on `sha2`, still with no `cubecl` dependency), and a helper's
+`identity_hash()` recursively folds in its *own* `uses(...)` the same way, so a change two levels
+deep in a helper-call chain still moves the top-level kernel's recorded identity. This is defense
+in depth alongside, not instead of, the IR-level hash: cube expansion inlines a used helper's real
+IR directly into the composing kernel's own `Scope`, so `ir_hash` already reflects a helper body
+change too — `identity()` makes the source-level hash honor composition the same way rather than
+leaving that half silently stale. A helper (or kernel) whose `uses(...)` graph is cyclic — including
+the degenerate case of listing itself — is rejected at compile time on a best-effort basis: a
+process-local registry accumulates every `uses(...)` edge seen so far in the compilation and checks
+for a cycle on each new declaration, which reliably catches any cycle written in ordinary top-to-
+bottom source (the last node in a cycle to be macro-expanded always closes it, and by definition
+every other node has already registered by then) but is not a soundness-critical guarantee, since a
+`#[proc_macro_attribute]` invocation cannot see other invocations' output directly. `#[cube]` itself
+does not help here — verified empirically that both direct and mutual recursion between `#[cube]`
+functions compile cleanly today (the former only draws rustc's ordinary `unconditional_recursion`
+lint *warning*). As a backstop for the residual gap, the runtime hash-combine is depth-guarded
+(32 levels) and panics naming the offending item rather than hanging, should a cycle ever slip past
+the compile-time check.
+
+The SMT bounds prover needed zero changes for composition: cube expansion inlines a used helper's
+IR directly into the composing kernel's own `Scope`, so the existing walker over
+`kernel_definition()` already sees everything a helper's body does — a guarded array access inside
+a composed helper discharges exactly like one written directly in the kernel, and an unguarded one
+refutes the same way (see `crates/vericl-examples/src/lib.rs`'s `tap_pair_guarded_kernel`/
+`tap_pair_unguarded_kernel` for the pinned positive/negative pair).
 
 ### The `gen(...)` clause: ergonomic by being explicit
 

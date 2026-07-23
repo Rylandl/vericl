@@ -2,6 +2,7 @@
 //! evidence is produced under.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// How outputs of two realizations are compared.
 ///
@@ -87,6 +88,12 @@ pub struct Contract {
     /// exists purely so evidence records what a kernel was monomorphized
     /// at, the same way `wrapping` records a declared clause.
     pub instantiate: &'static [&'static str],
+    /// Names of the `#[vericl::helper]`-annotated functions this kernel
+    /// declares via `uses(...)` (kernel composition). `[]` for a kernel that
+    /// calls no helpers. Purely for evidence legibility — `identity()`
+    /// (not `identity`/this struct) is what actually folds each used
+    /// helper's identity into the recorded source hash; see its doc.
+    pub uses: &'static [&'static str],
 }
 
 /// Serializable form of a [`Contract`] for the evidence manifest.
@@ -103,6 +110,11 @@ pub struct ContractRecord {
     /// old manifest for such a kernel is otherwise still perfectly valid.
     #[serde(default)]
     pub instantiate: Vec<String>,
+    /// See [`Contract::uses`]. `#[serde(default)]` for the same reason as
+    /// `instantiate` above — old evidence for a non-composing kernel is
+    /// unaffected by this field's addition.
+    #[serde(default)]
+    pub uses: Vec<String>,
 }
 
 /// Identity a piece of evidence is bound to. Any mismatch between a stored
@@ -143,6 +155,118 @@ impl Contract {
             compare: self.compare.describe(),
             wrapping: self.wrapping,
             instantiate: self.instantiate.iter().map(|s| s.to_string()).collect(),
+            uses: self.uses.iter().map(|s| s.to_string()).collect(),
         }
+    }
+}
+
+/// Fold a kernel's or helper's own (compile-time) source hash together with
+/// the already-computed identity hashes of every helper it directly
+/// `uses(...)`, producing the hash actually recorded as identity.
+///
+/// This is the runtime half of kernel-composition identity (see
+/// `crates/vericl-macros`' `#[vericl::helper]`/`uses(...)` design): a
+/// kernel's `SOURCE_HASH` constant only ever covers its own source tokens
+/// (computable at macro-expansion time), so it cannot by itself reflect a
+/// change to a helper's body — that only exists as a separate, sibling
+/// `SOURCE_HASH` constant vericl has no way to fold in at compile time
+/// (macro invocations cannot see each other's output). Folding the used
+/// helpers' hashes in here, at ordinary Rust runtime, closes that gap:
+/// `<kernel>_vericl::identity()` calls this with `deps` built from each
+/// `uses(...)`-listed helper's own `identity_hash()` (itself computed the
+/// same way, recursively — see that function's generated doc), so a change
+/// two levels deep in the helper-call graph still changes the top-level
+/// kernel's recorded `source_hash`. An empty `deps` (the overwhelmingly
+/// common case: a kernel/helper with no `uses(...)` clause) is a pure
+/// pass-through, so this is a no-op for every kernel that doesn't compose —
+/// existing evidence for such kernels is unaffected.
+///
+/// Recognizing more dependencies only ever changes the combined hash, never
+/// silently drops a real change — the reverse (a dependency change that
+/// fails to move the combined hash) would be the unsound direction, and
+/// isn't possible here since every `deps` entry is mixed into the digest.
+pub fn combine_source_hash(local: &str, deps: &[String]) -> String {
+    if deps.is_empty() {
+        return local.to_string();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(local.as_bytes());
+    for d in deps {
+        hasher.update(b"||uses:");
+        hasher.update(d.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// The deepest helper-composition chain `combine_source_hash`'s generated
+/// callers (`identity()`/`identity_hash()`) will recurse through before
+/// panicking (see [`check_helper_composition_depth`]) — a runtime backstop,
+/// independent of and in addition to vericl-macros' best-effort
+/// compile-time `uses(...)` cycle check (which cannot see across separate
+/// macro invocations with full reliability; see that check's doc). 32 is
+/// far beyond any plausible legitimate helper-call depth (v0's own examples
+/// nest at most two deep) and cheap to check on every call.
+pub const MAX_HELPER_COMPOSITION_DEPTH: u32 = 32;
+
+/// Panics with an actionable message identifying `name` if `depth` has
+/// reached [`MAX_HELPER_COMPOSITION_DEPTH`]. Called by every macro-generated
+/// `identity()`/`identity_hash()` before it recurses into its own
+/// `uses(...)`-listed dependencies. Without this, a recursive or
+/// mutually-recursive `uses(...)` declaration that slipped past
+/// vericl-macros' compile-time cycle check would make this combine hang
+/// forever chasing its own tail instead of failing loudly and namely — a
+/// silent hang is strictly worse than a clear panic naming the offending
+/// item.
+pub fn check_helper_composition_depth(name: &str, depth: u32) {
+    assert!(
+        depth < MAX_HELPER_COMPOSITION_DEPTH,
+        "vericl: helper composition depth exceeded {MAX_HELPER_COMPOSITION_DEPTH} while \
+         combining source-hash identity through `{name}` — this almost always means a \
+         recursive or mutually-recursive uses(...) declaration slipped past vericl-macros' \
+         compile-time cycle check; fix the uses(...) clauses so the helper-call graph is \
+         acyclic"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combine_source_hash_is_pass_through_with_no_deps() {
+        assert_eq!(combine_source_hash("local-hash", &[]), "local-hash");
+    }
+
+    #[test]
+    fn combine_source_hash_is_deterministic_and_dep_sensitive() {
+        let a = combine_source_hash("local", &["dep-a".to_string()]);
+        let a_again = combine_source_hash("local", &["dep-a".to_string()]);
+        let b = combine_source_hash("local", &["dep-b".to_string()]);
+        let two_deps = combine_source_hash("local", &["dep-a".to_string(), "dep-b".to_string()]);
+        assert_eq!(a, a_again, "same inputs must hash identically");
+        assert_ne!(a, "local", "folding in a dep must change the hash");
+        assert_ne!(a, b, "a different dep hash must change the combined hash");
+        assert_ne!(a, two_deps, "an extra dep must change the combined hash");
+    }
+
+    /// Direct test of the runtime depth guard's own threshold behavior —
+    /// independent of whether a real compiling cycle can be constructed to
+    /// exercise it end to end (see `crates/vericl-macros`'
+    /// `register_and_check_cycle` doc: every cycle constructed by hand
+    /// during this milestone's verification was in fact caught at compile
+    /// time, so this guard is believed unreachable via vericl-macros'
+    /// generated code in practice — this test pins the backstop itself
+    /// works correctly regardless).
+    #[test]
+    fn helper_composition_depth_guard_trips_at_the_threshold() {
+        for d in 0..MAX_HELPER_COMPOSITION_DEPTH {
+            check_helper_composition_depth("ok", d); // must not panic
+        }
+        let trapped = std::panic::catch_unwind(|| {
+            check_helper_composition_depth("cyclic_helper", MAX_HELPER_COMPOSITION_DEPTH);
+        });
+        assert!(trapped.is_err(), "depth == MAX must panic");
+        let msg = *trapped.unwrap_err().downcast::<String>().expect("panic payload is a String");
+        assert!(msg.contains("cyclic_helper"), "panic message should name the offending item: {msg}");
     }
 }

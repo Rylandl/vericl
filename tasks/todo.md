@@ -406,8 +406,199 @@ caught deterministically.
 6. Next proved property: race-freedom via two-thread symbolic reduction (the sum_racy class
    proved, not just differentially caught).
 7. Later: QF_BV wrapping model in the prover; fold cubecl version into Identity; upstream
-   conversation with tracel-ai; standalone `vericl check` CLI (README CI story row); kernel
-   composition (roadmap item 3 per docs/dogfood-2026-07.md); array-value-dependent indices
-   (offset tables / gather) via quantified assumes (docs/dogfood-2026-07.md Tier-2 gap #3,
-   still open); a `FLOAT_METHOD_CONST_ONLY` distinction if a dogfooded kernel needs a runtime
-   `new`/`from_int`.
+   conversation with tracel-ai; standalone `vericl check` CLI (README CI story row);
+   array-value-dependent indices (offset tables / gather) via quantified assumes
+   (docs/dogfood-2026-07.md Tier-2 gap #3, still open); a `FLOAT_METHOD_CONST_ONLY` distinction
+   if a dogfooded kernel needs a runtime `new`/`from_int`; an `f64` instantiation tier if a
+   dogfooded kernel ever needs one (see roadmap item 8's "one concrete type per helper" note —
+   today only `f32` is supported anywhere in vericl v0, so this is purely hypothetical debt, not
+   a known gap).
+8. [DONE 2026-07-22] Kernel composition — `#[vericl::helper]` + a kernel-side `uses(...)` clause
+   (roadmap item 3 per docs/dogfood-2026-07.md, the last Tier-1 macro gate, unblocking 16/22
+   dogfooded kernels). Design: `#[vericl::helper(instantiate(...), uses(...))]` on a non-launch
+   `#[cube]` device fn generates a host twin `fn <name>_vericl_ref(...)` plus a `<name>_vericl`
+   module (`SOURCE_HASH`, `USES`, `identity_hash`/`identity_hash_at`); a kernel's own
+   `uses(helperA, helperB)` clause rewrites its twin's calls `helperA(...)` -> its own twin's
+   calls to `helperA_vericl_ref(...)` (turbofish preserved on rewrite, dropped on the callee side
+   since the twin target is always monomorphized — see below); helpers may call other helpers via
+   their own `uses(...)`, the identical mechanism, so helper-calling-helper needed no special
+   casing.
+
+   **Design override from the original brief, found and fixed mid-task (approved by the
+   orchestrating session):** the brief called for a helper's generic type parameter to stay a
+   plain Rust generic in the twin. Empirically falsified before implementing it: cubecl-core's
+   `Float`/`Numeric` method traits (`impl_unary_func!`) give most methods only the panicking
+   `unexpanded!()` default (e.g. `impl Sqrt for f32 {}`, no override) — `FLOAT_METHOD_WHITELIST`'s
+   host-safety proof relies entirely on Rust preferring an inherent method over a trait method for
+   a *concrete* receiver, a preference that does not exist for a bound-but-unsubstituted generic
+   type parameter. Verified directly: a scratch `fn g<F: Float>(x: F) -> F { x.sqrt() }` panics on
+   host calling `g(2.5f32)` (confirmed via `catch_unwind`), as does `.abs()`; only the small
+   per-type-overridden associated-fn subset (`new`, `from_int`, `min_value`, `max_value`) is safe
+   generically. Fix: a helper's generic type parameter(s) must be monomorphized via its own
+   `instantiate(...)` clause exactly like a kernel's — required whenever the helper has generic
+   type params, reusing `resolve_instantiate`/`transform_body`/`FloatMethodCheck` unchanged (now
+   parameterized by `item_kind: &str` for kernel- vs. helper-flavored error text). `#[comptime]`
+   parameters are unaffected by this finding (plain values, no trait dispatch) and stay ordinary
+   pass-through parameters in a helper's twin signature, per the original design — the caller's
+   own twin already has the pinned value in hand to pass along. Cost: one concrete type per
+   helper (today, `f32` is the only type any part of vericl v0 supports, so this is free in
+   practice).
+
+   **Unlisted-callee detection** (`uses(...)`'s call-expression scan, `UsesRewriteFold`): a
+   `#[proc_macro_attribute]` invocation cannot see whether some other bare ident in scope names a
+   `#[cube]` fn, a `#[vericl::helper]`-annotated one, a host-safe free function, or nothing at all
+   — no whole-crate visibility. Classifies every bare (single-segment, e.g. not `Type::method`)
+   call in a twin body into three buckets: `uses(...)`-listed -> rewritten to `_vericl_ref`
+   (turbofish stripped — the target is always monomorphized, confirmed necessary empirically
+   while building the examples: a real generic call site often needs `foo::<F>(...)` for
+   inference even though the twin's target has zero generics after substitution); a local binding
+   (collected by a `syn::visit::Visit` walk over every `Pat::Ident` in the body plus the fn's own
+   params, deliberately over-inclusive of nested scoping — a spurious local match only ever
+   avoids flagging something real rustc still gets the final word on) or a tiny explicit allowlist
+   (`KNOWN_HOST_SAFE_FREE_FNS`, currently just `range_stepped`, grown by demand) -> left alone;
+   anything else -> a targeted compile error naming the function and suggesting `uses(...)` +
+   `#[vericl::helper]`, replacing what would otherwise be a confusing type/resolution error deep
+   in cubecl's generated code (the original, untouched item really is in scope under that name,
+   since `#[vericl::helper]`/`#[vericl::kernel]` always re-emit it — so the fallback isn't
+   "cannot find function", it's a genuinely confusing signature mismatch). Verified this
+   classification is complete for the existing example suite (only `range_stepped` needed the
+   allowlist) and exercises the rejection path correctly on a deliberately-unlisted call (scratch,
+   not committed).
+
+   **Identity and the drift hazard:** helpers get their own `SOURCE_HASH` (same recipe as a
+   kernel's — source tokens + raw contract tokens + vericl version); a composing kernel's/helper's
+   `identity()`/`identity_hash()` additionally folds `SOURCE_HASH` with every `uses(...)`-listed
+   dependency's own (already-recursive) `identity_hash_at(depth)` via a new core function,
+   `vericl::combine_source_hash` (SHA-256; the one place core `vericl` now depends on `sha2` —
+   still zero `cubecl` dependency, the constraint that actually matters). Recursion composes
+   without double-counting: a kernel/helper only ever combines with its *direct* dependencies'
+   hashes, and each of those already recursively covers its own `uses(...)`, so a change N levels
+   deep still reaches the top without re-hashing the same content redundantly at each level (a
+   diamond dependency being hashed into two different parents' combines is correct, not a bug —
+   it's exactly what should happen for two independent parents of the same changed child).
+   Regression-tested (`crates/vericl-examples/src/lib.rs`'s `#[cfg(test)]` block):
+   `composed_kernel_identity_folds_in_its_helpers_hash` /
+   `helper_calling_helper_identity_is_recursive` /
+   `composed_kernel_identity_is_recursive_through_the_helper_chain` reproduce the combine
+   independently via `combine_source_hash` and assert byte-for-byte equality (not just
+   "differs"); `unused_helper_does_not_affect_an_unrelated_kernels_identity` asserts a
+   non-composing kernel's `identity()` is an exact pass-through of its own `SOURCE_HASH`
+   regardless of how many helpers exist elsewhere in the crate — structural proof `identity()`
+   only ever sees the `uses(...)`-declared set. Additionally verified by hand (not committed,
+   since it needs a real source edit + rebuild a `#[test]` can't do in one process): edited
+   `single_tap`'s body, reran `cargo test -p vericl-examples --lib`, and confirmed
+   `gain_kernel_vericl::identity().source_hash` AND its `ir_hash` (via `vericl_ir::kernel_ir_hash`)
+   both moved while `axpy`'s and `flatten_decode_scale`'s (unrelated, non-composing) stayed
+   byte-identical, then reverted — the exact "helper body changes, kernel source doesn't, kernel
+   identity must" hazard the design brief called out, closed and empirically confirmed shut.
+   `ir_hash` already covers this too, independently: cube expansion inlines a used helper's real
+   IR into the composing kernel's own `Scope`, so `ir_hash` moved in the same hand-edit check —
+   `identity()`'s job is making the *source-level* hash honor composition the same way, not
+   duplicating what IR-level identity already gave for free.
+
+   **Recursion:** cycles are possible in a Rust fn call graph (mutual recursion compiles) —
+   verified empirically that `#[cube]` itself does not reject it either (a self-recursive and a
+   two-function mutually-recursive `#[cube] fn`, both compile cleanly; the former only draws
+   rustc's ordinary `unconditional_recursion` *lint warning*, the latter not even that — no
+   upstream backstop to lean on). `register_and_check_cycle` (vericl-macros) maintains a
+   process-local registry of every `uses(...)` edge seen so far in the compilation and DFS-checks
+   for a cycle reachable from each new declaration's dependencies back to itself, on every
+   kernel's/helper's own macro invocation. This is provably complete for a cycle written in
+   ordinary top-to-bottom source (the last node in the cycle to be macro-expanded always closes
+   it, and by construction every other node has already registered by then) but not a
+   soundness-critical guarantee in general, since one macro invocation cannot see another's output
+   directly — documented as best-effort, not silently assumed complete. Verified against BOTH
+   shapes by hand (scratch, not committed, since there's no compile-fail harness yet — same
+   precedent as the existing `wrapping`-subset rejection): a helper listing itself in its own
+   `uses(...)` and a two-helper mutual cycle (`uses(...)` declared on both sides) were both
+   rejected at compile time, at the second-processed item, naming the exact cycle path (e.g.
+   `cyc_b -> cyc_a -> cyc_b`). Backstop for the acknowledged residual gap (added after review):
+   the runtime hash-combine is depth-guarded (`vericl::check_helper_composition_depth`, 32
+   levels, panics naming the offending item) so a cycle that somehow slips the compile-time check
+   fails loudly instead of hanging — direct unit test
+   (`crates/vericl/src/contract.rs::tests::helper_composition_depth_guard_trips_at_the_threshold`)
+   pins the guard's own threshold behavior, since no compiling cycle could be constructed to
+   exercise it end-to-end (every cycle tried was caught first, as expected).
+
+   **Instantiation mismatch across a `uses(...)` edge** (e.g. a kernel pinned `F = f32` calling a
+   helper pinned `F = f64`): not caught by vericl-macros (no cross-invocation visibility, same
+   limitation as cycle detection), but checked empirically what happens instead — ordinary Rust
+   type-checking in the generated twin produces an `E0308` at the exact call-site argument plus a
+   "function defined here" note, both landing on real, comprehensible source spans (the call
+   expression's own span, and the callee name's span, deliberately preserved from the original
+   `fn` item through every token substitution) rather than pointing into opaque macro-internal
+   code. It does not spell out "these two instantiate(...) clauses disagree" on its own; mitigated
+   by the generated twin's doc comment always stating its pinned concrete type. Documented as a
+   residual in `vericl-macros::helper`'s doc comment rather than left silently unaddressed.
+
+   **Prover:** needed zero changes, confirmed rather than assumed — cube expansion inlines a
+   `uses(...)`-listed helper's IR directly into the composing kernel's own `Scope` (the same
+   mechanism cubecl itself already uses for ordinary, non-vericl kernel composition), so the
+   existing walker over `kernel_definition()` already sees everything a helper's body does.
+   Positive/negative pair (`crates/vericl-examples/src/lib.rs`): `tap_pair` is a helper whose OWN
+   body reads `x[idx]` and `x[idx + 1]`; `tap_pair_guarded_kernel` establishes `ABSOLUTE_POS + 1 <
+   x.len()` before calling it and `Proved`s; `tap_pair_unguarded_kernel` (same helper, same
+   shape) only establishes `ABSOLUTE_POS < x.len()` — one short of what the helper's own
+   unguarded second read needs — and `Refuted`s, proving the obligation living inside the composed
+   helper's body is genuinely walked, not silently dropped because it's composed rather than
+   written directly in the kernel.
+
+   **Public examples** (`crates/vericl-examples/src/lib.rs`, wired into `tests/conformance.rs`'s
+   `suite!`): `single_tap` (pure scalar, reused directly by two kernels — `gain_kernel` and,
+   transitively via `fir_pair_scaled`, `fir_pair_kernel`) and `fir_pair` (tuple-returning 2-tap
+   pair, the milestone's suggested shape) are composed by `fir_pair_scaled`
+   (`uses(fir_pair, single_tap)`, one level of helper-calling-helper) into `fir_pair_kernel` (two
+   `&mut Array` outputs — the existing N-output machinery needed no changes either). `gain_kernel`
+   and `fir_pair_kernel` both carry `tested` (differential, wgpu, 5 sizes) + `proved`
+   (`smt-oob-freedom`) claims in `evidence/vericl.json` — the milestone's "composed kernel carries
+   tested + proved claims" ask. `tap_pair`/`tap_pair_guarded_kernel`/`tap_pair_unguarded_kernel`
+   (prover-only positive/negative pair above, not suite-wired — mirrors the existing
+   `stepped_loop_*` precedent for a kernel that exists purely to pin a prover finding).
+
+   **Private dogfood validation** (per the README's Substrate policy: never committed, described
+   here only by construct class): the survey's own "inner-loop-with-single-helper shape"
+   candidate — `fir_conv_two_chain` (a `#[cube]` device fn Substrate's own source already calls
+   "the first proof that #[cube] Level-1 composition works") and `inner_loop_kernel` (the
+   `#[cube(launch)]` entry point that calls it exactly once) from `substrate-kernels/src/lib.rs` —
+   generic (`F: Float`), one `#[comptime]` param, exactly one helper call, no shared memory, per
+   the survey's own gap ranking the least-blocked composed shape. Copied UNCHANGED (no adaptation
+   needed for either body) and passed differentially on wgpu end-to-end across 5 sizes. Its bounds
+   proof — the real headline finding — is `Proved` (54 obligations), not merely `OutOfSubset`: the
+   helper's `#[unroll] for j in 0..8` loop carries four float accumulators, but per the existing
+   loop-carry refinement (docs/dogfood-2026-07.md Tier-2 gap #1) only they get tainted, since
+   nothing they touch is ever used as an index — every access inside the composed helper's body
+   stayed provable. Predicted "usize runtime param" wall did NOT surface (this kernel's only
+   non-array param is a `#[comptime] usize`, already covered by `instantiate(...)`); no NEW wall
+   surfaced either — composition landed on the first real composed kernel tried, with zero
+   adaptations to either function body. One genuine, previously-undocumented finding: the
+   kernel's own body destructures the helper's tuple return with ordinary `let (a, b) =
+   helper(...)` and compiles fine as-is, whereas the identical pattern failed
+   (`Unsupported local pat: Pat::Tuple`) when tried between two plain `#[cube]` device fns while
+   building the public `fir_pair_scaled` example (worked around there with `.0`/`.1` field access
+   instead) — so tuple-`let` destructuring of a composed call's return is specifically a
+   device-fn-calling-device-fn cubecl limitation, not a general composition one; noted for a
+   future README update if a public helper-calling-helper example ever wants the more natural
+   form. Separately, and NOT a composition finding: running the full private dogfood suite
+   surfaced that `instantiate_subset.rs`'s `synth_freqshift_cw_kernel_bounds_proof_is_out_of_subset_div_mod`
+   test (written for roadmap item 5's div/mod prover milestone, before div/mod modeling existed)
+   now returns `Refuted` instead of its hardcoded `OutOfSubset`-or-`Proved` expectation, because
+   that milestone's div/mod modeling has since landed and this specific test passes zero
+   `assumes` (so the solver can freely pick `fsteps.len() == 0` as a real counterexample) —
+   confirmed unrelated to this task (reproduces identically with none of this task's new files
+   present) and out of scope to fix here (a different milestone's private test going stale, not a
+   composition bug); left as-is and flagged here rather than silently worked around.
+
+   Verification: `cargo test --workspace` and `-p vericl-examples --features cpu` both green (77
+   tests total: 15 vericl core + 37 vericl-examples lib + 1 conformance + 2 float-whitelist + 21
+   vericl-ir + 1 vericl-macros, unchanged pass counts across both feature sets); `cargo clippy
+   --workspace --all-targets` zero warnings on both feature sets; `VERICL_UPDATE=1` run for
+   `--features cpu` first, verified, then the default (non-cpu) `VERICL_UPDATE=1` run LAST,
+   verified — evidence gained `gain_kernel`/`fir_pair_kernel` (`tested`+`proved` each), all five
+   pre-existing kernels' evidence unchanged; `conform demo-defects` exits 0 unchanged (composition
+   touches neither defective kernel); the helper-drift identity regression exercised both
+   structurally (four dedicated tests, above) and by hand (real source edit + rebuild, reverted);
+   the prover composed-kernel positive (`tap_pair_guarded_kernel` -> Proved) and negative
+   (`tap_pair_unguarded_kernel` -> Refuted) tests pass; the private dogfood suite's new
+   `composition_subset.rs` (2 tests: differential pass on wgpu across 5 sizes, bounds `Proved` 54
+   obligations) passes; `dogfood-rejects` still fails to build with the same class of expected
+   rejections (generics/topology/usize gates), unaffected.
