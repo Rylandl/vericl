@@ -1,0 +1,67 @@
+{
+  "vericl_version": "0.1.0",
+  "entries": [
+    {
+      "kernel": "block_sum_reduce",
+      "identity": {
+        "source_hash": "sha256:a1b1ed1eaff3e165ebf10ae58472aad8f2c1d8587c70c34781dd208cff3eeb80",
+        "vericl_version": "0.1.0",
+        "ir_hash": null
+      },
+      "contract": {
+        "assumes": [
+          "input.iter().all(| v | v.abs() <= 1000.0)"
+        ],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "depends_on": {
+              "check": "intra-phase-race-freedom",
+              "property": "intra-phase race freedom + barrier non-divergence",
+              "status": "assumed-undischarged"
+            },
+            "reference": "vericl-macros phase-split cooperative twin (derived from kernel source)",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "assumed",
+          "check": "intra-phase-race-freedom",
+          "config": {
+            "statement": "intra-phase race freedom + barrier non-divergence (undischarged — the phase-split twin is a faithful reference only if every barrier-delimited segment is race-free; this was not proved for this kernel/run)"
+          },
+          "result": {
+            "status": "declared"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware"
+      ]
+    }
+  ]
+}

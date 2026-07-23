@@ -29,15 +29,17 @@ pub use contract::{
     check_helper_composition_depth, combine_source_hash,
 };
 pub use evidence::{
-    CaseOutcome, Claim, ClaimKind, ClaimResult, Entry, Manifest, describe_case_outcome,
-    differential_config, proved_config, verify,
+    CaseOutcome, Claim, ClaimKind, ClaimResult, Entry, Manifest, RaceDependency,
+    RACE_FREEDOM_ASSUMPTION_CHECK, SMT_RACE_FREEDOM_CHECK, cooperative_differential_config,
+    describe_case_outcome, differential_config, proved_bounds_cooperative_config,
+    proved_config, proved_race_config, race_freedom_assumption_claim, verify,
 };
 pub use panic::catch_reference_panic;
 pub use rng::SplitMix64;
 pub use shared::SharedTile;
 pub use trust::{
-    GPU_HARDWARE_TRUST, backend_buffer_trust, proved_bounds_trust, reference_twin_trust,
-    shared_frontend_lane_trust,
+    GPU_HARDWARE_TRUST, backend_buffer_trust, proved_bounds_trust, proved_race_freedom_trust,
+    reference_twin_trust, shared_frontend_lane_trust,
 };
 pub use vericl_macros::{helper, kernel, suite};
 

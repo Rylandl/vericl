@@ -85,3 +85,50 @@ guard. Unreachable today (all users also hit other gates) but now banned explici
 - New residual: tuple-destructuring of a helper call's return (`let (a, b) = helper(...)`)
   works in launch-kernel twins but not yet in device-fn-calling-device-fn twins
   (`Pat::Tuple` unsupported at that site) — queued.
+
+## Addendum (shared-memory milestone, July 2026)
+
+The production tree-reduction kernel (the `Σ|iq|²` grid-stride reduction shape) was annotated
+`cooperative(cube_dim = 256)` + `instantiate(F = f32)` with a full contract and run through the
+whole shared-memory path — the phase-split cooperative twin (differential vs wgpu) AND both SMT
+proofs (out-of-bounds freedom + two-thread race freedom). **Result: the full triple lands** —
+differential pass, `smt-oob-freedom` proved (8 obligations), `smt-race-freedom` proved (8: 3
+write-write, 4 read-write, 1 inter-cube single-writer; 3 phases, 2 barrier-uniformity checks) — the
+real acceptance test for the milestone passing on the real shape, not just the clean-room example.
+
+Five adaptations were needed, each a genuine subset boundary the exercise surfaced (construct
+classes only, per the Substrate policy):
+
+1. **Comptime loop bound → buffer-derived.** The cooperative subset rejects `#[comptime]`
+   parameters; a comptime element-count loop bound had to become `let n = buf.len() / K` derived
+   from an interleaved buffer length. **New wall**: a cooperative kernel cannot take a comptime loop
+   bound — it must be recoverable from a buffer length.
+2. **Caller-supplied grid width → `CUBE_COUNT` builtin.** A runtime `num_cubes: u32` scalar that
+   must equal the launch cube count is not expressible: the cooperative launch model *owns*
+   `cube_count` (it derives it from the case size and sizes the per-cube output to it), and there is
+   no way to bind a free scalar parameter to that value. The grid-stride must read `CUBE_COUNT`.
+   **New wall**, and the reason the clean-room example was written against `CUBE_COUNT` from the
+   start.
+3. **Named tile-length const → literal matching `cube_dim`.** A symbolic tile length keyed off
+   `CUBE_DIM` is a v1.1 tier; the tile literal must equal the pinned `cube_dim`.
+4. **Unguarded single-writer store → explicitly bounds-guarded.** The production store wrote
+   `out[CUBE_POS]` under only `tid == 0`, relying on the host sizing the output to exactly the
+   launched cube count — an implicit invariant the bounds prover cannot see, so the store was an
+   undischargeable OOB obligation until an explicit `CUBE_POS < out.len()` guard was added. Same
+   "boundary behavior can be implicit" class as the div/mod dogfood finding above — surfaced again,
+   this time on the cooperative store. Both a provability fix and a genuine hardening.
+5. **Generic pinned via `instantiate(F = f32)`** (v0 is f32-only; production also runs an f64 host
+   oracle lane).
+
+- **Float-associativity finding (predicted, confirmed).** Unlike the clean-room `grid_stride_reduce`
+  (a single `data[k]*data[k]` product, bit-exact vs wgpu at `max_ulp = 0`), the real per-sample
+  term `re*re + im*im` (two products + an add) is fma-**contracted** by wgpu/naga, so the strict-f32
+  phase-split twin diverges by ~1 ULP per contracted op. `max_ulp = 0` failed at n=258 with a single
+  1-ULP miss; the honest claim is a relative bound (`compare(abs = 1e-2, rel = 1e-6)`), justified by
+  the reduction depth and the fact that a sum of non-negative squares has no cancellation. Exactly
+  the §4.6 / risk-6 prediction in `docs/design-shared-memory.md`, and the same finding class as
+  axpy's original fma story — the phase model itself introduces no divergence, only the backend
+  contraction does.
+- **No new wall in the prover.** The div-derived loop bound (`buf.len() / 2`) and the
+  complex-interleaved indices (`buf[k*2]`, `buf[k*2+1]`) discharged their bounds through the existing
+  div/mod modeling with no changes — the two-thread walk proved the whole real shape in-subset.

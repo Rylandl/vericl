@@ -30,7 +30,7 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{
     BinOp, Expr, ExprBinary, ExprCall, ExprForLoop, ExprLoop, ExprRange, ExprWhile, FnArg,
-    GenericParam, ItemFn, Meta, Pat, PatIdent, PatType, RangeLimits, ReturnType, Token, Type,
+    GenericParam, ItemFn, Meta, Pat, PatIdent, PatType, Path, RangeLimits, ReturnType, Token, Type,
     parse_macro_input,
 };
 
@@ -273,6 +273,15 @@ struct ContractSpec {
     /// `Expr` is the pinned `cube_dim` (the launch block size and the prover's
     /// `CUBE_DIM` binding).
     cooperative: Option<(proc_macro2::Span, Expr)>,
+    /// `reference = path::to::fn` clause, if declared — candidate #3, the
+    /// declared-reference fallback (docs/design-shared-memory.md §4.4/§6). An
+    /// author-supplied sequential reference for a cooperative kernel the
+    /// phase-split transform cannot derive. A *distinct, strictly weaker* claim
+    /// than the derived twin (the check string differs —
+    /// `differential-declared-reference` — and its custody is not derived from
+    /// the kernel source), so the taxonomy never blurs the two. Only valid with
+    /// `cooperative(...)`.
+    reference: Option<(proc_macro2::Span, Path)>,
 }
 
 fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
@@ -287,6 +296,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
     let mut instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)> = None;
     let mut uses: Vec<Ident> = Vec::new();
     let mut cooperative: Option<(proc_macro2::Span, Expr)> = None;
+    let mut reference: Option<(proc_macro2::Span, Path)> = None;
 
     for meta in metas {
         match &meta {
@@ -436,11 +446,28 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
                 })?;
                 cooperative = Some((list.span(), cube_dim));
             }
+            Meta::NameValue(nv) if nv.path.is_ident("reference") => {
+                if reference.is_some() {
+                    return Err(syn::Error::new(
+                        nv.span(),
+                        "duplicate reference = ... clause; a kernel declares at most one",
+                    ));
+                }
+                let Expr::Path(ep) = &nv.value else {
+                    return Err(syn::Error::new(
+                        nv.value.span(),
+                        "reference = ... expects a path to an author-supplied reference function, \
+                         e.g. `reference = my_module::my_sequential_ref` (docs/design-shared-\
+                         memory.md §4.4)",
+                    ));
+                };
+                reference = Some((nv.span(), ep.path.clone()));
+            }
             other => {
                 return Err(syn::Error::new(
                     other.span(),
                     "expected `assumes(...)`, `compare(...)`, `gen(...)`, `instantiate(...)`, \
-                     `uses(...)`, `cooperative(...)`, or `wrapping`",
+                     `uses(...)`, `cooperative(...)`, `reference = fn`, or `wrapping`",
                 ));
             }
         }
@@ -455,6 +482,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
         instantiate,
         uses,
         cooperative,
+        reference,
     })
 }
 
@@ -1683,6 +1711,26 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         }
     }
 
+    // --- reference = fn gate (docs/design-shared-memory.md §4.4/§6): the
+    // declared-reference fallback is a cooperative-only complement — it supplies
+    // a hand-written sequential reference for a cooperative kernel the
+    // phase-split transform cannot derive. On a NON-cooperative kernel the
+    // ordinary sequential twin already IS the derived reference, so a declared
+    // one there would be a pointless (and custody-weakening) override — rejected.
+    if let Some((ref_span, _)) = &spec.reference {
+        if !is_coop {
+            return Err(syn::Error::new(
+                *ref_span,
+                format!(
+                    "kernel `{fn_name_str}`: `reference = fn` (the declared-reference fallback) \
+                     is only valid together with `cooperative(...)` — for a non-cooperative \
+                     kernel the derived sequential twin already IS the reference \
+                     (docs/design-shared-memory.md §4.4)"
+                ),
+            ));
+        }
+    }
+
     // --- derive the reference twin body: ABSOLUTE_POS rewrite (ordinary twin
     // only — the cooperative twin binds ABSOLUTE_POS per segment) + F -> f32
     // token substitution + banned-construct rejection, then always parse as
@@ -1788,6 +1836,21 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 ParamKind::Scalar(ty) => Some(quote!(#name: #ty)),
                 ParamKind::ArrayRef(elem) => Some(quote!(#name: &[#elem])),
                 ParamKind::ArrayMut(elem) => Some(quote!(#name: &mut [#elem])),
+                ParamKind::Comptime(_) => None,
+            }
+        })
+        .collect();
+
+    // Argument names for forwarding to a declared reference (§4.4); mirrors
+    // `ref_params`' non-comptime filter (cooperative kernels reject #[comptime]).
+    let ref_arg_names: Vec<TokenStream2> = params
+        .iter()
+        .filter_map(|p| {
+            let name = &p.name;
+            match &p.kind {
+                ParamKind::Scalar(_) | ParamKind::ArrayRef(_) | ParamKind::ArrayMut(_) => {
+                    Some(quote!(#name))
+                }
                 ParamKind::Comptime(_) => None,
             }
         })
@@ -1918,17 +1981,38 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     // launch/output model (§7.1: per-cube partials sized `cube_count`).
     let (reference_fn, conformance_items): (TokenStream2, TokenStream2) = if is_coop {
         let (_span, cube_dim_expr) = spec.cooperative.as_ref().expect("is_coop");
-        let coop_body = coop::build_reference_body(&ref_block, &params, &fn_name_str)?;
-        let reference_fn = quote! {
-            /// Phase-split cooperative reference execution (docs/design-shared-
-            /// memory.md §4): per cube, per barrier-delimited segment, per
-            /// `unit_pos`, with `SharedMemory` a per-cube poison-initialised
-            /// tile and `CUBE_*`/`UNIT_POS`/`ABSOLUTE_POS` bound to the loop
-            /// variables/constants. `cube_count` is derived by the caller
-            /// (`conformance_case`) from the case size; `cube_dim` is the
-            /// `cooperative(cube_dim = …)` pinned block size.
-            pub fn reference(#(#ref_params,)* cube_count: usize, cube_dim: usize) {
-                #coop_body
+        let reference_fn = if let Some((_, ref_path)) = &spec.reference {
+            // Declared-reference fallback (§4.4): forward to the author-supplied
+            // sequential reference instead of deriving a phase-split twin. The
+            // body is NOT run through `coop::build_reference_body`, so a kernel
+            // outside the transformable subset is supported — that is the whole
+            // point of #3. The custody is explicitly weaker (the reference is a
+            // separate artifact, not this kernel's own re-executed structure),
+            // which the `differential-declared-reference` check string records.
+            quote! {
+                /// Author-supplied declared reference (docs/design-shared-
+                /// memory.md §4.4) — forwards to the `reference = …` function.
+                /// A strictly weaker claim than a derived twin: this reference
+                /// is a separate artifact that can drift from the kernel, so
+                /// the tested claim carries the `differential-declared-reference`
+                /// check string, never the derived-twin one.
+                pub fn reference(#(#ref_params,)* cube_count: usize, cube_dim: usize) {
+                    #ref_path(#(#ref_arg_names,)* cube_count, cube_dim)
+                }
+            }
+        } else {
+            let coop_body = coop::build_reference_body(&ref_block, &params, &fn_name_str)?;
+            quote! {
+                /// Phase-split cooperative reference execution (docs/design-shared-
+                /// memory.md §4): per cube, per barrier-delimited segment, per
+                /// `unit_pos`, with `SharedMemory` a per-cube poison-initialised
+                /// tile and `CUBE_*`/`UNIT_POS`/`ABSOLUTE_POS` bound to the loop
+                /// variables/constants. `cube_count` is derived by the caller
+                /// (`conformance_case`) from the case size; `cube_dim` is the
+                /// `cooperative(cube_dim = …)` pinned block size.
+                pub fn reference(#(#ref_params,)* cube_count: usize, cube_dim: usize) {
+                    #coop_body
+                }
             }
         };
         let conformance = coop::build_conformance_items(
@@ -1979,6 +2063,14 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         )
     };
 
+    // Cooperative-mode surface the `vericl::suite!` macro reads (a separate
+    // macro invocation that cannot see this kernel's clauses directly).
+    let coop_cube_dim_const = match &spec.cooperative {
+        Some((_, cd)) => quote!(::core::option::Option::Some((#cd) as u32)),
+        None => quote!(::core::option::Option::None),
+    };
+    let declared_reference_const = spec.reference.is_some();
+
     Ok(quote! {
         #[doc = #doc]
         #[allow(non_snake_case, unused_variables, clippy::all)]
@@ -1994,6 +2086,21 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             /// kernel calls via `uses(...)`. `[]` for a non-composing
             /// kernel.
             pub const USES: &[&str] = &[#(#uses_strs),*];
+
+            /// `Some(cube_dim)` iff this kernel declares `cooperative(cube_dim
+            /// = N)` — the pinned workgroup block size (docs/design-shared-
+            /// memory.md §7.1). `vericl::suite!` reads this to select the
+            /// cooperative claim pipeline (two-thread race + bounds proofs and
+            /// the differential/race-freedom coupling of §6); `None` selects
+            /// the ordinary bounds-only pipeline.
+            pub const COOPERATIVE_CUBE_DIM: ::core::option::Option<u32> = #coop_cube_dim_const;
+
+            /// `true` iff this cooperative kernel declares `reference = fn`
+            /// (candidate #3, docs/design-shared-memory.md §4.4): its reference
+            /// is an author-supplied artifact, not the derived phase-split twin.
+            /// `vericl::suite!` reads this to tag the tested claim with the
+            /// strictly-weaker `differential-declared-reference` check string.
+            pub const DECLARED_REFERENCE: bool = #declared_reference_const;
 
             pub fn contract() -> ::vericl::Contract {
                 ::vericl::Contract {

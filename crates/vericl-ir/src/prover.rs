@@ -350,6 +350,57 @@ pub enum ProveResult {
     SolverError { detail: String },
 }
 
+/// The obligation breakdown of a `Proved` cooperative walk, split so the two
+/// evidence claims one walk backs (`smt-oob-freedom` and `smt-race-freedom`)
+/// each carry an honest, non-overlapping count (docs/design-shared-memory.md
+/// §5.6, §6).
+#[derive(Debug, Clone, Copy)]
+pub struct CooperativeObligations {
+    /// Out-of-bounds obligations discharged — every shared/global index proved
+    /// `0 <= idx < len`, resolved once on the thread-1 pass. This is the
+    /// `smt-oob-freedom` count for a cooperative kernel: it includes exactly
+    /// the tree-reduction `tile[tid+half] < len` obligations that the
+    /// single-thread `prove_bounds_freedom_cooperative` defers to the race walk
+    /// (see `block_sum_reduce_defers_to_m3`).
+    pub bounds: usize,
+    /// Write-write race obligations discharged (§5.3).
+    pub write_write: usize,
+    /// Read-write race obligations discharged (§5.3).
+    pub read_write: usize,
+    /// Inter-cube single-writer global-output checks discharged (§5.3).
+    pub intercube: usize,
+    /// Barrier-uniformity checks passed (§5.4) — dataflow taint, no SMT query;
+    /// counted for legibility in the race claim's config.
+    pub uniformity: usize,
+    /// Phase count (barrier intervals the body was partitioned into, §5.3).
+    pub phases: usize,
+}
+
+impl CooperativeObligations {
+    /// Total data-race obligations (the `smt-race-freedom` count): write-write
+    /// + read-write + inter-cube single-writer.
+    pub fn race(&self) -> usize {
+        self.write_write + self.read_write + self.intercube
+    }
+}
+
+/// The detailed outcome of the two-thread cooperative walk
+/// ([`prove_cooperative`]). The single sound walk (docs/design-shared-memory.md
+/// §5) discharges BOTH the out-of-bounds obligations of every access it
+/// resolves AND the data-race obligations, so one walk backs two distinct
+/// evidence claims — `smt-oob-freedom` and `smt-race-freedom` — each with its
+/// own honest count. This is why the milestone's cooperative kernels earn a
+/// `Proved` `smt-oob-freedom` claim even though `prove_bounds_freedom_
+/// cooperative` alone returns `OutOfSubset` for them (the single-thread bounds
+/// walk defers a barrier-carrying tree loop to this walker).
+#[derive(Debug, Clone)]
+pub enum CooperativeProof {
+    Proved(CooperativeObligations),
+    Refuted { obligation: String, counterexample: String },
+    OutOfSubset { reason: String },
+    SolverError { detail: String },
+}
+
 /// `z3 --version`, or `None` if the `z3` binary isn't on `PATH`. Recorded in
 /// evidence as part of the trusted solver component (docs/ir-research.md
 /// §4: the subprocess solver is an external, independently versioned
@@ -397,10 +448,13 @@ pub fn prove_bounds_freedom_cooperative(
     prove_bounds_freedom_impl(def, buffers, assumes, Some(cube_dim))
 }
 
+/// The `check` string of the out-of-bounds-freedom `Proved` claim. A single
+/// source of truth shared by the bounds prover and the M6 evidence wiring.
+pub const SMT_OOB_FREEDOM_CHECK: &str = "smt-oob-freedom";
+
 /// The `check` string of the race-freedom `Proved` claim (sibling to
 /// `"smt-oob-freedom"`), per docs/design-shared-memory.md §5.6. Defined here
-/// so the (future, milestone M6) evidence wiring has a single source of truth;
-/// M3 is prover-only and does not itself touch `suite!`/evidence.
+/// so the (milestone M6) evidence wiring has a single source of truth.
 pub const SMT_RACE_FREEDOM_CHECK: &str = "smt-race-freedom";
 
 /// Prove **data-race freedom** for a workgroup-cooperative `def`, via the
@@ -432,7 +486,33 @@ pub fn prove_race_freedom(
     assumes: &[Assume],
     cube_dim: u32,
 ) -> ProveResult {
-    prove_race_freedom_impl(def, buffers, assumes, cube_dim)
+    match prove_race_freedom_detailed(def, buffers, assumes, cube_dim) {
+        CooperativeProof::Proved(o) => ProveResult::Proved { obligations: o.bounds + o.race() },
+        CooperativeProof::Refuted { obligation, counterexample } => {
+            ProveResult::Refuted { obligation, counterexample }
+        }
+        CooperativeProof::OutOfSubset { reason } => ProveResult::OutOfSubset { reason },
+        CooperativeProof::SolverError { detail } => ProveResult::SolverError { detail },
+    }
+}
+
+/// Prove BOTH out-of-bounds freedom and data-race freedom for a
+/// workgroup-cooperative `def` in one two-thread walk, keeping the obligation
+/// breakdown split (see [`CooperativeProof`] / [`CooperativeObligations`]).
+///
+/// This is the conformance suite's cooperative entry point (docs/design-shared-
+/// memory.md §6): the SAME sound walk `prove_race_freedom` performs, but
+/// returning the bounds/race split so the evidence can carry two distinct
+/// `Proved` claims — `smt-oob-freedom` (bounds) and `smt-race-freedom` (races)
+/// — from one walk. `prove_race_freedom` is this collapsed to a single combined
+/// count (for callers that only need the race verdict).
+pub fn prove_cooperative(
+    def: &KernelDefinition,
+    buffers: &[BufferParam],
+    assumes: &[Assume],
+    cube_dim: u32,
+) -> CooperativeProof {
+    prove_race_freedom_detailed(def, buffers, assumes, cube_dim)
 }
 
 fn prove_bounds_freedom_impl(
@@ -482,16 +562,16 @@ fn prove_bounds_freedom_impl(
     }
 }
 
-fn prove_race_freedom_impl(
+fn prove_race_freedom_detailed(
     def: &KernelDefinition,
     buffers: &[BufferParam],
     assumes: &[Assume],
     cube_dim: u32,
-) -> ProveResult {
+) -> CooperativeProof {
     let mut smt = match ContextBuilder::new().solver("z3").solver_args(["-smt2", "-in"]).build() {
         Ok(ctx) => ctx,
         Err(e) => {
-            return ProveResult::SolverError { detail: format!("failed to start z3: {e}") };
+            return CooperativeProof::SolverError { detail: format!("failed to start z3: {e}") };
         }
     };
 
@@ -537,25 +617,32 @@ fn prove_race_freedom_impl(
     };
 
     if let Err(e) = prover.assert_structured_assumes(assumes) {
-        return e.into_result();
+        return e.into_coop();
     }
     if let Err(e) = prover.race_setup() {
-        return e.into_result();
+        return e.into_coop();
     }
     if let Err(e) = prover.race_walk(&def.body, Thread::T1) {
-        return e.into_result();
+        return e.into_coop();
     }
     prover.race_reset_for_t2();
     if let Err(e) = prover.race_walk(&def.body, Thread::T2) {
-        return e.into_result();
+        return e.into_coop();
     }
+    // Capture the phase count before `emit_race_obligations` drains `phases_t1`.
+    let phases = prover.race.as_ref().expect("race mode").phases_t1.len();
     if let Err(e) = prover.emit_race_obligations() {
-        return e.into_result();
+        return e.into_coop();
     }
     let r = prover.race.as_ref().expect("race mode");
-    ProveResult::Proved {
-        obligations: prover.obligations + r.ww + r.rw + r.global_checks,
-    }
+    CooperativeProof::Proved(CooperativeObligations {
+        bounds: prover.obligations,
+        write_write: r.ww,
+        read_write: r.rw,
+        intercube: r.global_checks,
+        uniformity: r.uniformity_checks,
+        phases,
+    })
 }
 
 enum Stop {
@@ -572,6 +659,16 @@ impl Stop {
                 ProveResult::Refuted { obligation, counterexample }
             }
             Stop::SolverError(detail) => ProveResult::SolverError { detail },
+        }
+    }
+
+    fn into_coop(self) -> CooperativeProof {
+        match self {
+            Stop::OutOfSubset(reason) => CooperativeProof::OutOfSubset { reason },
+            Stop::Refuted { obligation, counterexample } => {
+                CooperativeProof::Refuted { obligation, counterexample }
+            }
+            Stop::SolverError(detail) => CooperativeProof::SolverError { detail },
         }
     }
 }

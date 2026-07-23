@@ -403,8 +403,33 @@ caught deterministically.
    (non-cpu) shape, per the "run VERICL_UPDATE as the LAST thing you do" staleness-guard lesson
    from the earlier adversarial review; `conform demo-defects` exits 0, output unchanged (neither
    defect kernel touches `&&`/div/mod/loop-carry).
-6. Next proved property: race-freedom via two-thread symbolic reduction (the sum_racy class
-   proved, not just differentially caught).
+6. [DONE 2026-07] Next proved property: race-freedom via two-thread symbolic reduction — the
+   shared-memory milestone (`docs/design-shared-memory.md`), delivered M1–M7. `smt-race-freedom`
+   is now a live second proved property alongside `smt-oob-freedom`: a GPUVerify-style two-thread
+   reduction (`t1 != t2` over one cube; per-phase write-write / read-write / inter-cube
+   single-writer disjointness + barrier uniformity in QF_LIA) over the CubeCL IR
+   (`crates/vericl-ir/src/prover.rs`, `prove_race_freedom`/`prove_cooperative`). The cooperative
+   twin is a macro-derived **phase-split** reference (`crates/vericl-macros/src/coop.rs`), gated by
+   a `cooperative(cube_dim = N)` clause. **M6 — the coupling**: a cooperative `tested` differential
+   claim always makes its dependence on race freedom explicit — discharged (cites the
+   `smt-race-freedom` proof), assumed (an injected `intra-phase-race-freedom` `assumed` claim when
+   `prove: false` or the proof is out-of-subset), or refused — never silently green. One sound
+   two-thread walk backs BOTH the `smt-oob-freedom` (bounds deferred by the single-thread walk) and
+   `smt-race-freedom` claims via the split `prove_cooperative` returns (`CooperativeProof`). A
+   declared-reference fallback (`reference = fn`) carries a distinct, strictly weaker
+   `differential-declared-reference` check string (candidate #3, §4.4). `verify()`'s downgrade check
+   already covers the new claim kind (keyed on the `check` string;
+   `dropped_proved_race_freedom_claim_is_a_downgrade` pins it). **M7 — validation**: clean-room
+   `block_sum_reduce` + `grid_stride_reduce` wired into `vericl::suite!`, each carrying the triple
+   `tested` (race dependency discharged) + proved `smt-oob-freedom` + proved `smt-race-freedom`
+   (both lanes: wgpu, and cpu feature); a cooperative defective twin `block_sum_reduce_racy` (the
+   overlapping `tile[tid] += tile[tid+1]` stride) REFUTES `smt-race-freedom` with a two-thread
+   counterexample (`t1 == t2 + 1`) in `conform demo-defects`, exit 0. Private dogfood: the
+   production `Σ|iq|²` reduction shape (`reduce_rssi`) annotated cooperative + instantiate + full
+   contract lands the whole triple on the real shape (5 documented adaptations, 2 new walls —
+   comptime loop bound, caller-supplied grid width — and the predicted fma tolerance finding; see
+   `docs/dogfood-2026-07.md` shared-memory addendum, and `vericl-dogfood`). Resolves the README
+   "open decision" on ordering: race-freedom is the gateway and is now delivered.
 7. Later: QF_BV wrapping model in the prover — needed for, among other things, the
    unbounded-overflow-feeding-div/mod gap found in the round-2 adversarial review (roadmap item 9
    below): a divisor provably nonzero in unbounded QF_LIA can still wrap to exactly zero via `u32`

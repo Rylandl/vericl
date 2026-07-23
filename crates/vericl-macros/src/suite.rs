@@ -240,7 +240,11 @@ fn kernel_salt(name: &str) -> u64 {
 
 /// One kernel's block in the primary runtime lane: run every size, print,
 /// build the `Tested` (and, when `prove`, `Proved`) claims, and push a fresh
-/// `Entry`.
+/// `Entry`. A cooperative kernel (`COOPERATIVE_CUBE_DIM.is_some()`) runs the
+/// two-prover pipeline and the differential↔race-freedom coupling of
+/// docs/design-shared-memory.md §6; a non-cooperative kernel keeps the ordinary
+/// bounds-only pipeline. The branch is on a per-kernel const the kernel macro
+/// emits, since `suite!` (a separate macro invocation) cannot see the clauses.
 fn kernel_block(kernel: &Ident) -> TokenStream2 {
     let kmod = format_ident!("{}_vericl", kernel);
     let salt = kernel_salt(&kernel.to_string());
@@ -281,70 +285,204 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
                 ::vericl::ClaimResult::Fail { detail: __detail }
             };
 
-            let mut __claims = ::std::vec![::vericl::Claim {
-                kind: ::vericl::ClaimKind::Tested,
-                check: "differential".to_string(),
-                backend: Some(__vericl_backend.clone()),
-                config: ::vericl::differential_config(__vericl_sizes, __vericl_seed, __vericl_cube_dim),
-                result: __result,
-            }];
-
             let mut __trusted = ::vericl::reference_twin_trust();
             __trusted.push(::vericl::backend_buffer_trust(&__vericl_backend));
             __trusted.push(::vericl::GPU_HARDWARE_TRUST.to_string());
-
             let mut __identity = #kmod::identity();
+            let mut __claims: ::std::vec::Vec<::vericl::Claim> = ::std::vec::Vec::new();
 
-            if __vericl_prove {
-                let __def = #kmod::kernel_definition();
-                let __ir_hash = ::vericl_ir::kernel_ir_hash(&__def);
-                let __buffers: ::std::vec::Vec<::vericl_ir::BufferParam> = #kmod::BUFFER_PARAMS
-                    .iter()
-                    .map(|(name, is_output)| ::vericl_ir::BufferParam { name, is_output: *is_output })
-                    .collect();
-                let __assumes: ::std::vec::Vec<::vericl_ir::Assume> = #kmod::contract()
-                    .structured_assumes
-                    .iter()
-                    .map(|a| match *a {
-                        ::vericl::StructuredAssume::LenEq { a, b } => ::vericl_ir::Assume::LenEq { a, b },
-                        ::vericl::StructuredAssume::LenEqConst { a, value } => {
-                            ::vericl_ir::Assume::LenEqConst { a, value }
-                        }
-                    })
-                    .collect();
-                let __prove_result = ::vericl_ir::prove_bounds_freedom(&__def, &__buffers, &__assumes);
-                let (__obligations, __claim_result) = match &__prove_result {
-                    ::vericl_ir::ProveResult::Proved { obligations } => {
-                        (*obligations, ::vericl::ClaimResult::Pass)
-                    }
-                    ::vericl_ir::ProveResult::Refuted { obligation, counterexample } => (
-                        0,
-                        ::vericl::ClaimResult::Fail {
-                            detail: format!("REFUTED: {obligation} — counterexample: {counterexample}"),
-                        },
-                    ),
-                    ::vericl_ir::ProveResult::OutOfSubset { reason } => (
-                        0,
-                        ::vericl::ClaimResult::Fail { detail: format!("outside the vericl v0 subset: {reason}") },
-                    ),
-                    ::vericl_ir::ProveResult::SolverError { detail } => {
-                        (0, ::vericl::ClaimResult::Fail { detail: format!("solver error: {detail}") })
-                    }
+            if let ::core::option::Option::Some(__coop_cd) = #kmod::COOPERATIVE_CUBE_DIM {
+                // ---- Cooperative pipeline (docs/design-shared-memory.md §6) ----
+                // The phase-split twin is a faithful reference only under
+                // intra-phase race freedom + barrier non-divergence, so the
+                // tested claim ALWAYS records that dependency — discharged by
+                // the `smt-race-freedom` proof (strong tier), or as an explicit
+                // injected assumption (honest fallback). It is never assumed
+                // silently, and a racy kernel's failing race proof sinks the
+                // entry rather than recording a green-by-luck tested pass.
+                let __ref_desc = if #kmod::DECLARED_REFERENCE {
+                    "author-supplied declared reference (not derived from kernel source)"
+                } else {
+                    "vericl-macros phase-split cooperative twin (derived from kernel source)"
                 };
-                __identity.ir_hash = Some(__ir_hash);
-                __claims.push(::vericl::Claim {
-                    kind: ::vericl::ClaimKind::Proved,
-                    check: "smt-oob-freedom".to_string(),
-                    backend: None,
-                    config: ::vericl::proved_config(
-                        __vericl_solver.as_deref().expect("prove checked z3 above"),
-                        __obligations,
+                let __tested_check = if #kmod::DECLARED_REFERENCE {
+                    "differential-declared-reference"
+                } else {
+                    "differential"
+                };
+
+                let mut __dependency = ::vericl::RaceDependency::Assumed;
+                let mut __assumption: ::core::option::Option<::vericl::Claim> = None;
+
+                if __vericl_prove {
+                    let __solver = __vericl_solver.as_deref().expect("prove checked z3 above");
+                    let __def = #kmod::kernel_definition();
+                    __identity.ir_hash = Some(::vericl_ir::kernel_ir_hash(&__def));
+                    let __buffers: ::std::vec::Vec<::vericl_ir::BufferParam> = #kmod::BUFFER_PARAMS
+                        .iter()
+                        .map(|(name, is_output)| ::vericl_ir::BufferParam { name, is_output: *is_output })
+                        .collect();
+                    let __assumes: ::std::vec::Vec<::vericl_ir::Assume> = #kmod::contract()
+                        .structured_assumes
+                        .iter()
+                        .map(|a| match *a {
+                            ::vericl::StructuredAssume::LenEq { a, b } => ::vericl_ir::Assume::LenEq { a, b },
+                            ::vericl::StructuredAssume::LenEqConst { a, value } => {
+                                ::vericl_ir::Assume::LenEqConst { a, value }
+                            }
+                        })
+                        .collect();
+                    match ::vericl_ir::prove_cooperative(&__def, &__buffers, &__assumes, __coop_cd) {
+                        ::vericl_ir::CooperativeProof::Proved(__o) => {
+                            // Strong tier: one sound two-thread walk discharges
+                            // BOTH bounds and races; split into two claims.
+                            __claims.push(::vericl::Claim {
+                                kind: ::vericl::ClaimKind::Proved,
+                                check: ::vericl_ir::SMT_OOB_FREEDOM_CHECK.to_string(),
+                                backend: None,
+                                config: ::vericl::proved_bounds_cooperative_config(__solver, __o.bounds),
+                                result: ::vericl::ClaimResult::Pass,
+                            });
+                            __claims.push(::vericl::Claim {
+                                kind: ::vericl::ClaimKind::Proved,
+                                check: ::vericl_ir::SMT_RACE_FREEDOM_CHECK.to_string(),
+                                backend: None,
+                                config: ::vericl::proved_race_config(
+                                    __solver,
+                                    __o.race(),
+                                    __o.phases,
+                                    __o.write_write,
+                                    __o.read_write,
+                                    __o.intercube,
+                                    __o.uniformity,
+                                ),
+                                result: ::vericl::ClaimResult::Pass,
+                            });
+                            __trusted.extend(::vericl::proved_bounds_trust(__solver));
+                            __trusted.extend(::vericl::proved_race_freedom_trust(__solver));
+                            __dependency = ::vericl::RaceDependency::Discharged;
+                        }
+                        ::vericl_ir::CooperativeProof::Refuted { obligation, counterexample } => {
+                            // A genuine two-thread race: emit a FAILING race
+                            // claim (the entry fails — a racy kernel belongs in
+                            // demo-defects, not the honest suite) and fall back
+                            // to the explicit assumption for the tested claim.
+                            __claims.push(::vericl::Claim {
+                                kind: ::vericl::ClaimKind::Proved,
+                                check: ::vericl_ir::SMT_RACE_FREEDOM_CHECK.to_string(),
+                                backend: None,
+                                config: ::vericl::proved_race_config(__solver, 0, 0, 0, 0, 0, 0),
+                                result: ::vericl::ClaimResult::Fail {
+                                    detail: format!(
+                                        "REFUTED: {obligation} — two-thread counterexample: {counterexample}"
+                                    ),
+                                },
+                            });
+                            __assumption = Some(::vericl::race_freedom_assumption_claim());
+                        }
+                        ::vericl_ir::CooperativeProof::OutOfSubset { reason } => {
+                            // Honest fallback: race freedom is not provable for
+                            // this kernel's shape. No proved claim (there is
+                            // nothing discharged), inject the explicit assumption
+                            // the tested claim depends on. NB the smt-oob-freedom
+                            // claim is also absent here — the same walk discharges
+                            // both, so if it cannot run neither property is proved.
+                            println!(
+                                "      note: {} cooperative proofs OutOfSubset ({reason}) — \
+                                 tested claim carries the explicit race-freedom assumption",
+                                #kmod::contract().kernel
+                            );
+                            __assumption = Some(::vericl::race_freedom_assumption_claim());
+                        }
+                        ::vericl_ir::CooperativeProof::SolverError { detail } => {
+                            panic!(
+                                "z3 solver error proving cooperative kernel `{}`: {detail}",
+                                #kmod::contract().kernel
+                            );
+                        }
+                    }
+                } else {
+                    // prove disabled: honest fallback — no proofs, explicit
+                    // assumption (exactly as the ordinary lane omits the bounds
+                    // proof under prove: false, rather than faking one).
+                    __assumption = Some(::vericl::race_freedom_assumption_claim());
+                }
+
+                // Tested claim built AFTER the provers (its config cites the
+                // dependency), inserted first so it heads the entry.
+                __claims.insert(0, ::vericl::Claim {
+                    kind: ::vericl::ClaimKind::Tested,
+                    check: __tested_check.to_string(),
+                    backend: Some(__vericl_backend.clone()),
+                    config: ::vericl::cooperative_differential_config(
+                        __vericl_sizes, __vericl_seed, __coop_cd, __ref_desc, __dependency,
                     ),
-                    result: __claim_result,
+                    result: __result,
                 });
-                __trusted.extend(::vericl::proved_bounds_trust(
-                    __vericl_solver.as_deref().expect("prove checked z3 above"),
-                ));
+                if let Some(__a) = __assumption {
+                    __claims.push(__a);
+                }
+            } else {
+                // ---- Ordinary (non-cooperative) pipeline ----
+                __claims.push(::vericl::Claim {
+                    kind: ::vericl::ClaimKind::Tested,
+                    check: "differential".to_string(),
+                    backend: Some(__vericl_backend.clone()),
+                    config: ::vericl::differential_config(__vericl_sizes, __vericl_seed, __vericl_cube_dim),
+                    result: __result,
+                });
+
+                if __vericl_prove {
+                    let __def = #kmod::kernel_definition();
+                    let __ir_hash = ::vericl_ir::kernel_ir_hash(&__def);
+                    let __buffers: ::std::vec::Vec<::vericl_ir::BufferParam> = #kmod::BUFFER_PARAMS
+                        .iter()
+                        .map(|(name, is_output)| ::vericl_ir::BufferParam { name, is_output: *is_output })
+                        .collect();
+                    let __assumes: ::std::vec::Vec<::vericl_ir::Assume> = #kmod::contract()
+                        .structured_assumes
+                        .iter()
+                        .map(|a| match *a {
+                            ::vericl::StructuredAssume::LenEq { a, b } => ::vericl_ir::Assume::LenEq { a, b },
+                            ::vericl::StructuredAssume::LenEqConst { a, value } => {
+                                ::vericl_ir::Assume::LenEqConst { a, value }
+                            }
+                        })
+                        .collect();
+                    let __prove_result = ::vericl_ir::prove_bounds_freedom(&__def, &__buffers, &__assumes);
+                    let (__obligations, __claim_result) = match &__prove_result {
+                        ::vericl_ir::ProveResult::Proved { obligations } => {
+                            (*obligations, ::vericl::ClaimResult::Pass)
+                        }
+                        ::vericl_ir::ProveResult::Refuted { obligation, counterexample } => (
+                            0,
+                            ::vericl::ClaimResult::Fail {
+                                detail: format!("REFUTED: {obligation} — counterexample: {counterexample}"),
+                            },
+                        ),
+                        ::vericl_ir::ProveResult::OutOfSubset { reason } => (
+                            0,
+                            ::vericl::ClaimResult::Fail { detail: format!("outside the vericl v0 subset: {reason}") },
+                        ),
+                        ::vericl_ir::ProveResult::SolverError { detail } => {
+                            (0, ::vericl::ClaimResult::Fail { detail: format!("solver error: {detail}") })
+                        }
+                    };
+                    __identity.ir_hash = Some(__ir_hash);
+                    __claims.push(::vericl::Claim {
+                        kind: ::vericl::ClaimKind::Proved,
+                        check: ::vericl_ir::SMT_OOB_FREEDOM_CHECK.to_string(),
+                        backend: None,
+                        config: ::vericl::proved_config(
+                            __vericl_solver.as_deref().expect("prove checked z3 above"),
+                            __obligations,
+                        ),
+                        result: __claim_result,
+                    });
+                    __trusted.extend(::vericl::proved_bounds_trust(
+                        __vericl_solver.as_deref().expect("prove checked z3 above"),
+                    ));
+                }
             }
 
             entries.push(::vericl::Entry {
@@ -367,7 +505,28 @@ fn extra_lane_kernel_block(kernel: &Ident) -> TokenStream2 {
     let salt = kernel_salt(&kernel.to_string());
     quote! {
         {
-            let __outcomes: ::std::vec::Vec<::vericl::CaseOutcome> = __vericl_sizes
+            // Extra-lane sizes. For a COOPERATIVE kernel, cap to single-cube
+            // cases (`n <= cube_dim`): a CPU runtime (e.g. cubecl-cpu) executes
+            // a workgroup-cooperative kernel per-cube with heavy barrier-
+            // simulation overhead (seconds per cube — measured ~6s/cube), so the
+            // primary lane's large multi-cube sizes (65536 → 256 cubes) would
+            // turn the extra lane into a many-minute run. A few single-cube
+            // cases confirm the shared front end agrees; the INDEPENDENT primary
+            // lane still covers every declared size (docs/design-shared-memory.md
+            // — cubecl-cpu cooperative-execution performance finding). Non-
+            // cooperative kernels are unaffected (all sizes).
+            let __extra_sizes: ::std::vec::Vec<usize> =
+                if let ::core::option::Option::Some(__ccd) = #kmod::COOPERATIVE_CUBE_DIM {
+                    let mut __v: ::std::vec::Vec<usize> =
+                        __vericl_sizes.iter().copied().filter(|&n| n <= __ccd as usize).collect();
+                    if __v.is_empty() {
+                        __v.push(__ccd as usize);
+                    }
+                    __v
+                } else {
+                    __vericl_sizes.to_vec()
+                };
+            let __outcomes: ::std::vec::Vec<::vericl::CaseOutcome> = __extra_sizes
                 .iter()
                 .map(|&n| {
                     #kmod::conformance_case::<__VericlExtraR>(
@@ -393,14 +552,49 @@ fn extra_lane_kernel_block(kernel: &Ident) -> TokenStream2 {
             } else {
                 ::vericl::ClaimResult::Fail { detail: __detail }
             };
-            let __claim = ::vericl::Claim {
-                kind: ::vericl::ClaimKind::Tested,
-                check: "differential".to_string(),
-                backend: Some(__vericl_extra_backend.clone()),
-                config: ::vericl::differential_config(__vericl_sizes, __vericl_seed, __vericl_cube_dim),
-                result: __result,
-            };
             if let Some(entry) = entries.iter_mut().find(|e| e.kernel == #kmod::contract().kernel) {
+                let __claim = if let ::core::option::Option::Some(__coop_cd) = #kmod::COOPERATIVE_CUBE_DIM {
+                    // Cooperative extra lane: mirror the main lane's coupling.
+                    // The dependency is read off the entry the main lane already
+                    // built — a discharged proof is present iff its passing
+                    // `smt-race-freedom` claim is (no need to re-run the prover).
+                    let __dependency = if entry.claims.iter().any(|c| {
+                        c.kind == ::vericl::ClaimKind::Proved
+                            && c.check == ::vericl::SMT_RACE_FREEDOM_CHECK
+                            && matches!(c.result, ::vericl::ClaimResult::Pass)
+                    }) {
+                        ::vericl::RaceDependency::Discharged
+                    } else {
+                        ::vericl::RaceDependency::Assumed
+                    };
+                    let __ref_desc = if #kmod::DECLARED_REFERENCE {
+                        "author-supplied declared reference (not derived from kernel source)"
+                    } else {
+                        "vericl-macros phase-split cooperative twin (derived from kernel source)"
+                    };
+                    let __tested_check = if #kmod::DECLARED_REFERENCE {
+                        "differential-declared-reference"
+                    } else {
+                        "differential"
+                    };
+                    ::vericl::Claim {
+                        kind: ::vericl::ClaimKind::Tested,
+                        check: __tested_check.to_string(),
+                        backend: Some(__vericl_extra_backend.clone()),
+                        config: ::vericl::cooperative_differential_config(
+                            &__extra_sizes, __vericl_seed, __coop_cd, __ref_desc, __dependency,
+                        ),
+                        result: __result,
+                    }
+                } else {
+                    ::vericl::Claim {
+                        kind: ::vericl::ClaimKind::Tested,
+                        check: "differential".to_string(),
+                        backend: Some(__vericl_extra_backend.clone()),
+                        config: ::vericl::differential_config(&__extra_sizes, __vericl_seed, __vericl_cube_dim),
+                        result: __result,
+                    }
+                };
                 entry.claims.push(__claim);
                 entry.trusted.push(::vericl::shared_frontend_lane_trust(&__vericl_extra_backend));
             }

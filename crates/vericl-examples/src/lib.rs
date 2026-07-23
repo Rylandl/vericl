@@ -521,6 +521,14 @@ pub fn block_sum_reduce(input: &Array<f32>, output: &mut Array<f32>) {
 /// reduction as `block_sum_reduce`. Uses the `CUBE_COUNT` builtin for the
 /// grid stride (validated runtime value on wgpu), so no extra parameter is
 /// needed and the twin's `CUBE_COUNT` binds to the launch cube_count.
+///
+/// NOT wired into `vericl::suite!` (unlike `block_sum_reduce`): the cubecl-cpu
+/// backend does not support the `CUBE_COUNT` builtin ("Unsupported builtin was
+/// used: CubeCount"), so this kernel cannot run on the suite's `--features cpu`
+/// lane — exactly the portability reason the production `reduce_rssi` passes the
+/// grid width as an explicit runtime scalar rather than reading `CUBE_COUNT`.
+/// It remains fully covered: bit-exact vs wgpu in `tests/cooperative.rs`, and
+/// race-free + in-bounds proved in `grid_stride_reduce_definition_is_race_free`.
 #[vericl::kernel(
     assumes(data.iter().all(|v| v.abs() <= 100.0)),
     compare(max_ulp = 0),
@@ -582,6 +590,120 @@ pub fn shared_read_before_write(input: &Array<f32>, output: &mut Array<f32>) {
     let acc = tile[tid] + input[ABSOLUTE_POS];
     tile[tid] = acc;
     sync_cube();
+    if tid == 0usize && CUBE_POS < output.len() {
+        output[CUBE_POS] = tile[0usize];
+    }
+}
+
+/// DEFECTIVE cooperative twin — the racy variant of `block_sum_reduce`
+/// (docs/design-shared-memory.md §5.5 / §8 M7). Its reduction generation uses
+/// the **overlapping neighbor stride** `tile[tid] = tile[tid] + tile[tid + 1]`
+/// under `tid < 255` instead of the correct disjoint `tile[tid] += tile[tid +
+/// half]` under `tid < half`: thread `t` reads `tile[t + 1]` while thread `t +
+/// 1` concurrently writes `tile[t + 1]`, and no barrier can separate reads from
+/// writes *within* one generation — an intra-phase read-write race (`t1 == t2 +
+/// 1` collides). All accesses are bounds-safe (the `tid < 255` guard keeps the
+/// neighbor read in range), so the two-thread race walker refutes
+/// `smt-race-freedom` on the **race**, not on bounds, printing a two-thread
+/// counterexample — the deterministic catch. Because the twin serialises the
+/// generation into one arbitrary thread order (and the GPU does not), the GPU
+/// differential *usually* diverges too, but that is nondeterministic, so the
+/// proof refutation is the reliable finding. Not suite-wired (a defect probe;
+/// lives in `conform`'s demo-defects mode).
+#[vericl::kernel(
+    assumes(input.iter().all(|v| v.abs() <= 100.0)),
+    compare(max_ulp = 0),
+    gen(input in -100.0..=100.0),
+    cooperative(cube_dim = 256)
+)]
+#[cube(launch)]
+pub fn block_sum_reduce_racy(input: &Array<f32>, output: &mut Array<f32>) {
+    let tid = UNIT_POS as usize;
+    let mut tile = SharedMemory::<f32>::new(256usize);
+    if ABSOLUTE_POS < input.len() {
+        tile[tid] = input[ABSOLUTE_POS];
+    } else {
+        tile[tid] = 0.0f32;
+    }
+    sync_cube();
+    // BUG: an intra-level neighbor combine — thread `t` reads `tile[t + 1]`
+    // while thread `t + 1` writes it. The correct reduction uses a disjoint
+    // `tid + half` stride under `tid < half`, so read and write sets never
+    // overlap; this overlapping `tid + 1` stride makes adjacent threads race.
+    if tid < 255usize {
+        let neighbor = tile[tid + 1usize];
+        tile[tid] = tile[tid] + neighbor;
+    }
+    sync_cube();
+    if tid == 0usize && CUBE_POS < output.len() {
+        output[CUBE_POS] = tile[0usize];
+    }
+}
+
+/// Hand-written sequential reference for the declared-reference demonstrator
+/// below (candidate #3, docs/design-shared-memory.md §4.4/§6). Deliberately a
+/// SEPARATE artifact from the kernel — the whole point of #3 is a reference the
+/// phase-split transform did not derive, for a cooperative kernel outside the
+/// transformable subset. Signature matches the cooperative twin's:
+/// `(inputs..., outputs..., cube_count, cube_dim)`.
+pub fn block_sum_declared_ref(input: &[f32], output: &mut [f32], cube_count: usize, cube_dim: usize) {
+    for (c, slot) in output.iter_mut().enumerate().take(cube_count) {
+        let mut tile = vec![0.0f32; cube_dim];
+        for (tid, cell) in tile.iter_mut().enumerate() {
+            let abs = c * cube_dim + tid;
+            *cell = if abs < input.len() { input[abs] } else { 0.0 };
+        }
+        let mut half = cube_dim / 2;
+        while half > 0 {
+            for tid in 0..half {
+                tile[tid] += tile[tid + half];
+            }
+            half /= 2;
+        }
+        *slot = tile[0];
+    }
+}
+
+/// Declared-reference demonstrator (candidate #3, docs/design-shared-memory.md
+/// §4.4/§6): identical reduction shape to `block_sum_reduce`, but its reference
+/// is the author-supplied `block_sum_declared_ref` (via `reference = …`) rather
+/// than a derived phase-split twin. A *strictly weaker, distinct* claim — the
+/// tested claim carries `differential-declared-reference`, not `differential`,
+/// because a hand-written reference is a separate artifact that can silently
+/// drift from the kernel (the custody the derived twin preserves is given up).
+/// Not suite-wired; exercised by `block_sum_reduce_declared_uses_the_declared_
+/// reference` below. NB a kernel *inside* the transformable subset (as this one
+/// is) opting into the weaker claim is only allowed *explicitly*, via the
+/// clause — never silently (§4.4 gate).
+#[vericl::kernel(
+    assumes(input.iter().all(|v| v.abs() <= 1000.0)),
+    compare(max_ulp = 0),
+    gen(input in -1000.0..=1000.0),
+    cooperative(cube_dim = 256),
+    reference = block_sum_declared_ref
+)]
+#[cube(launch)]
+pub fn block_sum_reduce_declared(input: &Array<f32>, output: &mut Array<f32>) {
+    let tid = UNIT_POS as usize;
+    let mut tile = SharedMemory::<f32>::new(256usize);
+    if ABSOLUTE_POS < input.len() {
+        tile[tid] = input[ABSOLUTE_POS];
+    } else {
+        tile[tid] = 0.0f32;
+    }
+    sync_cube();
+
+    let mut half = CUBE_DIM as usize / 2;
+    while half > 0usize {
+        if tid < half {
+            let a = tile[tid];
+            let b = tile[tid + half];
+            tile[tid] = a + b;
+        }
+        sync_cube();
+        half /= 2usize;
+    }
+
     if tid == 0usize && CUBE_POS < output.len() {
         output[CUBE_POS] = tile[0usize];
     }
@@ -1449,6 +1571,70 @@ mod tests {
         match vericl_ir::prove_race_freedom(&def, &buffers, &[], 256) {
             vericl_ir::ProveResult::Proved { .. } => {}
             other => panic!("expected race-free Proved, got {other:?}"),
+        }
+    }
+
+    /// The demo-defects racy twin `block_sum_reduce_racy` is REFUTED by the
+    /// two-thread race walker (M7): the overlapping `tile[tid] += tile[tid + 1]`
+    /// stride is a read-write race between adjacent threads, caught with a
+    /// two-thread counterexample (`t1 == t2 + 1`) — deterministically, unlike
+    /// the nondeterministic GPU differential divergence. Pins that the same
+    /// clean `block_sum_reduce` shape, once made racy, flips Proved -> Refuted.
+    #[test]
+    fn block_sum_reduce_racy_definition_refutes_race_freedom() {
+        let def = block_sum_reduce_racy_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = block_sum_reduce_racy_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        match vericl_ir::prove_race_freedom(&def, &buffers, &[], 256) {
+            vericl_ir::ProveResult::Refuted { obligation, counterexample } => {
+                assert!(
+                    obligation.contains("read-write race"),
+                    "unexpected obligation: {obligation}"
+                );
+                assert!(
+                    counterexample.contains("t1") && counterexample.contains("t2"),
+                    "expected a two-thread counterexample: {counterexample}"
+                );
+            }
+            other => panic!("expected Refuted (neighbor-stride race), got {other:?}"),
+        }
+    }
+
+    /// Declared-reference fallback (candidate #3, docs/design-shared-memory.md
+    /// §4.4/§6, M6): `block_sum_reduce_declared` opts into the author-supplied
+    /// `block_sum_declared_ref` via `reference = …`. The generated `reference`
+    /// forwards to it (so a kernel outside the transformable subset is
+    /// supportable), and the `DECLARED_REFERENCE` const flips true so the suite
+    /// tags the tested claim with the strictly-weaker
+    /// `differential-declared-reference` check string — never the derived-twin
+    /// `differential`. The derived-twin sibling (`block_sum_reduce`) keeps it
+    /// false. The forwarded reference agrees bit-for-bit with the derived twin
+    /// here (the two shapes are identical), demonstrating the fallback is a
+    /// faithful — but separately-authored, hence weaker-claim — reference.
+    #[test]
+    fn block_sum_reduce_declared_uses_the_declared_reference() {
+        const { assert!(block_sum_reduce_declared_vericl::DECLARED_REFERENCE) };
+        const { assert!(!block_sum_reduce_vericl::DECLARED_REFERENCE) };
+        assert_eq!(block_sum_reduce_declared_vericl::COOPERATIVE_CUBE_DIM, Some(256));
+
+        let cube_dim = 256usize;
+        for &n in &[1usize, 3, 257, 512] {
+            let input: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.5 - 1.0).collect();
+            let cube_count = n.div_ceil(cube_dim).max(1);
+            // The declared kernel's forwarding reference == the hand-written fn.
+            let mut got = vec![0.0f32; cube_count];
+            block_sum_reduce_declared_vericl::reference(&input, &mut got, cube_count, cube_dim);
+            let mut want = vec![0.0f32; cube_count];
+            block_sum_declared_ref(&input, &mut want, cube_count, cube_dim);
+            assert_eq!(got, want, "n={n}: forwarding must call the declared reference");
+            // …and it agrees bit-for-bit with the DERIVED twin of the same shape.
+            let mut derived = vec![0.0f32; cube_count];
+            block_sum_reduce_vericl::reference(&input, &mut derived, cube_count, cube_dim);
+            for c in 0..cube_count {
+                assert_eq!(got[c].to_bits(), derived[c].to_bits(), "n={n} cube {c}");
+            }
         }
     }
 }

@@ -250,6 +250,46 @@ declaration order (not `gen(...)` clause order) for determinism, then checked ag
 with the kernel name, so a persistent failure means the declared ranges are inconsistent with the
 kernel's own `assumes(...)`, not a runtime fluke.
 
+### The `cooperative(...)` clause: workgroup shared-memory reductions
+
+```rust
+#[vericl::kernel(
+    assumes(input.iter().all(|v| v.abs() <= 1000.0)),
+    compare(max_ulp = 0),
+    gen(input in -1000.0..=1000.0),
+    cooperative(cube_dim = 256)
+)]
+#[cube(launch)]
+pub fn block_sum_reduce(input: &Array<f32>, output: &mut Array<f32>) {
+    let tid = UNIT_POS as usize;
+    let mut tile = SharedMemory::<f32>::new(256usize);
+    /* load into tile; */ sync_cube();
+    let mut half = CUBE_DIM as usize / 2;
+    while half > 0usize {
+        if tid < half { tile[tid] = tile[tid] + tile[tid + half]; }
+        sync_cube();
+        half /= 2usize;
+    }
+    if tid == 0usize && CUBE_POS < output.len() { output[CUBE_POS] = tile[0usize]; }
+}
+```
+
+The `cooperative(cube_dim = N)` clause opts a kernel into the workgroup-cooperative shape —
+`UNIT_POS`/`CUBE_POS`/`CUBE_DIM`/`CUBE_COUNT`, `SharedMemory`, `sync_cube()`, grid-stride loops,
+tree reductions — which the ordinary loop-over-`ABSOLUTE_POS` twin cannot model (a sequential
+per-thread twin has no per-workgroup shared arena and no barrier semantics). It swaps in a
+**phase-split twin**: the body is split at each `sync_cube()` into barrier-delimited segments, run
+per cube, per segment, per `unit_pos`, with `SharedMemory` a per-cube **poison-initialised** tile
+(a read of a never-written cell panics rather than masking an uninitialised-read bug with a zero).
+`cube_dim` pins the launch block size *and* the prover's `CUBE_DIM` binding (a single source of
+truth — a launch with a different block size panics loudly rather than binding `CUBE_DIM` to a value
+the launch does not use). The suite sizes each `&mut Array` output to `cube_count` (one partial per
+workgroup) and launches `(cube_count, cube_dim)`. The v1 subset is the 1-D reduction shape
+(one non-cooperative accumulation loop, one uniform-trip-count tree loop, single-writer `tid == 0`
+store); anything else — a barrier under a thread-varying condition (barrier divergence), a
+non-uniform tree loop, multiple tiles — is rejected with a targeted error, never mis-modelled.
+Design: `docs/design-shared-memory.md`.
+
 ### Suites: `vericl::suite!`
 
 ```rust
@@ -310,6 +350,34 @@ IR-level content hash alongside the source-level one, so evidence goes stale on 
 drift. `axpy_off_by_one` REFUTES with a counterexample exhibiting the out-of-bounds position, and
 `sum_racy`'s bounds PROVE even though its differential check correctly fails — the race is a
 distinct, differential finding, never conflated with the bounds claim.
+
+The second proved claim is **data-race freedom** (`smt-race-freedom`), for the cooperative
+shared-memory kernels. It is discharged by a GPUVerify-style two-thread symbolic reduction: two
+arbitrary distinct threads `t1 ≠ t2` of one cube are walked, and within each barrier-delimited phase
+every shared/global write is proved not to collide (same index) with another thread's write
+(write-write) or read (read-write), plus barrier uniformity and inter-cube single-writer
+disjointness — all in QF_LIA, UNSAT meaning race-free, SAT a real race reported with a two-thread
+counterexample. `block_sum_reduce` and `grid_stride_reduce` PROVE race-free and in-bounds; the
+demo-defects `block_sum_reduce_racy` (an overlapping `tile[tid] += tile[tid+1]` stride) REFUTES with
+a two-thread counterexample (`t1 == t2 + 1`). The one two-thread walk discharges *both* the race
+obligations and the tree-reduction bounds obligations that the single-thread bounds walk defers, so
+a cooperative kernel earns both a `smt-race-freedom` and a `smt-oob-freedom` proved claim from it,
+each with its own honest obligation count.
+
+**The differential↔race-freedom coupling (the honesty rule).** A phase-split twin picks *one*
+intra-segment thread order, so it is a faithful reference **only** when every segment is race-free —
+which is exactly what `smt-race-freedom` proves. A cooperative kernel's `tested` differential claim
+therefore always makes that dependency explicit, in one of three never-blurred tiers: when race
+freedom is **proved**, the tested claim's config cites it as a *discharged* dependency (pointing at
+the proved claim); when it is **not** proved (`prove: false`, or the proof is out-of-subset), the
+suite injects an explicit `assumed` claim — "intra-phase race freedom + barrier non-divergence" —
+and the tested claim depends on *that* instead; a cooperative differential result with neither the
+proof nor the assumption is **refused**, not recorded (the same posture as `prove: false` omitting a
+proved claim rather than faking one). A green cooperative test can never silently over-claim: the
+thing that makes it valid is always a named, visible dependency. A hand-written reference supplied
+via `reference = fn` (for a kernel the transform cannot derive) carries a distinct, strictly weaker
+`differential-declared-reference` check string, since it is a separate artifact that can drift from
+the kernel — never conflated with the derived twin.
 
 ### CubeCL semantics findings
 

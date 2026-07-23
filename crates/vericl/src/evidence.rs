@@ -164,6 +164,130 @@ pub fn proved_config(solver: &str, obligations: usize) -> serde_json::Value {
     })
 }
 
+/// The `check` string of the injected assumption a cooperative differential
+/// claim depends on when race freedom is *not* proved (the honest-fallback
+/// tier, docs/design-shared-memory.md §6). Distinct from the `smt-race-freedom`
+/// proved-claim check the strong tier cites — the two must never be conflated.
+pub const RACE_FREEDOM_ASSUMPTION_CHECK: &str = "intra-phase-race-freedom";
+
+/// The `check` string of the `Proved` race-freedom claim, duplicated here
+/// (core cannot depend on `vericl-ir`, by design) so a cooperative differential
+/// claim's `depends_on` can cite it. Kept byte-identical to
+/// `vericl_ir::SMT_RACE_FREEDOM_CHECK` — the suite asserts both agree.
+pub const SMT_RACE_FREEDOM_CHECK: &str = "smt-race-freedom";
+
+/// How a cooperative differential (`tested`) claim records its dependency on
+/// intra-phase race freedom + barrier non-divergence (docs/design-shared-
+/// memory.md §6). The phase-split twin picks one intra-segment thread order, so
+/// it is a faithful reference *only* under race freedom; that dependency is
+/// always made explicit, never assumed silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaceDependency {
+    /// Strong tier: the `smt-race-freedom` proof is present and discharged the
+    /// dependency. The tested claim cites that proved claim's `check`.
+    Discharged,
+    /// Honest-fallback tier: race freedom was not proved (prove disabled, or
+    /// the proof came back `OutOfSubset`), so it travels as an explicit
+    /// [`race_freedom_assumption_claim`] the tested claim depends on.
+    Assumed,
+}
+
+/// `config` JSON for a cooperative kernel's differential (`tested`) claim,
+/// carrying the race-freedom dependency coupling (docs/design-shared-memory.md
+/// §6). `reference` describes the reference twin (derived phase-split, or an
+/// author-supplied declared reference). `dependency` records whether the twin's
+/// faithfulness is discharged by the `smt-race-freedom` proof or rests on the
+/// injected assumption.
+pub fn cooperative_differential_config(
+    sizes: &[usize],
+    seed: u64,
+    cube_dim: u32,
+    reference: &str,
+    dependency: RaceDependency,
+) -> serde_json::Value {
+    let depends_on = match dependency {
+        RaceDependency::Discharged => serde_json::json!({
+            "property": "intra-phase race freedom + barrier non-divergence",
+            "check": SMT_RACE_FREEDOM_CHECK,
+            "status": "discharged-by-proof",
+        }),
+        RaceDependency::Assumed => serde_json::json!({
+            "property": "intra-phase race freedom + barrier non-divergence",
+            "check": RACE_FREEDOM_ASSUMPTION_CHECK,
+            "status": "assumed-undischarged",
+        }),
+    };
+    serde_json::json!({
+        "sizes": sizes,
+        "seed": seed,
+        "cube_dim": cube_dim,
+        "reference": reference,
+        "depends_on": depends_on,
+    })
+}
+
+/// The `Assumed` claim injected into a cooperative kernel's entry when race
+/// freedom is not proved (the honest-fallback tier, §6). Travels exactly as a
+/// `compare(abs=…)` tolerance does — a declared constraint the tested claim
+/// leans on but does not itself establish. A cooperative differential result
+/// with neither this assumption nor the `smt-race-freedom` proof is refused,
+/// never recorded silently.
+pub fn race_freedom_assumption_claim() -> Claim {
+    Claim {
+        kind: ClaimKind::Assumed,
+        check: RACE_FREEDOM_ASSUMPTION_CHECK.to_string(),
+        backend: None,
+        config: serde_json::json!({
+            "statement": "intra-phase race freedom + barrier non-divergence (undischarged — the \
+                          phase-split twin is a faithful reference only if every barrier-delimited \
+                          segment is race-free; this was not proved for this kernel/run)",
+        }),
+        result: ClaimResult::Declared,
+    }
+}
+
+/// `config` JSON for a cooperative kernel's `Proved`/`smt-oob-freedom` claim.
+/// Unlike the ordinary bounds proof, a cooperative kernel's tree-reduction
+/// bounds obligations are discharged by the two-thread cooperative walk (the
+/// single-thread bounds walk defers a barrier-carrying loop) — recorded here so
+/// the provenance is explicit.
+pub fn proved_bounds_cooperative_config(solver: &str, obligations: usize) -> serde_json::Value {
+    serde_json::json!({
+        "solver": solver,
+        "logic": "QF_LIA",
+        "obligations": obligations,
+        "discharged_by": "two-thread cooperative walk (a barrier-carrying tree loop is deferred \
+                          by the single-thread bounds walk and discharged here)",
+    })
+}
+
+/// `config` JSON for a `Proved`/`smt-race-freedom` claim (docs/design-shared-
+/// memory.md §5.6): solver, QF_LIA, phase count, and the per-class obligation
+/// counts (write-write / read-write / inter-cube single-writer / barrier
+/// uniformity). `obligations` is the total of the three SMT-checked race
+/// classes.
+#[allow(clippy::too_many_arguments)]
+pub fn proved_race_config(
+    solver: &str,
+    obligations: usize,
+    phases: usize,
+    write_write: usize,
+    read_write: usize,
+    intercube: usize,
+    uniformity: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "solver": solver,
+        "logic": "QF_LIA",
+        "obligations": obligations,
+        "phases": phases,
+        "write_write": write_write,
+        "read_write": read_write,
+        "intercube_single_writer": intercube,
+        "barrier_uniformity": uniformity,
+    })
+}
+
 impl Manifest {
     pub fn new(entries: Vec<Entry>) -> Self {
         Self {
@@ -362,6 +486,36 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("downgraded"), "{problems:?}");
         assert!(problems[0].contains("smt-oob-freedom"), "{problems:?}");
+    }
+
+    /// The downgrade check keys on the claim's `check` string, so it covers
+    /// the new `smt-race-freedom` proved claim (docs/design-shared-memory.md
+    /// §5.6/§6) exactly like `smt-oob-freedom`: a stored race-freedom proof the
+    /// current build no longer produces (prove disabled, z3 gone, or the
+    /// cooperative walk regressed) is a downgrade, not a silent pass. This is
+    /// the coupling's safety net — a cooperative tested claim cites this proof
+    /// as its discharged dependency, so losing it must not go unnoticed.
+    #[test]
+    fn dropped_proved_race_freedom_claim_is_a_downgrade() {
+        let race_claim = Claim {
+            kind: ClaimKind::Proved,
+            check: SMT_RACE_FREEDOM_CHECK.into(),
+            backend: None,
+            config: serde_json::json!({}),
+            result: ClaimResult::Pass,
+        };
+        let mut stored_entry = entry("coop_k", "aaa");
+        stored_entry.claims.push(proved_claim()); // smt-oob-freedom
+        stored_entry.claims.push(race_claim);
+        let stored = Manifest::new(vec![stored_entry]);
+        // Current build keeps bounds but drops the race-freedom proof.
+        let mut current_entry = entry("coop_k", "aaa");
+        current_entry.claims.push(proved_claim());
+        let current = Manifest::new(vec![current_entry]);
+        let problems = verify(&stored, &current);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("downgraded"), "{problems:?}");
+        assert!(problems[0].contains("smt-race-freedom"), "{problems:?}");
     }
 
     /// The same proved claim present on both sides is not a downgrade.
