@@ -1345,3 +1345,71 @@ audited — unreachable from evidence-producing flows; rejection-only so cannot 
 Known benign asymmetry recorded: a global-array-read terminate condition is genuinely
 uniform and the twin accepts it, while the prover taints the read and goes OutOfSubset —
 suite degrades to the labeled assumed-race-freedom tier, never a false Proved.
+
+## Ecosystem survey (2026-07-23) — tracel-ai's own CubeCL kernel libraries
+
+Public-code counterpart to the private Substrate dogfood — full report in
+`docs/ecosystem-survey-2026-07.md`. Ran VeriCL against tracel-ai's open-source kernel
+libraries at VeriCL's pinned `cubecl = "=0.10.0"`. Work in a sibling workspace
+(`/Users/ryland/code/vericl-ecosystem-survey`); no vericl-repo source changes beyond the
+survey doc and this addendum; no commits.
+
+**Mapping finding (premise correction).** The named targets are NOT crates in `tracel-ai/cubecl`
+at 0.10.0 — the cubecl 0.10.0 meta-crate ships only `cubecl-std` as a kernel library. For this
+generation the algorithm kernels live in a separate repo, `tracel-ai/cubek` (published `cubek`
+v0.2.0, pins cubecl 0.10.0): `cubek-random`, `cubek-reduce`, `cubek-matmul`, `cubek-convolution`,
+`cubek-std`. `burn` v0.21.0 consumes both; `burn-cubecl/src/kernel/*` are host wrappers with zero
+`#[cube]`. Also: cubecl-random is a **Tausworthe-88 + LCG** hybrid, not Philox (does not weaken
+the "proven this shape before" premise — it is `xorshift_step`/`mix_u32`-shaped).
+
+**Gap map (464 device `#[cube]` items; ecosystem-wide gate ranking, item×gate incidences).**
+1 `Line`/`Vector` **148** · 2 `View`/`Slice` **128** · 3 `comptime!{}` blocks 120 · 4 `match`/Switch 119 ·
+5 `plane_*` 88 · 6 rejected methods (`cast_from`/`mul_hi`/…) 82 · 7 custom `CubeType` struct params 68 ·
+8 cmma/Matrix 62 · 9 2-D topology 39 · 10 `Tensor` 32 · 11 `SharedMemory` 24 (supported only in the
+1-D cooperative scalar subset) · 12 `select()` 9 · 13 `Atomic` 1. Launch entry-points are very few
+(cubek-random 1, cubek-reduce 2, cubek-matmul 4, cubek-std 0, cubek-conv 0) and all maximally gated
+— the annotatable content is the reusable scalar device helpers underneath, not the dispatch sites.
+
+**THE HEADLINE — the frontier flipped vs Substrate.** Substrate found *zero* `Line`/`Vector`/
+`Slice`/`plane_*`/`Atomic`/`Tensor` and withdrew Tensor/2-D speculation (correct for Substrate). The
+ecosystem's own libraries are the mirror image: `Line`/`Vector` is the #1 gap, `View`/`Slice` #2. The
+two disagree because they occupy different layers (Substrate: 1-D scalar app kernels; cubek/cubecl:
+the vectorized tensor-algebra substrate). **Recommended next milestone: `Line`/`Vector` element
+support (twin = length-N lane array; per-lane compare; bounds over the outer index), scoped first to
+1-D vectorized elementwise + reduction shapes where the topology/proof machinery already exists, with
+`View`/`Slice` as the immediate follow-on.** This is the change that converts "VeriCL proves the
+reusable scalar cores of tracel-ai's kernels" into "VeriCL proves tracel-ai's kernels".
+
+**Shortlist — 8 kernels, full tested + proved pair, on TWO differential lanes (wgpu/WGSL/Metal +
+cubecl-cpu).** All bodies verbatim from upstream (MIT/Apache-2.0, cited); `*_map` drivers are 1-D
+glue; contracts ours. Evidence: `vericl-ecosystem-survey/annotated/evidence/vericl.json`.
+- cubek-random RNG core: `taus_step_0/1/2` (via `taus0/1/2_map`, composition/helper-calling-helper,
+  `Proved{2}` each) · `lcg_step` (via `lcg_map`, **wrapping**, `Proved{2}`) · `combined_taus_lcg`
+  (cubek's full per-value output `taus0^taus1^taus2^lcg`, **wrapping + `uses(...)` together**,
+  `Proved{5}`). All `compare(exact)`, bit-exact on both lanes.
+- cubecl-std: `to_degrees`/`to_radians` (**generic** `instantiate(F=f32)` + composition, `abs`
+  tolerances derived from input range, `Proved{2}`) · `shift_right` (`#[comptime]` bool pass-through,
+  `exact`, `Proved{2}`).
+Confirms composition, `instantiate`, `wrapping`, `#[comptime]` params all land on real upstream code
+with zero adaptation. Positive result: `wrapping` + `uses(...)` co-exist in one kernel.
+
+**Findings classified.**
+- VeriCL gaps: (1) `Line`/`Vector`+`View` (the frontier, above). (2) `cast_from` blocks cubek-random's
+  `u32→f32` converters (`to_unit_interval_*`) — the exact seam between the provable integer core and
+  the float-conversion boundary; verified clean macro rejection on the real body. (3) `wrapping` is
+  kernel-only, so cubek's wrap-intent `lcg_step` cannot be a `#[vericl::helper]` — inline-into-a-
+  wrapping-kernel is the faithful path (proves); a helper-level `wrapping` would let the LFSR/LCG steps
+  compose end-to-end. Residual, low urgency.
+- Implicit invariant: none in the shortlist. One observation outside it — cubek-reduce `shared_sum`'s
+  prose-only "caller must zero the output" obligation (same class as the dogfood findings), not
+  annotatable today (`Atomic`+`Vector`+`View`+generic).
+- Real upstream bugs: none (mature library code; bit-exact on two backends, provably in-bounds).
+- Negative controls (discrimination proven, `annotated/src/bin/negatives.rs`, exit 0): `lcg_map_oob`
+  (`<=` guard) `Refuted` at `abs_pos==len` while honest `lcg_map` `Proved{2}` (both directions);
+  `lcg_map_nowrap` differential catches the checked twin panicking on overflow. Macro-gate rejections
+  captured on real bodies (`cast_from`; `Array<Vector<…>>` element).
+
+Roadmap consequence: elevate `Line`/`Vector` (+ `View`/`Slice`) to the next milestone slot — it is the
+demand-ranked #1/#2 gap across tracel-ai's own libraries, ahead of any remaining scalar-tier
+follow-up. Upstream-conversation-worthy: the RNG-core proof result, and the `wrapping`-on-helper /
+runtime-`cast_from` expressiveness gaps.
