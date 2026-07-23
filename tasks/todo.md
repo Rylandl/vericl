@@ -1413,3 +1413,17 @@ Roadmap consequence: elevate `Line`/`Vector` (+ `View`/`Slice`) to the next mile
 demand-ranked #1/#2 gap across tracel-ai's own libraries, ahead of any remaining scalar-tier
 follow-up. Upstream-conversation-worthy: the RNG-core proof result, and the `wrapping`-on-helper /
 runtime-`cast_from` expressiveness gaps.
+
+## Queued (deferred by Ryland, 2026-07-23): upstream f64 disclosure
+
+Report the cubecl 0.10 wgpu f64 silent-corruption bug (pinned by
+crates/vericl-examples/tests/f64_wgpu_unsound.rs) to tracel-ai — QUEUED, do not send
+without Ryland's explicit go. Pre-send verification checklist:
+1. Reproduce against cubecl main and any 0.11 pre-release (fixed? rejected? still silent?).
+2. Check the SPIR-V compilation path (cubecl-wgpu spirv feature) — f64 is expressible there;
+   behavior may differ from the WGSL/naga path.
+3. Draft framing: "still present at <commit>" or "fixed on main, published 0.10 affected —
+   consider advisory"; include the minimal repro + the corruption-not-demotion diagnostic
+   (axpy expected 1776.99, got 526.99; cpu lane bit-exact).
+The broader upstream package (7 compiler/runtime findings + docs/ecosystem-survey-2026-07.md)
+goes with it when Ryland green-lights contact.
