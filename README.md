@@ -139,6 +139,57 @@ subset`. This is an explicit rejection, not a best-effort attempt — a twin tha
 or panics on a method vericl never verified is exactly the failure mode this project exists to
 prevent.
 
+The whitelist was re-verified **on `f64`** the same empirical way
+(`crates/vericl-examples/tests/float_method_whitelist_f64.rs`) rather than assumed to transfer from
+`f32` — cubecl's `Float`/`Numeric` trait impls could in principle differ per type. Result: every
+whitelisted method is host-callable and numerically correct on `f64`, and every rejected method
+panics on `f64`, exactly as on `f32`, so a single shared whitelist stays correct (no per-type
+split needed). The reason is the same: for a *concrete* `f64` receiver Rust prefers the inherent
+`f64::method` over the trait's `unexpanded!()` default, and the associated fns (`new`, `from_int`,
+`min_value`, `max_value`) have real per-type `f64` impls.
+
+### f64 support: the cubecl-cpu-only tier
+
+`instantiate(F = f64)` monomorphizes a generic kernel at `f64` exactly like `F = f32`: the twin
+becomes `&[f64]`/`alpha: f64` and computes at full f64 precision, `conformance_case` launches
+`<f64, R>`, and `kernel_definition()` extracts the IR at `f64`. Input generation uses
+`SplitMix64`'s 53-bit `next_f64_range`/`fill_f64` (the f64 analog of the 24-bit f32 path), a float
+parameter without a `gen(...)` range is the same compile error as for f32, and the compare mode is
+recorded honestly at f64 precision — `compare(abs = 1e-12)` on an f64 kernel becomes
+`Compare::AbsRelF64` (an f64 tolerance stored at f64 precision, described `f64 |e-a| <= …`), never
+silently narrowed to the f32 variant. The flagship example is `axpy_f64` — byte-for-byte `axpy`
+with `instantiate(F = f64)`.
+
+**The platform caveat, stated loudly because it is a soundness landmine.** WGSL has no `f64`, so an
+f64 kernel *cannot* run on the wgpu/Metal backend — but cubecl 0.10 does **not** reject it. Verified
+empirically: launching an f64 kernel on `WgpuRuntime` produces **no compile error and no runtime
+panic**, and then returns **silently wrong results** — not even an f32 demotion (which would at least
+be a recognizable rounding), but genuine garbage, because the host uploads 8-byte f64 elements into a
+buffer the WGSL kernel indexes at a different element size. A green-looking launch that quietly
+computes the wrong answer is precisely the failure class VeriCL exists to catch, so this is pinned by
+a test (`crates/vericl-examples/tests/f64_wgpu_unsound.rs`, which asserts the f64 kernel *diverges*
+from its correct twin on wgpu) and never used as an execution lane. cubecl-cpu, by contrast, runs
+f64 correctly at full precision (verified: bit-exact to a host f64 computation).
+
+The consequence for the trust boundary is real and worth naming. For an **f32** kernel, wgpu and
+cubecl-cpu are two genuinely different backends, so the wgpu lane is an execution path independent of
+cpu (and the cpu extra-lane is recorded as *not* independent because it shares CubeCL's front end).
+For an **f64** kernel on this machine there is **no front-end-independent execution lane at all**:
+wgpu is unusable, and cubecl-cpu shares CubeCL's front end (macro expansion + IR) with the kernel
+under test. So the macro-derived sequential twin is the **sole** independent leg, which makes its
+independence *load-bearing* rather than a redundant cross-check. The f64 suite records this in the
+evidence trusted list explicitly — `host CPU execution hardware` (not the f32 lanes' "GPU hardware"),
+plus the standing shared-front-end caveat "this lane is NOT an independent reference; only the
+vericl-macros sequential twin is independent of CubeCL" — via a `frontend_independent: false` suite
+declaration. f64 kernels therefore get their own `suite!` invocation on `cubecl::cpu::CpuRuntime`
+with its own evidence file (`crates/vericl-examples/tests/conformance_f64.rs` →
+`evidence/vericl_f64.json`), the same "one suite, one manifest" precedent as `conformance.rs` and
+`cooperative_fallback.rs`; it is `#[cfg(feature = "cpu")]`, so it is exercised under `cargo test
+--features cpu`. `axpy_f64` there carries a `tested` (differential, cpu) claim and a `proved`
+`smt-oob-freedom` claim (3 obligations — bounds freedom is about buffer `Length`, so the f64 element
+type is irrelevant to the proof). Everything else — `wrapping` (still integer-only), the bounds
+prover, kernel composition — is unchanged; f64 is an instantiate tier, not a new subset.
+
 ### Kernel composition: `#[vericl::helper]` and `uses(...)`
 
 Real kernels call other `#[cube]` functions — the July 2026 dogfooding survey found this blocking

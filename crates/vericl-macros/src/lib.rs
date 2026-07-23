@@ -247,10 +247,51 @@ impl Parse for InstantiateEntry {
     }
 }
 
+/// The parsed `compare(...)` mode, kept in a precision-agnostic form so
+/// `expand` can render the concrete `Compare::` value at the right float
+/// precision once the compared arrays' element type is known — `parse_contract`
+/// runs before instantiate(...) substitution resolves that type. The default
+/// rendering in `ContractSpec::compare`/`compare_desc` is the f32/integer one
+/// (used verbatim for every non-f64 kernel, so their evidence is byte-identical
+/// to the pre-f64 behavior); an f64 kernel gets `compare_tokens_f64` applied to
+/// this instead.
+enum CompareMode {
+    Exact,
+    MaxUlp(Expr),
+    AbsRel { abs: Option<Expr>, rel: Option<Expr> },
+}
+
+/// Render a [`CompareMode`] as the f64 `Compare::` value + its describe
+/// string, used only for a kernel whose compared `&mut Array` outputs are
+/// f64 (see `expand`'s `compare_float_kind`). The f32/integer rendering
+/// lives inline in `parse_contract` and is used verbatim for every other
+/// kernel — this is the single point where an f64 kernel's tolerance is
+/// stored at f64 precision (`AbsRelF64`) and described as `f64`, rather than
+/// being silently narrowed to the f32 variant.
+fn compare_tokens_f64(mode: &CompareMode) -> (TokenStream2, String) {
+    match mode {
+        CompareMode::Exact => (quote!(::vericl::Compare::Exact), "exact".to_string()),
+        CompareMode::MaxUlp(val) => (
+            quote!(::vericl::Compare::MaxUlpF64(#val)),
+            format!("f64 max_ulp={}", val.to_token_stream()),
+        ),
+        CompareMode::AbsRel { abs, rel } => {
+            let a = abs.as_ref().map_or(quote!(0.0f64), |e| e.to_token_stream());
+            let r = rel.as_ref().map_or(quote!(0.0f64), |e| e.to_token_stream());
+            (
+                quote!(::vericl::Compare::AbsRelF64 { abs: #a, rel: #r }),
+                format!("f64 |e-a| <= {a} + {r}*|e|"),
+            )
+        }
+    }
+}
+
 struct ContractSpec {
     assumes: Vec<Expr>,
     compare: TokenStream2,
     compare_desc: String,
+    /// Precision-agnostic form of `compare`/`compare_desc` — see [`CompareMode`].
+    compare_mode: CompareMode,
     /// Whether the `wrapping` clause is declared, and the span to blame if
     /// the kernel turns out to be outside the subset it requires.
     wrapping: Option<proc_macro2::Span>,
@@ -291,6 +332,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
     let mut assumes = Vec::new();
     let mut compare = quote!(::vericl::Compare::Exact);
     let mut compare_desc = "exact".to_string();
+    let mut compare_mode = CompareMode::Exact;
     let mut wrapping = None;
     let mut gen_entries: Vec<GenEntry> = Vec::new();
     let mut instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)> = None;
@@ -327,11 +369,13 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
                         Meta::Path(p) if p.is_ident("exact") => {
                             compare = quote!(::vericl::Compare::Exact);
                             compare_desc = "exact".into();
+                            compare_mode = CompareMode::Exact;
                         }
                         Meta::NameValue(nv) if nv.path.is_ident("max_ulp") => {
                             let val = &nv.value;
                             compare = quote!(::vericl::Compare::MaxUlpF32(#val));
                             compare_desc = format!("f32 max_ulp={}", val.to_token_stream());
+                            compare_mode = CompareMode::MaxUlp(nv.value.clone());
                         }
                         Meta::NameValue(nv) if nv.path.is_ident("abs") => {
                             abs = Some(nv.value.clone());
@@ -348,10 +392,11 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
                     }
                 }
                 if abs.is_some() || rel.is_some() {
-                    let a = abs.map_or(quote!(0.0f32), |e| e.to_token_stream());
-                    let r = rel.map_or(quote!(0.0f32), |e| e.to_token_stream());
+                    let a = abs.as_ref().map_or(quote!(0.0f32), |e| e.to_token_stream());
+                    let r = rel.as_ref().map_or(quote!(0.0f32), |e| e.to_token_stream());
                     compare = quote!(::vericl::Compare::AbsRelF32 { abs: #a, rel: #r });
                     compare_desc = format!("f32 |e-a| <= {a} + {r}*|e|");
+                    compare_mode = CompareMode::AbsRel { abs, rel };
                 }
             }
             Meta::Path(p) if p.is_ident("wrapping") => {
@@ -477,6 +522,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
         assumes,
         compare,
         compare_desc,
+        compare_mode,
         wrapping,
         gen_entries,
         instantiate,
@@ -732,16 +778,23 @@ fn is_wrapping_integer_type(ty: &Type) -> bool {
     matches!(last.ident.to_string().as_str(), "u32" | "i32" | "u64" | "i64")
 }
 
-/// The scalar kinds `gen(...)` knows how to generate. v0 supports exactly
-/// the float type used by every example (`f32`) and the integer types the
-/// `wrapping` clause already recognizes (`u32`/`i32`/`u64`/`i64`) — matching
-/// this project's convention of rejecting an unsupported subset explicitly
-/// rather than silently approximating it. `f64` and other numeric types are
-/// out of scope for v0 because `vericl::rng::SplitMix64` has no `f64`
-/// generator to reuse honestly.
+/// The scalar kinds `gen(...)` knows how to generate: the float types
+/// (`f32`, and `f64` — the latter with `vericl::rng::SplitMix64`'s 53-bit
+/// `next_f64_range`/`fill_f64` path) and the integer types the `wrapping`
+/// clause recognizes (`u32`/`i32`/`u64`/`i64`) — matching this project's
+/// convention of rejecting an unsupported subset explicitly rather than
+/// silently approximating it. Other numeric types (`f16`, `bf16`, `u8`, ...)
+/// stay out of scope.
+///
+/// **f64 platform note:** an f64 kernel silently miscomputes on the
+/// wgpu/Metal backend (WGSL has no f64 — cubecl launches with no error/panic
+/// but the results are garbage; verified empirically), so an f64 kernel's
+/// differential lane is `cubecl-cpu`, never wgpu. See the README "f64
+/// support" section.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NumKind {
     F32,
+    F64,
     U32,
     I32,
     U64,
@@ -754,12 +807,20 @@ impl NumKind {
         let last = tp.path.segments.last()?;
         match last.ident.to_string().as_str() {
             "f32" => Some(NumKind::F32),
+            "f64" => Some(NumKind::F64),
             "u32" => Some(NumKind::U32),
             "i32" => Some(NumKind::I32),
             "u64" => Some(NumKind::U64),
             "i64" => Some(NumKind::I64),
             _ => None,
         }
+    }
+
+    /// `true` for a floating-point kind — the kinds that require a declared
+    /// `gen(...)` range and use a float compare mode (`max_ulp`/`abs`/`rel`),
+    /// as opposed to the integer kinds.
+    fn is_float(self) -> bool {
+        matches!(self, NumKind::F32 | NumKind::F64)
     }
 }
 
@@ -1930,8 +1991,36 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
 
     let assume_exprs = &spec.assumes;
     let assume_strs: Vec<String> = spec.assumes.iter().map(pretty).collect();
-    let compare = &spec.compare;
-    let compare_desc = &spec.compare_desc;
+    // The compare mode's float precision follows the compared `&mut Array`
+    // outputs (the only buffers conformance_case compares). An f64 output
+    // needs the f64 `Compare` variant so `compare_f64_with` matches it; the
+    // f32/integer rendering built in `parse_contract` is used verbatim
+    // otherwise (byte-identical to the pre-f64 behavior). A kernel mixing f32
+    // and f64 compared outputs cannot be served by one compare mode — rejected
+    // rather than silently rendered at one precision.
+    let out_float_kinds: Vec<NumKind> = params
+        .iter()
+        .filter_map(|p| match &p.kind {
+            ParamKind::ArrayMut(elem) => NumKind::of(elem).filter(|k| k.is_float()),
+            _ => None,
+        })
+        .collect();
+    if out_float_kinds.contains(&NumKind::F32) && out_float_kinds.contains(&NumKind::F64) {
+        return Err(syn::Error::new(
+            func.sig.span(),
+            format!(
+                "kernel `{fn_name_str}` has both f32 and f64 `&mut Array` outputs; a single \
+                 compare(...) mode cannot serve two float precisions — outside the vericl v0 \
+                 subset"
+            ),
+        ));
+    }
+    let is_f64_compare = out_float_kinds.contains(&NumKind::F64);
+    let (compare, compare_desc): (TokenStream2, String) = if is_f64_compare {
+        compare_tokens_f64(&spec.compare_mode)
+    } else {
+        (spec.compare.clone(), spec.compare_desc.clone())
+    };
     let wrapping = spec.wrapping.is_some();
     let instantiate_strs: &[String] = &plan.pretty;
 
@@ -2999,7 +3088,9 @@ fn integer_draw_expr(ty: &TokenStream2, kind: NumKind, range: Option<&(Expr, Exp
             NumKind::I32 => quote!(__vericl_rng.next_u32() as #ty),
             NumKind::U64 => quote!(__vericl_rng.next_u64() as #ty),
             NumKind::I64 => quote!(__vericl_rng.next_u64() as #ty),
-            NumKind::F32 => unreachable!("floats never reach integer_draw_expr"),
+            NumKind::F32 | NumKind::F64 => {
+                unreachable!("floats never reach integer_draw_expr")
+            }
         }
     }
 }
@@ -3021,14 +3112,14 @@ fn build_gen_field(
                 return Err(syn::Error::new(
                     ty.span(),
                     format!(
-                        "gen(...) v0 only supports f32/u32/i32/u64/i64 scalar parameters; \
+                        "gen(...) v0 only supports f32/f64/u32/i32/u64/i64 scalar parameters; \
                          `{name_str}: {}` is outside that set",
                         ty.to_token_stream()
                     ),
                 ));
             };
             let range = ranges.get(&name_str);
-            let stmt = if kind == NumKind::F32 {
+            let stmt = if kind.is_float() {
                 let (lo, hi) = range.ok_or_else(|| {
                     syn::Error::new(
                         ty.span(),
@@ -3040,7 +3131,11 @@ fn build_gen_field(
                         ),
                     )
                 })?;
-                quote!(let #name: #ty = __vericl_rng.next_f32_range((#lo) as f32, (#hi) as f32);)
+                if kind == NumKind::F64 {
+                    quote!(let #name: #ty = __vericl_rng.next_f64_range((#lo) as f64, (#hi) as f64);)
+                } else {
+                    quote!(let #name: #ty = __vericl_rng.next_f32_range((#lo) as f32, (#hi) as f32);)
+                }
             } else {
                 let draw = integer_draw_expr(&quote!(#ty), kind, range);
                 quote!(let #name: #ty = #draw;)
@@ -3052,7 +3147,7 @@ fn build_gen_field(
                 return Err(syn::Error::new(
                     elem.span(),
                     format!(
-                        "gen(...) v0 only supports f32/u32/i32/u64/i64 array elements; \
+                        "gen(...) v0 only supports f32/f64/u32/i32/u64/i64 array elements; \
                          `{name_str}: Array<{}>` is outside that set",
                         elem.to_token_stream()
                     ),
@@ -3063,7 +3158,7 @@ fn build_gen_field(
                 Some(e) => quote!((#e) as usize),
                 None => quote!(n),
             };
-            let stmt = if kind == NumKind::F32 {
+            let stmt = if kind.is_float() {
                 let (lo, hi) = range.ok_or_else(|| {
                     syn::Error::new(
                         elem.span(),
@@ -3075,9 +3170,16 @@ fn build_gen_field(
                         ),
                     )
                 })?;
-                quote! {
-                    let #name: ::std::vec::Vec<#elem> =
-                        __vericl_rng.fill_f32(#len_tokens, (#lo) as f32, (#hi) as f32);
+                if kind == NumKind::F64 {
+                    quote! {
+                        let #name: ::std::vec::Vec<#elem> =
+                            __vericl_rng.fill_f64(#len_tokens, (#lo) as f64, (#hi) as f64);
+                    }
+                } else {
+                    quote! {
+                        let #name: ::std::vec::Vec<#elem> =
+                            __vericl_rng.fill_f32(#len_tokens, (#lo) as f32, (#hi) as f32);
+                    }
                 }
             } else {
                 let draw = integer_draw_expr(&quote!(#elem), kind, range);
@@ -3208,13 +3310,15 @@ fn build_conformance_items(
 
                 let compare_call = match elem_kind {
                     NumKind::F32 => quote!(::vericl::compare_f32_with(contract().compare, &#ref_name, &#gpu_name)),
+                    NumKind::F64 => quote!(::vericl::compare_f64_with(contract().compare, &#ref_name, &#gpu_name)),
                     NumKind::U32 => quote!(::vericl::compare_u32_with(contract().compare, &#ref_name, &#gpu_name)),
                     NumKind::I32 | NumKind::U64 | NumKind::I64 => {
                         return Err(syn::Error::new(
                             elem.span(),
                             format!(
-                                "conformance_case v0 only supports comparing f32 or u32 `&mut \
-                                 Array` elements; `{name}: &mut Array<{}>` is outside that set",
+                                "conformance_case v0 only supports comparing f32, f64, or u32 \
+                                 `&mut Array` elements; `{name}: &mut Array<{}>` is outside that \
+                                 set",
                                 elem.to_token_stream()
                             ),
                         ));

@@ -22,7 +22,8 @@ pub mod trust;
 
 pub use compare::{
     CompareReport, Mismatch, compare_exact_u32, compare_f32, compare_f32_absrel,
-    compare_f32_with, compare_u32_with, ulp_distance_f32,
+    compare_f32_with, compare_f64, compare_f64_absrel, compare_f64_with, compare_u32_with,
+    ulp_distance_f32, ulp_distance_f64,
 };
 pub use contract::{
     Compare, Contract, ContractRecord, Identity, MAX_HELPER_COMPOSITION_DEPTH, StructuredAssume,
@@ -38,8 +39,8 @@ pub use panic::catch_reference_panic;
 pub use rng::SplitMix64;
 pub use shared::SharedTile;
 pub use trust::{
-    GPU_HARDWARE_TRUST, backend_buffer_trust, proved_bounds_trust, proved_race_freedom_trust,
-    reference_twin_trust, shared_frontend_lane_trust,
+    GPU_HARDWARE_TRUST, HOST_HARDWARE_TRUST, backend_buffer_trust, proved_bounds_trust,
+    proved_race_freedom_trust, reference_twin_trust, shared_frontend_lane_trust,
 };
 pub use vericl_macros::{helper, kernel, reference, suite};
 

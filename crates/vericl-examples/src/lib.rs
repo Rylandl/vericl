@@ -35,6 +35,50 @@ pub fn axpy<F: Float + CubeElement>(alpha: F, x: &Array<F>, y: &mut Array<F>) {
     }
 }
 
+/// The f64 flagship: `axpy` with `instantiate(F = f64)` instead of `f32`.
+/// Identical body, generic over `F` exactly like `axpy` — the only change is
+/// the pinned concrete type — demonstrating that the `instantiate(...)`
+/// machinery monomorphizes the twin, launch, and IR at f64 with no per-type
+/// special-casing in the kernel author's code.
+///
+/// **Differential lane is cubecl-cpu, never wgpu.** WGSL has no f64: cubecl
+/// 0.10 launches an f64 kernel on the wgpu/Metal backend with no compile
+/// error and no panic, but the results are silently *wrong* (not even an f32
+/// demotion — genuine garbage; verified empirically, see the README "f64
+/// support" section and `tests/f64_wgpu_unsound.rs`). So this kernel's suite
+/// lane is `cubecl::cpu::CpuRuntime` (`tests/conformance_f64.rs`), where f64
+/// runs at full precision. Both cpu and wgpu share cubecl's front end, and
+/// wgpu is unusable for f64 anyway, so there is currently **no**
+/// front-end-independent execution lane for an f64 kernel on this platform —
+/// the macro-derived sequential twin is the sole independent leg, which makes
+/// its independence load-bearing.
+///
+/// Tolerance rationale: with `|alpha| <= 4` and `|x| <= 100`, `|alpha*x| <=
+/// 400`, and one f64 rounding at that scale is at most `ulp(400) ≈ 5.7e-14`,
+/// so `abs = 1e-12` covers a rounding (and any fma contraction the backend
+/// might apply) with wide margin — the same claim shape as `axpy`'s, one
+/// precision tier finer. In practice cubecl-cpu matches the strict-f64 twin
+/// bit-for-bit here (no contraction observed), so the tolerance is never
+/// approached; it is declared to stay honest about what is *guaranteed*, not
+/// what is merely observed.
+#[vericl::kernel(
+    assumes(
+        x.len() == y.len(),
+        alpha.abs() <= 4.0,
+        x.iter().all(|v| v.abs() <= 100.0),
+        y.iter().all(|v| v.abs() <= 100.0)
+    ),
+    compare(abs = 1e-12),
+    gen(alpha in -4.0..=4.0, x in -100.0..=100.0, y in -100.0..=100.0),
+    instantiate(F = f64)
+)]
+#[cube(launch)]
+pub fn axpy_f64<F: Float + CubeElement>(alpha: F, x: &Array<F>, y: &mut Array<F>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = alpha * x[ABSOLUTE_POS] + y[ABSOLUTE_POS];
+    }
+}
+
 /// A small windowed FIR (up to 3 taps), generic over its element type *and*
 /// pinning the active tap count via `#[comptime]` — the milestone's
 /// headline case: a genuinely generic + comptime kernel that still lands a
@@ -743,6 +787,62 @@ mod tests {
         let mut y = vec![10.0f32; 3];
         axpy_vericl::reference(2.0, &x, &mut y, 256); // threads >> len
         assert_eq!(y, vec![12.0; 3]);
+    }
+
+    /// `axpy_f64`'s twin is monomorphized to `f64` (`&[f64]`, `alpha: f64`)
+    /// by `instantiate(F = f64)` and computes at full f64 precision — a value
+    /// finer than f32 can represent round-trips through the twin exactly,
+    /// proving the twin is genuinely f64 and not silently f32.
+    #[test]
+    fn axpy_f64_twin_is_full_precision() {
+        let x = vec![1.0f64; 3];
+        let mut y = vec![10.0f64; 3];
+        axpy_f64_vericl::reference(2.0, &x, &mut y, 256); // threads >> len
+        assert_eq!(y, vec![12.0f64; 3]);
+
+        // A value that is NOT representable in f32: the twin must preserve it.
+        let a = 1.0f64 + 2f64.powi(-40); // distinct from its own f32 round-trip
+        assert_ne!(a, (a as f32) as f64);
+        let x2 = vec![1.0f64];
+        let mut y2 = vec![0.0f64];
+        axpy_f64_vericl::reference(a, &x2, &mut y2, 1);
+        assert_eq!(y2[0], a); // a*1 + 0, exact in f64
+    }
+
+    /// The compare mode is recorded at f64 precision (`AbsRelF64`, described
+    /// as `f64 ...`), not silently narrowed to the f32 variant — the whole
+    /// point of the macro's `compare_tokens_f64` path.
+    #[test]
+    fn axpy_f64_compare_is_recorded_as_f64() {
+        match axpy_f64_vericl::contract().compare {
+            vericl::Compare::AbsRelF64 { abs, rel } => {
+                assert_eq!(abs, 1e-12);
+                assert_eq!(rel, 0.0);
+            }
+            other => panic!("expected AbsRelF64, got {other:?}"),
+        }
+        assert!(axpy_f64_vericl::contract().compare.describe().starts_with("f64 "));
+        // The f32 flagship stays f32 — no cross-contamination.
+        assert!(matches!(axpy_vericl::contract().compare, vericl::Compare::AbsRelF32 { .. }));
+        assert_eq!(axpy_f64_vericl::contract().instantiate, &["F = f64"]);
+    }
+
+    /// The SMT bounds prover discharges `axpy_f64` exactly like the f32
+    /// flagship (3 obligations) — bounds freedom is about buffer `Length`, so
+    /// the f64 element type is irrelevant to the proof; f64 support did not
+    /// weaken it.
+    #[test]
+    fn axpy_f64_kernel_definition_is_provably_in_bounds() {
+        let def = axpy_f64_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = axpy_f64_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved, got {other:?}"),
+        }
     }
 
     #[test]

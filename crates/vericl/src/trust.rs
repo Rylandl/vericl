@@ -21,6 +21,14 @@ pub fn backend_buffer_trust(backend: &str) -> String {
 /// The GPU hardware itself is always trusted, never verified.
 pub const GPU_HARDWARE_TRUST: &str = "GPU hardware";
 
+/// Hardware-trust wording for a lane that executes on the host CPU (e.g. the
+/// cubecl-cpu backend) rather than a GPU — the CPU counterpart of
+/// [`GPU_HARDWARE_TRUST`]. Used when a suite lane is declared
+/// `frontend_independent: false` (see `vericl::suite!`), for which "GPU
+/// hardware" would be a misnomer. The primary use is the f64 lane, whose only
+/// honest execution backend is cubecl-cpu (WGSL has no f64).
+pub const HOST_HARDWARE_TRUST: &str = "host CPU execution hardware";
+
 /// Trust entries added when a `Proved`/`smt-oob-freedom` claim is folded into
 /// an entry.
 pub fn proved_bounds_trust(solver: &str) -> Vec<String> {

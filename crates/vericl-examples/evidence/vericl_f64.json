@@ -1,0 +1,73 @@
+{
+  "vericl_version": "0.1.0",
+  "entries": [
+    {
+      "kernel": "axpy_f64",
+      "identity": {
+        "source_hash": "sha256:aabf546d0d586b4c60d53c2f930e0d67e28125a250977e1b02766eb4d6cee5fc",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:4edf919d6b22067edbc59f5db720dd43bab9c8ab9786de74329ae2e3f76020cd"
+      },
+      "contract": {
+        "assumes": [
+          "x.len() == y.len()",
+          "alpha.abs() <= 4.0",
+          "x.iter().all(| v | v.abs() <= 100.0)",
+          "y.iter().all(| v | v.abs() <= 100.0)"
+        ],
+        "compare": "f64 |e-a| <= 1e-12 + 0e0*|e|",
+        "wrapping": false,
+        "instantiate": [
+          "F = f64"
+        ],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"cpu\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 3,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"cpu\" buffer upload/readback integrity",
+        "host CPU execution hardware",
+        "\"cpu\" runtime shares CubeCL's front end (macro expansion + IR) with the kernel under test — this lane is NOT an independent reference; only the vericl-macros sequential twin is independent of CubeCL",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    }
+  ]
+}

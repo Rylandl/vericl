@@ -33,6 +33,19 @@ impl SplitMix64 {
         (0..n).map(|_| self.next_f32_range(lo, hi)).collect()
     }
 
+    /// Uniform f64 in [lo, hi). Uses the top 53 bits of a fresh `u64` (f64's
+    /// mantissa width) divided by 2^53, so the unit draw covers every
+    /// representable dyadic in [0, 1) at full f64 precision — the f64 analog
+    /// of `next_f32_range`'s 24-bit path (`>> 8`, `/ 2^24`).
+    pub fn next_f64_range(&mut self, lo: f64, hi: f64) -> f64 {
+        let unit = (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        lo + (hi - lo) * unit
+    }
+
+    pub fn fill_f64(&mut self, n: usize, lo: f64, hi: f64) -> Vec<f64> {
+        (0..n).map(|_| self.next_f64_range(lo, hi)).collect()
+    }
+
     pub fn fill_u32(&mut self, n: usize) -> Vec<u32> {
         (0..n).map(|_| self.next_u32()).collect()
     }
@@ -58,5 +71,27 @@ mod tests {
             let v = r.next_f32_range(-2.0, 3.0);
             assert!((-2.0..3.0).contains(&v));
         }
+    }
+
+    #[test]
+    fn f64_in_range() {
+        let mut r = SplitMix64::new(7);
+        for _ in 0..1000 {
+            let v = r.next_f64_range(-2.0, 3.0);
+            assert!((-2.0..3.0).contains(&v));
+        }
+    }
+
+    /// The 53-bit unit path yields values genuinely finer than f32 could
+    /// represent (proving f64 generation is not silently going through f32):
+    /// at least one draw in a wide sample differs from its own f32 round-trip.
+    #[test]
+    fn f64_uses_full_precision() {
+        let mut r = SplitMix64::new(0xF64);
+        let any_finer = (0..2000).any(|_| {
+            let v = r.next_f64_range(0.0, 1.0);
+            v != (v as f32) as f64
+        });
+        assert!(any_finer, "f64 draws should exceed f32 precision");
     }
 }

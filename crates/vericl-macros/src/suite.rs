@@ -46,6 +46,7 @@ enum SuiteField {
     Seed(Expr),
     CubeDim(Expr),
     Prove(Expr),
+    FrontendIndependent(Expr),
     ExtraLane { cfg_predicate: TokenStream2, path: Path },
 }
 
@@ -71,6 +72,7 @@ impl Parse for SuiteField {
             "seed" => Ok(SuiteField::Seed(input.parse()?)),
             "cube_dim" => Ok(SuiteField::CubeDim(input.parse()?)),
             "prove" => Ok(SuiteField::Prove(input.parse()?)),
+            "frontend_independent" => Ok(SuiteField::FrontendIndependent(input.parse()?)),
             "extra_lane" => {
                 let content;
                 syn::parenthesized!(content in input);
@@ -100,7 +102,7 @@ impl Parse for SuiteField {
                 name.span(),
                 format!(
                     "unknown `suite!` field `{other}`; expected one of: runtime, kernels, \
-                     evidence, sizes, seed, cube_dim, prove, extra_lane"
+                     evidence, sizes, seed, cube_dim, prove, frontend_independent, extra_lane"
                 ),
             )),
         }
@@ -123,6 +125,17 @@ struct SuiteSpec {
     seed: Expr,
     cube_dim: Expr,
     prove: Expr,
+    /// Whether this suite's primary runtime is a front-end-independent
+    /// execution lane relative to the macro-derived twin. `true` (default) for
+    /// a GPU backend like wgpu — a genuinely different codegen path — where the
+    /// entry's trusted list records `GPU_HARDWARE_TRUST`. `false` for a lane
+    /// that shares CubeCL's front end AND is the only execution lane (the f64
+    /// case: WGSL has no f64, so cubecl-cpu is the sole honest backend); then
+    /// the trusted list swaps in `HOST_HARDWARE_TRUST` + the explicit
+    /// `shared_frontend_lane_trust` caveat, so evidence never implies an
+    /// independent execution lane exists where there is none — only the twin is
+    /// independent.
+    frontend_independent: Expr,
     extra_lane: Option<(TokenStream2, Path)>,
 }
 
@@ -141,6 +154,7 @@ fn build_spec(fields: Punctuated<SuiteField, Token![,]>) -> syn::Result<SuiteSpe
     let mut seed: Option<Expr> = None;
     let mut cube_dim: Option<Expr> = None;
     let mut prove: Option<Expr> = None;
+    let mut frontend_independent: Option<Expr> = None;
     let mut extra_lane: Option<(TokenStream2, Path)> = None;
 
     let dup = |field: &str| -> syn::Error {
@@ -191,6 +205,12 @@ fn build_spec(fields: Punctuated<SuiteField, Token![,]>) -> syn::Result<SuiteSpe
                 }
                 prove = Some(p);
             }
+            SuiteField::FrontendIndependent(p) => {
+                if frontend_independent.is_some() {
+                    return Err(dup("frontend_independent"));
+                }
+                frontend_independent = Some(p);
+            }
             SuiteField::ExtraLane { cfg_predicate, path } => {
                 if extra_lane.is_some() {
                     return Err(dup("extra_lane"));
@@ -219,6 +239,7 @@ fn build_spec(fields: Punctuated<SuiteField, Token![,]>) -> syn::Result<SuiteSpe
         seed: seed.unwrap_or_else(|| syn::parse_quote!(0xE901u64)),
         cube_dim: cube_dim.unwrap_or_else(|| syn::parse_quote!(256u32)),
         prove: prove.unwrap_or_else(|| syn::parse_quote!(true)),
+        frontend_independent: frontend_independent.unwrap_or_else(|| syn::parse_quote!(true)),
         extra_lane,
     })
 }
@@ -287,7 +308,16 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
 
             let mut __trusted = ::vericl::reference_twin_trust();
             __trusted.push(::vericl::backend_buffer_trust(&__vericl_backend));
-            __trusted.push(::vericl::GPU_HARDWARE_TRUST.to_string());
+            if __vericl_frontend_independent {
+                __trusted.push(::vericl::GPU_HARDWARE_TRUST.to_string());
+            } else {
+                // Non-independent primary lane (the f64 / cubecl-cpu case): the
+                // only execution backend shares CubeCL's front end with the
+                // kernel under test, so evidence must NOT imply an independent
+                // execution lane exists. "GPU hardware" is also a misnomer here.
+                __trusted.push(::vericl::HOST_HARDWARE_TRUST.to_string());
+                __trusted.push(::vericl::shared_frontend_lane_trust(&__vericl_backend));
+            }
             let mut __identity = #kmod::identity();
             let mut __claims: ::std::vec::Vec<::vericl::Claim> = ::std::vec::Vec::new();
 
@@ -612,6 +642,7 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
     let seed_expr = &spec.seed;
     let cube_dim_expr = &spec.cube_dim;
     let prove_expr = &spec.prove;
+    let frontend_independent_expr = &spec.frontend_independent;
 
     let kernel_blocks: Vec<TokenStream2> = spec.kernels.iter().map(kernel_block).collect();
 
@@ -663,6 +694,7 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
                 None
             };
 
+            let __vericl_frontend_independent: bool = #frontend_independent_expr;
             let __vericl_seed: u64 = #seed_expr;
             let __vericl_cube_dim: u32 = #cube_dim_expr;
             let __vericl_sizes: &[usize] = &[ #(#sizes_exprs),* ];

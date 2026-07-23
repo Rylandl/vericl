@@ -23,6 +23,15 @@ pub enum Compare {
     /// does. The bound is part of the contract and must be justified by the
     /// `assumes(...)` clauses.
     AbsRelF32 { abs: f32, rel: f32 },
+    /// f64 counterpart of [`Compare::MaxUlpF32`] — maximum permitted ULP
+    /// distance between f64 results. The macro emits this (rather than the
+    /// f32 variant) for an f64 kernel; see the `NumKind::F64` handling in
+    /// `vericl-macros`.
+    MaxUlpF64(u32),
+    /// f64 counterpart of [`Compare::AbsRelF32`]. Tolerances are stored at f64
+    /// precision (an f64 tolerance rounded to f32 would be a dishonest record
+    /// of a bound the author declared for an f64 kernel).
+    AbsRelF64 { abs: f64, rel: f64 },
 }
 
 impl Compare {
@@ -32,6 +41,10 @@ impl Compare {
             Compare::MaxUlpF32(n) => format!("f32 max_ulp={n}"),
             Compare::AbsRelF32 { abs, rel } => {
                 format!("f32 |e-a| <= {abs:e} + {rel:e}*|e|")
+            }
+            Compare::MaxUlpF64(n) => format!("f64 max_ulp={n}"),
+            Compare::AbsRelF64 { abs, rel } => {
+                format!("f64 |e-a| <= {abs:e} + {rel:e}*|e|")
             }
         }
     }

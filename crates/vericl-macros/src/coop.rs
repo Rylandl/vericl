@@ -962,6 +962,9 @@ pub(crate) fn build_conformance_items(
                     Some(NumKind::F32) => {
                         quote!(::vericl::compare_f32_with(contract().compare, &#ref_name, &#gpu_name))
                     }
+                    Some(NumKind::F64) => {
+                        quote!(::vericl::compare_f64_with(contract().compare, &#ref_name, &#gpu_name))
+                    }
                     Some(NumKind::U32) => {
                         quote!(::vericl::compare_u32_with(contract().compare, &#ref_name, &#gpu_name))
                     }
@@ -969,8 +972,9 @@ pub(crate) fn build_conformance_items(
                         return Err(syn::Error::new(
                             elem.span(),
                             format!(
-                                "cooperative conformance_case v0 only compares f32 or u32 `&mut \
-                                 Array` partials; `{name}: &mut Array<{}>` is outside that set",
+                                "cooperative conformance_case v0 only compares f32, f64, or u32 \
+                                 `&mut Array` partials; `{name}: &mut Array<{}>` is outside that \
+                                 set",
                                 quote!(#elem)
                             ),
                         ));

@@ -442,10 +442,9 @@ caught deterministically.
    Identity; upstream conversation with tracel-ai; standalone `vericl check` CLI (README CI story
    row); array-value-dependent indices (offset tables / gather) via quantified assumes
    (docs/dogfood-2026-07.md Tier-2 gap #3, still open); a `FLOAT_METHOD_CONST_ONLY` distinction
-   if a dogfooded kernel needs a runtime `new`/`from_int`; an `f64` instantiation tier if a
-   dogfooded kernel ever needs one (see roadmap item 8's "one concrete type per helper" note —
-   today only `f32` is supported anywhere in vericl v0, so this is purely hypothetical debt, not
-   a known gap).
+   if a dogfooded kernel needs a runtime `new`/`from_int`. [The `f64` instantiation tier this line
+   previously listed as hypothetical debt is now DONE — see roadmap item 11 below; the production
+   codebase validates at f64 on cubecl-cpu, which drove it.]
 8. [DONE 2026-07-22] Kernel composition — `#[vericl::helper]` + a kernel-side `uses(...)` clause
    (roadmap item 3 per docs/dogfood-2026-07.md, the last Tier-1 macro gate, unblocking 16/22
    dogfooded kernels). Design: `#[vericl::helper(instantiate(...), uses(...))]` on a non-launch
@@ -926,3 +925,84 @@ caught deterministically.
     no `VERICL_UPDATE`/regeneration was needed); `conform demo-defects` exits 0, output unchanged
     (all bounds/race/differential defects still caught; neither defective kernel uses a paren
     compound-assign or a declared reference).
+
+11. [DONE 2026-07-23] **f64 support** — the `f64` instantiation tier (roadmap item 7's former
+    "hypothetical debt"), driven by the real demand that the private production codebase validates
+    at f64 on cubecl-cpu (docs/dogfood-2026-07.md). f64 is an instantiate *tier*, not a new subset —
+    `wrapping` stays integer-only, and the bounds/race provers, composition, and cooperative paths
+    are untouched.
+
+    **Critical platform finding (verified empirically FIRST, since it shapes everything).** WGSL has
+    no f64. cubecl 0.10 launching an f64 kernel on `WgpuRuntime` is **not** a compile error and
+    **not** a runtime panic — it silently returns **wrong** results (not an f32 demotion: genuine
+    garbage — a probe's worst element was 526.99 where the correct f64 value is 1776.99; the host
+    uploads 8-byte f64 into a buffer WGSL indexes at a different element size). This silent-corruption
+    landmine is exactly the failure class the project exists to catch, so it is pinned by a test
+    (`tests/f64_wgpu_unsound.rs`, asserting the f64 kernel *diverges* from its correct twin on wgpu)
+    and wgpu is never an f64 lane. cubecl-cpu runs f64 correctly at full precision (probe:
+    `max_abs_diff = 0`, distinct from the f32-demoted value at 17 sig figs). **Design consequence:**
+    an f64 kernel has NO front-end-independent execution lane on this machine (wgpu broken, cubecl-cpu
+    shares CubeCL's front end), so the macro-derived twin is the *sole* independent leg — its
+    independence is load-bearing. Recorded honestly in the f64 evidence trusted list
+    (`host CPU execution hardware` + the explicit shared-front-end caveat) via a new
+    `frontend_independent: false` suite declaration; README "f64 support" states it loudly.
+
+    **Core compare** (`crates/vericl/src/compare.rs`): `ulp_distance_f64` (i128 ordered-map,
+    saturating to u64), `compare_f64` (max_ulp), `compare_f64_absrel`, `compare_f64_with` (dispatch)
+    — mirror the f32 impls including NaN-always-fails and the `inf - inf` edge; f32 unit tests ported
+    to f64 (`ulp_basics_f64`, `compare_reports_f64`, `absrel_f64_nan_and_inf_edges`).
+    **`Compare`** (`contract.rs`) gained `MaxUlpF64(u32)` / `AbsRelF64 { abs: f64, rel: f64 }` (f64
+    tolerances stored at f64 precision, described `f64 …`) — additive, so all existing f32/integer
+    evidence is byte-identical. **rng** (`rng.rs`): `next_f64_range`/`fill_f64` via the 53-bit path
+    (`>> 11`, `/ 2^53`), the f64 analog of the 24-bit f32 path; `f64_uses_full_precision` proves the
+    draws exceed f32.
+
+    **Macro** (`vericl-macros`): `NumKind::F64` + `NumKind::is_float()`; f64 draw codegen
+    (`next_f64_range`/`fill_f64`); the mandatory-range-for-floats rule and all gen/compare error
+    messages extended to f64; compare dispatch (lib.rs + coop.rs) adds `NumKind::F64 ->
+    compare_f64_with`. The `Compare` VALUE is precision-aware: `parse_contract` keeps building the
+    f32/default tokens verbatim (so non-f64 kernels are byte-identical) and additionally records a
+    precision-agnostic `CompareMode`; `expand` computes the compared `&mut Array` outputs' float kind
+    and, only for an f64 kernel, rebuilds the tokens via `compare_tokens_f64` (a kernel mixing f32 and
+    f64 outputs is rejected — one compare mode can't serve two precisions). `instantiate(F = f64)`
+    needed no resolver change (`f64` parses as a concrete type token-wise).
+
+    **Whitelist re-verified on f64, not assumed** (`tests/float_method_whitelist_f64.rs`): every
+    `FLOAT_METHOD_WHITELIST` entry is host-callable + numerically correct on `f64`, and every
+    `FLOAT_METHOD_REJECT` entry panics on `f64` — identical to the f32 result, so a single shared
+    whitelist stays correct (NO per-type split needed). Same reason: inherent-method preference for a
+    concrete `f64` receiver, and real per-type `f64` impls for the associated fns.
+
+    **Example + suite**: `axpy_f64` (byte-for-byte `axpy` with `instantiate(F = f64)`,
+    `compare(abs = 1e-12)` justified from the ranges) in `crates/vericl-examples/src/lib.rs`, plus lib
+    tests (`axpy_f64_twin_is_full_precision`, `axpy_f64_compare_is_recorded_as_f64`,
+    `axpy_f64_kernel_definition_is_provably_in_bounds` — 3 obligations, same as f32). Suite wiring: a
+    SECOND `suite!` invocation (`tests/conformance_f64.rs`, runtime `cubecl::cpu::CpuRuntime`,
+    `evidence/vericl_f64.json`, `frontend_independent: false`, `#[cfg(feature = "cpu")]`) — the
+    conformance.rs + cooperative_fallback.rs "one suite, one manifest" precedent, honoring M6's
+    two-`#[test]`s-must-not-share-one-evidence-file constraint. `axpy_f64` carries `tested`
+    (differential, cpu) + `proved` `smt-oob-freedom` (3 obligations). New `suite!` field
+    `frontend_independent` (default `true` = unchanged for every existing suite; `false` swaps
+    `GPU_HARDWARE_TRUST` for `HOST_HARDWARE_TRUST` + `shared_frontend_lane_trust` on the primary lane).
+
+    **Private dogfood** (`vericl-dogfood`, never committed; reported by construct class only): the
+    production `synth_freqshift_cw` pure-cos/sin shape — whose Substrate validation story IS f64-based
+    (`substrate-kernels/tests/cubecl_cpu_f64_proof.rs`: cos/sin bit-exact to host libm at f64 on
+    cubecl-cpu) — annotated `instantiate(F = f64)` as `synth_freqshift_cw_kernel_f64` (identical body
+    to the existing f32 clean-room kernel; only the pinned type changed). `tests/f64_cpu.rs` (new
+    `cpu` feature) validates three ways: (1) differential on cubecl-cpu vs the f64 twin passes across
+    sizes; (2) bounds PROVED with declared comptime-implied lengths (4 obligations); (3) the twin is
+    **bit-exact** to host libm f64 cos/sin — the production expectation — closing the loop kernel(cpu)
+    == twin == host libm f64. No new subset wall surfaced; `instantiate(...)` monomorphized cleanly at
+    f64.
+
+    Verification: `cargo test --workspace` (default/wgpu) green — `evidence/vericl.json` verified
+    UNCHANGED (byte-identical `git diff` empty; f64 added no kernels to it, and the compare-token
+    rebuild fires only for f64 kernels); `cargo test -p vericl-examples --features cpu` green
+    (conformance.rs's cpu extra-lane + conformance_f64.rs both pass); `cargo clippy --workspace
+    --all-targets` and `--features cpu` both zero warnings (forced fresh, not cached). Counts: vericl
+    core 25 (+f64 compare/rng tests), vericl-examples lib 50 (+3 axpy_f64), integration adds
+    `float_method_whitelist_f64` (2), `f64_wgpu_unsound` (1), `conformance_f64` (1, cpu-only).
+    `VERICL_UPDATE=1` was run LAST and ONLY on the new `conformance_f64` test binary (the sole
+    evidence that changed), leaving `vericl.json`/`cooperative_fallback.json` untouched, per the
+    staleness-guard lesson.
