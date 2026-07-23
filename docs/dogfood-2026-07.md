@@ -68,3 +68,20 @@ guard. Unreachable today (all users also hit other gates) but now banned explici
 4. Prover: div/mod index modeling (cheap), loop-carry refinement, then value-dependent
    indices via quantified assumes.
 5. Shared-memory reduction shape — last, hardest, and the gateway to race-freedom proofs.
+
+## Addendum (late July 2026, post div/mod + composition milestones)
+
+- **Implicit-invariant finding on a real kernel**: once div/mod indices became modelable, a
+  production flat-index-decode kernel's bounds went from unanalyzable to *refuted* — with a
+  genuine counterexample (an empty parameter table admits an OOB read). The kernel's in-bounds
+  behavior had always depended on caller-side buffer-sizing discipline that nothing in the
+  kernel declared. With the invariant stated as contract assumes (`table.len() == <comptime
+  count>`), the proof discharges. Exactly the charter's "boundary behavior can be implicit"
+  failure class, surfaced on real code by a subset expansion.
+- **Composition validated with zero adaptations**: a production inner-loop kernel + its FIR
+  helper ran unchanged through helper/uses annotation — differential pass on wgpu, bounds
+  Proved (54 obligations) with obligations walked inside the composed helper body. The
+  predicted "usize runtime param" wall did not surface.
+- New residual: tuple-destructuring of a helper call's return (`let (a, b) = helper(...)`)
+  works in launch-kernel twins but not yet in device-fn-calling-device-fn twins
+  (`Pat::Tuple` unsupported at that site) — queued.
