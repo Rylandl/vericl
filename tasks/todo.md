@@ -1330,3 +1330,18 @@ caught deterministically.
     prover_subset, shmem_probe/min/conformance/reduce_rssi); `dogfood-rejects` still fails `cargo
     build` by design (compile-fail fixtures, unaffected by a prover-runtime change). All five rounds'
     regression tests green.
+
+## Round-6 adversarial review (2026-07-23) — CLEAN
+
+Verdict: MERGE-READY, no confirmed or suspected soundness defect — the second clean round
+(rounds 1,2,4,5 each found one critical; round 3 clean). All four v1.1 surfaces held under
+attack with real machinery: terminate modeling (eager bounds fire before not_cond — a
+pre-terminate unguarded store Refutes; wider-than-len terminate bound Refutes; uniformity
+verified before assertion so rejection never pollutes context), comptime baking (pinned
+values confirmed identical across IR/twin/launch from one source; load-bearing bound flips
+Proved/Refuted exactly at the boundary), helper rejection (recursive token scan caught
+every evasion: aliasing, parens, nesting), and the barrier-count lane check (None-path
+audited — unreachable from evidence-producing flows; rejection-only so cannot false-Prove).
+Known benign asymmetry recorded: a global-array-read terminate condition is genuinely
+uniform and the twin accepts it, while the prover taints the read and goes OutOfSubset —
+suite degrades to the labeled assumed-race-freedom tier, never a false Proved.
