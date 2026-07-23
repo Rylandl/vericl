@@ -824,3 +824,105 @@ caught deterministically.
    fails to compile with the targeted collision error (was a silent wrong twin); the ground-truth
    GPU probe (`probe3_ground_truth`, real 4-thread wgpu/Metal dispatch) independently confirms the
    underlying OOB write the manifestation-2/3 kernels' pre-fix `Proved` verdict was wrong about.
+
+10. [DONE 2026-07-23] Adversarial soundness review round 3 (cooperative/shared-memory periphery) —
+    DONE. **Verdict: no false-`Proved` this round** — the reviewer's 17-kernel battery produced no
+    wrong verdict on any *core* surface; both findings are on the periphery (a macro-level
+    definedness ban and identity bookkeeping), neither a prover soundness hole. Both fixed and
+    regression-tested here, same posture as rounds 1–2 (every fix closes a demonstrated hole; the
+    reviewer's scratch shapes reproduced against the pre-fix build and re-run against the fixed one,
+    scratch not committed — path in the verification report).
+
+    **Surfaces the review probed that held without changes needed** (17-kernel battery, cooperative
+    and non-cooperative): barrier-uniformity taint — a `sync_cube()` under a thread-varying `if
+    tid < half` and a barrier inside a thread-varying-trip-count loop both stay `OutOfSubset` with
+    the barrier-divergence reason (round-2 risk 2 analog, held); the two-thread shared-memory race
+    walker — `block_sum_reduce`/`grid_stride_reduce` still `Proved` race-free with unchanged
+    obligation counts, and `block_sum_reduce_racy`'s overlapping `tile[tid]+=tile[tid+1]` stride
+    still `Refuted` with a two-thread counterexample; the tainted shared/global **index** discipline
+    — a gather-tainted or otherwise unmodelled index at a shared/global access is `OutOfSubset` at
+    the access site, never `Proved` and never silently modelled; shared-tile **definedness** — the
+    poison twin still fires on a never-written cell rather than masking it as 0.0 (the property F1
+    hardens); `CUBE_DIM` pinning — the `cooperative(cube_dim = N)`↔launch assertion still refuses a
+    mismatched block size; the round-1/2 fixes re-probed under cooperative bodies (branch-scoped
+    write taint, `instantiate(...)` namespace-collision rejection, the `uses(...)` rewrite/rejection)
+    all held; and the §6 honesty coupling — a cooperative differential with neither a race-freedom
+    proof nor the injected `assumed` clause is still *refused*, not recorded.
+
+    **Design-intended residual the reviewer confirmed (not a bug):** a genuinely racy cooperative
+    kernel whose racy access rides a **tainted** index (one the two-thread walker cannot prove
+    disjoint) does not get a false `Proved` race-freedom claim — it falls to the labeled fallback
+    tier (`OutOfSubset` on the proof + the differential carrying the explicit `assumed`
+    "intra-phase race freedom" clause, or refusal), exactly the §5.3/§6 posture. The gap is
+    *documented and labeled*, never a silent green — the reviewer confirmed the tier boundary holds.
+
+    **F1 (MEDIUM) — paren-evasion of the shared-tile compound-assignment poison ban
+    (`crates/vericl-macros/src/coop.rs`).** `SharedCompoundAssignCheck` classified a compound-assign
+    target only as `Expr::Index { expr: Expr::Path }`, so `(tile)[tid] += 1.0` (a parenthesised
+    index base) slipped past the ban that keeps a read-modify-write out of the shared-memory subset
+    (§4.5). The twin's poison `SharedTile` then read the never-written cell as its `Default` (`0.0`)
+    — green on Metal (which zero-inits), but the kernel is UB on a non-zeroing backend, the exact
+    definedness-masking §9 risk 3 warns about, hidden behind a passing differential. Fix: peel
+    `Expr::Paren`/`Expr::Group` (new `unwrap_paren_group`, mirroring `expr_is_pure_alias`'s existing
+    Paren/Group recursion, coop.rs) at *both* LHS levels — the whole target (`(tile[tid]) += …`) and
+    the index base (`(tile)[tid] += …`). The reviewer's exact paren kernel is now rejected with the
+    unchanged poison-ban wording. Tests (`coop::tests`): `paren_compound_assign_into_shared_tile_is_
+    rejected` (the exact evasion), `nested_paren_..._is_rejected` (`((tile))[i]` and `(tile[i])`
+    both peeled), `bare_..._is_rejected` (positive control, pre-existing behaviour). All four fail
+    against the pre-fix matcher and pass after (confirmed by temporary in-place revert).
+
+    **F1 audit — the same paren-evasion pattern everywhere the macros classify an expression by
+    shape** (the reviewer asked for a sweep, not a point fix): (1) **`UsesRewriteFold` callee
+    detection** (`crates/vericl-macros/src/lib.rs`) — **was vulnerable**: `(helper)(x)` matched
+    neither the `Expr::Path` rewrite-to-`_vericl_ref` nor the unlisted-callee rejection, so a
+    parenthesised helper call silently called the original `#[cube]` item host-side (invisible to a
+    black-box differential, exactly the round-2 multi-segment bypass class). Fixed by peeling the
+    callee (`peel_paren_group`) before classifying; tests `uses_rewrite_fold_rewrites_parenthesised_
+    helper_call` (`((self::triple::<F>))(x)` → bare `triple_vericl_ref(x)`) and `..._rejects_
+    parenthesised_unlisted_call`, both failing pre-fix. (2) **`check_instantiate_local_collisions` /
+    `single_ident_string`** — **not vulnerable**: the type-value side is gated to `Expr::Path` only
+    by `resolve_instantiate` (a parenthesised `instantiate(F = (f32))` is rejected upstream before
+    reaching the classifier), and the local-name side uses `visit_pat_ident`, which already recurses
+    through `Pat::Paren`/`Pat::Tuple`. (3) **`WrappingFold` LHS handling** — **not vulnerable**: it
+    keys on the `Expr::Binary` op and rewrites the whole `#left` wholesale (no index-vs-path shape
+    classification), and folds children post-order, so `(x) += y` / `(x += y)` are handled without a
+    shape gate to evade. (4) **the pure-alias check `expr_is_pure_alias`** — **already recursive**
+    (Paren/Group arms, coop.rs) — it is the reference the fix mirrors.
+
+    **F2 (LOW-MEDIUM) — declared-reference identity did not cover the reference body
+    (`crates/vericl-macros/src/lib.rs`).** A kernel's `SOURCE_HASH` covers its own tokens + the
+    contract attribute tokens; the `reference = <path>` clause put only the reference's *path text*
+    in those tokens, never its body — so drifting the referenced fn's body left the kernel's recorded
+    identity byte-identical (demonstrated on `block_sum_reduce_declared`), contradicting §4.4's
+    promise that the reference fn's own source hash is recorded. Fix: a new `#[vericl::reference]`
+    attribute for the plain host fn used as a declared reference — it derives no twin and no
+    `#[cube]` machinery (it *is* the reference); it generates a sibling `<name>_vericl` module
+    holding the fn's own `SOURCE_HASH` (over its tokens), plus a sibling accessor
+    `<name>_vericl_reference_source_hash()`. The kernel's `reference = fn` clause now folds that hash
+    into `identity()` via the same `vericl::combine_source_hash` runtime path `uses(...)` uses, so a
+    reference-**body** drift moves the kernel's recorded identity. The clause **requires** the
+    annotation: it calls the sibling accessor, so an un-annotated reference fails to compile at the
+    `reference = …` clause span with `cannot find function \`<name>_vericl_reference_source_hash\``
+    (naming the attribute requirement, no misleading `cargo add` help — the reason the accessor is a
+    sibling, not nested in the module). `block_sum_declared_ref` now carries `#[vericl::reference]`.
+    Regression test `crates/vericl-examples/src/lib.rs::declared_reference_body_is_part_of_kernel_
+    identity` (structural: `identity()` folds in exactly the reference's hash, and the derived-twin
+    sibling `block_sum_reduce` stays a pass-through — the fold is scoped to declared references); the
+    inverted probe (edit the reference body → the real kernel's identity moves `dec33577…` →
+    `07e8bd42…`) and the annotation-missing error were demonstrated in scratch (see verification
+    report). Macro-level tests (`vericl-macros`): `reference_macro_generates_source_hash_module_and_
+    accessor`, `reference_macro_hash_tracks_the_body`, `reference_macro_rejects_cube_fn`,
+    `reference_macro_rejects_arguments`. Design §4.4 status note + README declared-reference
+    paragraph updated.
+
+    Verification: full workspace green (`cargo test --workspace` — vericl 20, vericl-examples lib 47
+    + integration 7 [conformance 1, cooperative 3, cooperative_fallback 1, float_method_whitelist 2],
+    vericl-ir 46, vericl-macros 15; vericl-macros +6 and vericl-examples lib +1 over round-2 counts);
+    `-p vericl-examples --features cpu` identical pass count; `cargo clippy --workspace --all-targets`
+    and `-p vericl-examples --features cpu --all-targets` both zero warnings; `evidence/vericl.json`
+    and `evidence/cooperative_fallback.json` byte-identical (`git diff` empty — F1 changes only
+    macro-time *rejection*, F2 only the identity fold of a NON-suite-wired kernel; `block_sum_reduce`,
+    the one suite-wired cooperative kernel, declares no `reference` so its identity is unchanged, so
+    no `VERICL_UPDATE`/regeneration was needed); `conform demo-defects` exits 0, output unchanged
+    (all bounds/race/differential defects still caught; neither defective kernel uses a paren
+    compound-assign or a declared reference).

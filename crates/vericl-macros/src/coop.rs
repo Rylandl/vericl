@@ -117,10 +117,33 @@ impl<'ast> Visit<'ast> for BoundCollector {
     }
 }
 
+/// Peel `Expr::Paren`/`Expr::Group` wrappers to reach the underlying
+/// expression, mirroring the Paren/Group recursion in [`expr_is_pure_alias`].
+/// Every place that classifies an expression by its *shape* must peel first,
+/// or a parenthesis silently changes the classification: `(tile)[tid]` is the
+/// same place-expression as `tile[tid]`, and `(tile[tid]) OP= …` the same
+/// compound assignment as `tile[tid] OP= …`. `Expr::Group` is the invisible
+/// delimiter syn/proc-macro insert around interpolated fragments — same
+/// treatment for the same reason.
+fn unwrap_paren_group(e: &Expr) -> &Expr {
+    match e {
+        Expr::Paren(pe) => unwrap_paren_group(&pe.expr),
+        Expr::Group(g) => unwrap_paren_group(&g.expr),
+        other => other,
+    }
+}
+
 /// Detects a compound assignment (`x[..] += y`, etc.) whose target is an index
 /// into a shared tile — the read-modify-write that would bypass poison
 /// checking. syn 2.0 lowers `a += b` to `Expr::Binary` with a compound-assign
 /// `BinOp` (same shape `WrappingFold` keys on).
+///
+/// The LHS is classified through [`unwrap_paren_group`] at *both* levels — the
+/// whole target (`(tile[tid]) += …`) and the index base (`(tile)[tid] += …`) —
+/// so a parenthesis cannot smuggle the read-modify-write past this ban (round-3
+/// adversarial review F1: `(tile)[tid] += 1.0` evaded the pre-fix
+/// `Expr::Index{expr: Expr::Path}`-only match, and the poison twin then read
+/// the unwritten cell as `0.0`).
 struct SharedCompoundAssignCheck<'a> {
     shared: &'a HashSet<String>,
     hit: Option<String>,
@@ -143,8 +166,8 @@ impl<'a, 'ast> Visit<'ast> for SharedCompoundAssignCheck<'a> {
                 | ShrAssign(_)
         );
         if is_compound {
-            if let Expr::Index(idx) = i.left.as_ref() {
-                if let Expr::Path(p) = idx.expr.as_ref() {
+            if let Expr::Index(idx) = unwrap_paren_group(i.left.as_ref()) {
+                if let Expr::Path(p) = unwrap_paren_group(idx.expr.as_ref()) {
                     if let Some(id) = p.path.get_ident() {
                         if self.shared.contains(&id.to_string()) && self.hit.is_none() {
                             self.hit = Some(id.to_string());
@@ -1036,4 +1059,60 @@ pub(crate) fn build_conformance_items(
         #generate_case_fn
         #conformance_case_fn
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `analyse` over a minimal cooperative body and assert it is rejected
+    /// with the shared-tile compound-assignment poison-ban wording (§4.5).
+    fn assert_compound_assign_rejected(src: &str) {
+        let block: syn::Block = syn::parse_str(src).expect("valid block");
+        let Err(err) = analyse(&block, &[], "paren_demo") else {
+            panic!("compound-assign into a shared tile must be rejected: {src}");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compound assignment") && msg.contains("poison"),
+            "expected the poison-ban wording, got: {msg}"
+        );
+    }
+
+    /// The bare `tile[i] += …` read-modify-write into a shared tile is banned
+    /// (positive control for the check itself — pre-existing behaviour).
+    #[test]
+    fn bare_compound_assign_into_shared_tile_is_rejected() {
+        assert_compound_assign_rejected(
+            "{ let mut tile = SharedMemory::<f32>::new(256usize); \
+               tile[0usize] += 1.0f32; sync_cube(); }",
+        );
+    }
+
+    /// Round-3 adversarial review F1, the reviewer's exact evasion: a
+    /// *parenthesised* index base — `(tile)[tid] += …` — must be rejected with
+    /// the identical poison-ban wording. Pre-fix it slipped past the
+    /// `Expr::Index{expr: Expr::Path}`-only match and the poison twin then read
+    /// the never-written cell as `0.0` (green-but-UB on a non-zeroing backend).
+    #[test]
+    fn paren_compound_assign_into_shared_tile_is_rejected() {
+        assert_compound_assign_rejected(
+            "{ let mut tile = SharedMemory::<f32>::new(256usize); \
+               (tile)[0usize] += 1.0f32; sync_cube(); }",
+        );
+    }
+
+    /// The same evasion nested deeper (`((tile))[i] += …`) and with the paren
+    /// around the whole target (`(tile[i]) += …`) — both peeled at both levels.
+    #[test]
+    fn nested_paren_compound_assign_into_shared_tile_is_rejected() {
+        assert_compound_assign_rejected(
+            "{ let mut tile = SharedMemory::<f32>::new(256usize); \
+               ((tile))[0usize] += 1.0f32; sync_cube(); }",
+        );
+        assert_compound_assign_rejected(
+            "{ let mut tile = SharedMemory::<f32>::new(256usize); \
+               (tile[0usize]) += 1.0f32; sync_cube(); }",
+        );
+    }
 }

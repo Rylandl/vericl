@@ -377,7 +377,11 @@ proved claim rather than faking one). A green cooperative test can never silentl
 thing that makes it valid is always a named, visible dependency. A hand-written reference supplied
 via `reference = fn` (for a kernel the transform cannot derive) carries a distinct, strictly weaker
 `differential-declared-reference` check string, since it is a separate artifact that can drift from
-the kernel — never conflated with the derived twin.
+the kernel — never conflated with the derived twin. That reference fn must carry the
+`#[vericl::reference]` attribute (a compile error names it otherwise); the attribute records the
+reference's own source hash, which the kernel folds into its `identity()`, so a drift in the
+reference **body** — not just the `reference = fn` clause path text — moves the kernel's recorded
+identity (round-3 adversarial review, F2).
 
 ### CubeCL semantics findings
 

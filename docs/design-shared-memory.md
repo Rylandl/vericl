@@ -317,6 +317,18 @@ The claim taxonomy must never blur them (§6): the `check` string differs
 (`differential-derived-twin` vs `differential-declared-reference`), and the declared-reference
 variant records the reference fn's own source hash so its drift is at least visible in identity.
 
+> **Status (round-3 adversarial review, F2 — implemented):** the reference fn's source hash is now
+> recorded as promised. The `reference = fn` clause **requires** that fn to carry the new
+> `#[vericl::reference]` attribute, which generates a sibling `<fn>_vericl` module holding the
+> reference's own `SOURCE_HASH` (over its tokens). The kernel folds that hash into `identity()` via
+> the same `vericl::combine_source_hash` runtime path `uses(...)` uses, so a drift in the reference
+> **body** — not merely the clause path text carried in the attribute tokens — moves the kernel's
+> recorded identity (`crates/vericl-macros/src/lib.rs::expand_reference`; regression test
+> `block_sum_reduce_declared`/`declared_reference_body_is_part_of_kernel_identity`). Before F2 the
+> clause folded in *nothing*, so `SOURCE_HASH` saw only the reference's *path text* and a body drift
+> left identity byte-identical. A `reference = fn` naming an un-annotated fn is a compile error at
+> the clause span, naming the missing `#[vericl::reference]` accessor.
+
 **#3 is a complement, not a rival.** It keeps custody *honest* (an explicit "we did not derive
 this") for kernels #1/#2 can't reach, instead of stretching the phase-split transform past where it
 is sound. Recommendation: ship #1/#2 as the primary path and #3 as the fallback, gated so a kernel

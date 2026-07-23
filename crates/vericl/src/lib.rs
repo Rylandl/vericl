@@ -41,7 +41,7 @@ pub use trust::{
     GPU_HARDWARE_TRUST, backend_buffer_trust, proved_bounds_trust, proved_race_freedom_trust,
     reference_twin_trust, shared_frontend_lane_trust,
 };
-pub use vericl_macros::{helper, kernel, suite};
+pub use vericl_macros::{helper, kernel, reference, suite};
 
 /// VeriCL version, recorded in every identity and manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

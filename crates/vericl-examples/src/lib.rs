@@ -646,6 +646,13 @@ pub fn block_sum_reduce_racy(input: &Array<f32>, output: &mut Array<f32>) {
 /// phase-split transform did not derive, for a cooperative kernel outside the
 /// transformable subset. Signature matches the cooperative twin's:
 /// `(inputs..., outputs..., cube_count, cube_dim)`.
+///
+/// `#[vericl::reference]` records this fn's own `SOURCE_HASH` (over its tokens)
+/// in a sibling `block_sum_declared_ref_vericl` module, which the kernel below
+/// folds into its `identity()` — so a drift in THIS body moves the kernel's
+/// recorded identity (round-3 adversarial review F2). The annotation is
+/// required by the `reference = …` clause.
+#[vericl::reference]
 pub fn block_sum_declared_ref(input: &[f32], output: &mut [f32], cube_count: usize, cube_dim: usize) {
     for (c, slot) in output.iter_mut().enumerate().take(cube_count) {
         let mut tile = vec![0.0f32; cube_dim];
@@ -1636,5 +1643,49 @@ mod tests {
                 assert_eq!(got[c].to_bits(), derived[c].to_bits(), "n={n} cube {c}");
             }
         }
+    }
+
+    /// Round-3 adversarial review F2 (inverted probe): a declared-reference
+    /// kernel's *recorded* identity now folds in the `#[vericl::reference]`
+    /// fn's own `SOURCE_HASH`, so a drift in the reference BODY moves the
+    /// kernel's identity — the exact leak the reviewer found (identity stayed
+    /// byte-identical because `SOURCE_HASH` only ever saw the `reference =
+    /// <path>` clause text, never the referenced body). Verified structurally,
+    /// by reproducing the combine independently (same posture as the
+    /// `uses(...)` composition-identity tests above): `identity()` provably
+    /// folds in exactly `block_sum_declared_ref_vericl::identity_hash()`, which
+    /// is that reference's own `SOURCE_HASH`. An actual body-edit-moves-the-hash
+    /// run was additionally done by hand (scratch, not committed — see the
+    /// verification report). The derived-twin sibling `block_sum_reduce` (no
+    /// `reference = …`) stays a pass-through, so the fold is scoped to declared
+    /// references only.
+    #[test]
+    fn declared_reference_body_is_part_of_kernel_identity() {
+        // The reference module composes nothing — its identity_hash is exactly
+        // its own SOURCE_HASH.
+        assert_eq!(
+            block_sum_declared_ref_vericl::identity_hash(),
+            block_sum_declared_ref_vericl::SOURCE_HASH,
+        );
+        const { assert!(block_sum_declared_ref_vericl::IS_VERICL_REFERENCE) };
+
+        // The kernel's recorded identity is NOT its own SOURCE_HASH: the
+        // reference's hash is genuinely folded in (so a reference-body drift
+        // moves it), and by exactly `combine_source_hash(SOURCE_HASH, [ref])`.
+        let recorded = block_sum_reduce_declared_vericl::identity().source_hash;
+        assert_ne!(recorded, block_sum_reduce_declared_vericl::SOURCE_HASH);
+        let expected = vericl::combine_source_hash(
+            block_sum_reduce_declared_vericl::SOURCE_HASH,
+            &[block_sum_declared_ref_vericl::identity_hash()],
+        );
+        assert_eq!(recorded, expected);
+
+        // The derived-twin sibling declares no `reference = …`, so its recorded
+        // identity is an exact pass-through of its own SOURCE_HASH — the fold is
+        // scoped to declared-reference kernels only.
+        assert_eq!(
+            block_sum_reduce_vericl::identity().source_hash,
+            block_sum_reduce_vericl::SOURCE_HASH,
+        );
     }
 }

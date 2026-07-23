@@ -1093,8 +1093,33 @@ struct UsesRewriteFold<'a> {
     errors: Vec<syn::Error>,
 }
 
+/// Peel `Expr::Paren`/`Expr::Group` wrappers, returning the innermost
+/// expression by value. A parenthesised callee `(helper)(x)` is the same call
+/// as `helper(x)`; classifying it by shape without peeling first lets it slip
+/// past both the helper rewrite and the unlisted-callee rejection in
+/// [`UsesRewriteFold`] (round-3 adversarial review F1 — the same bypass class
+/// as the round-2 multi-segment finding). Mirrors `coop::expr_is_pure_alias`'s
+/// Paren/Group recursion. Dropping the parens is semantically identity for the
+/// derived twin.
+fn peel_paren_group(mut e: Expr) -> Expr {
+    loop {
+        match e {
+            Expr::Paren(p) => e = *p.expr,
+            Expr::Group(g) => e = *g.expr,
+            other => return other,
+        }
+    }
+}
+
 impl Fold for UsesRewriteFold<'_> {
     fn fold_expr_call(&mut self, mut i: ExprCall) -> ExprCall {
+        // Peel redundant parens/groups around the callee so a parenthesised
+        // helper call `(helper)(x)` classifies exactly like `helper(x)` — see
+        // `peel_paren_group`'s doc. A no-op for the overwhelmingly common bare
+        // `helper(x)` (leaves its tokens byte-identical).
+        let func = std::mem::replace(&mut i.func, Box::new(Expr::Verbatim(TokenStream2::new())));
+        i.func = Box::new(peel_paren_group(*func));
+
         if let Expr::Path(p) = i.func.as_mut() {
             if p.path.leading_colon.is_none() && p.path.segments.len() == 1 {
                 // Rewrite the ident in place, preserving whatever turbofish
@@ -1820,6 +1845,28 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     let used_helper_mods: Vec<Ident> =
         used_names.iter().map(|n| format_ident!("{}_vericl", n)).collect();
 
+    // --- identity() source-hash dependencies: every uses(...)-listed helper's
+    // composition-aware hash, plus — for a declared-reference kernel (§4.4) —
+    // the `#[vericl::reference]` fn's own SOURCE_HASH. Folding the reference's
+    // hash in is what makes the reference *body* (not merely the `reference =
+    // <path>` clause text already in the attr tokens) part of the kernel's
+    // recorded identity, so a reference-body edit moves it (round-3 review F2).
+    // Calling `<ref>_vericl_reference_source_hash()` also *requires* the
+    // reference fn to carry `#[vericl::reference]`: without the annotation that
+    // sibling accessor does not exist, and the kernel fails to compile pointing
+    // at the `reference = …` clause with a `cannot find function` error that
+    // names the missing attribute (a cooperative kernel rejects uses(...), so
+    // the reference is a declared-reference kernel's only source-hash
+    // dependency).
+    let mut identity_dep_exprs: Vec<TokenStream2> = used_helper_mods
+        .iter()
+        .map(|m| quote!(#m::identity_hash_at(1)))
+        .collect();
+    if let Some((_, ref_path)) = &spec.reference {
+        let ref_accessor = reference_accessor_path(ref_path);
+        identity_dep_exprs.push(quote!(#ref_accessor()));
+    }
+
     // --- generated signatures ---
     let mod_name = Ident::new(&format!("{fn_name}_vericl"), fn_name.span());
     let vis = &func.vis;
@@ -2121,8 +2168,14 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             /// helper's own `identity_hash()` — so identity goes stale when
             /// a used helper's body changes, even though `SOURCE_HASH` above
             /// (this kernel's own source tokens only) can't see that change
-            /// at macro-expansion time. A no-op wrapper (returns exactly
-            /// `contract().identity()`) when `USES` is empty. Depth-guarded
+            /// at macro-expansion time. For a declared-reference kernel
+            /// (`reference = fn`, §4.4) the `#[vericl::reference]` fn's own
+            /// `SOURCE_HASH` is folded in the same way, so a drift in the
+            /// reference *body* (not just the clause path text the attribute
+            /// tokens already cover) moves identity too (round-3 review F2).
+            /// A no-op wrapper (returns exactly
+            /// `contract().identity()`) when `USES` is empty and no reference
+            /// is declared. Depth-guarded
             /// (`::vericl::check_helper_composition_depth`) against a
             /// helper-composition cycle that slipped past vericl-macros'
             /// best-effort compile-time check — see that check's doc.
@@ -2143,7 +2196,7 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 let mut __vericl_id = contract().identity();
                 __vericl_id.source_hash = ::vericl::combine_source_hash(
                     SOURCE_HASH,
-                    &[#(#used_helper_mods::identity_hash_at(1)),*],
+                    &[#(#identity_dep_exprs),*],
                 );
                 __vericl_id
             }
@@ -2234,6 +2287,42 @@ pub fn helper(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
 
     match expand_helper(attr2, &func) {
+        Ok(generated) => {
+            let mut out = func.to_token_stream();
+            out.extend(generated);
+            out.into()
+        }
+        Err(e) => {
+            let mut out = func.to_token_stream();
+            out.extend(e.to_compile_error());
+            out.into()
+        }
+    }
+}
+
+/// `#[vericl::reference]` — placed above a plain host function used as a
+/// cooperative kernel's author-supplied declared reference (candidate #3,
+/// docs/design-shared-memory.md §4.4). Unlike `#[vericl::helper]`/
+/// `#[vericl::kernel]` it derives **nothing** — no twin, no `#[cube]`
+/// machinery, no launch/conformance glue: the annotated function already *is*
+/// the sequential reference. Its sole job is to record the reference's own
+/// `SOURCE_HASH` (over its source tokens) in a sibling `<name>_vericl` module,
+/// so a kernel that declares `reference = <name>` can fold that hash into its
+/// `identity()` (via `::vericl::combine_source_hash`, the same runtime
+/// mechanism `uses(...)` uses).
+///
+/// This closes round-3 adversarial review F2: without it a kernel's
+/// `SOURCE_HASH` covers only the *path text* of the `reference = …` clause (in
+/// the attribute tokens), never the referenced fn's body — so drifting the
+/// reference body left the kernel's recorded identity byte-identical, exactly
+/// the silent-drift the design (§4.4) promises identity catches. Requiring the
+/// annotation makes the reference's body a first-class input to identity.
+#[proc_macro_attribute]
+pub fn reference(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr2: TokenStream2 = attr.into();
+    let func = parse_macro_input!(item as ItemFn);
+
+    match expand_reference(attr2, &func) {
         Ok(generated) => {
             let mut out = func.to_token_stream();
             out.extend(generated);
@@ -2596,6 +2685,131 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
                     &[#(#used_helper_mods::identity_hash_at(depth + 1)),*],
                 )
             }
+        }
+    })
+}
+
+/// The suffix `#[vericl::reference]` appends to the fn ident for the sibling
+/// accessor fn a kernel's `reference = …` fold calls (see
+/// `reference_accessor_path`). A *sibling-scope* item (not one nested in the
+/// `<name>_vericl` module) so that a missing annotation yields a single, clean
+/// `cannot find function \`<name>_vericl_reference_source_hash\`` error — which
+/// names the `vericl::reference` requirement — instead of the module-resolution
+/// error's misleading `cargo add <name>_vericl` help.
+const REFERENCE_ACCESSOR_SUFFIX: &str = "_vericl_reference_source_hash";
+
+/// Derive the sibling accessor path a kernel's `reference = <path>` clause
+/// calls from the clause path: append [`REFERENCE_ACCESSOR_SUFFIX`] to the
+/// final segment and drop any turbofish, so `block_sum_declared_ref` ->
+/// `block_sum_declared_ref_vericl_reference_source_hash` and `foo::bar` ->
+/// `foo::bar_vericl_reference_source_hash`.
+fn reference_accessor_path(p: &Path) -> Path {
+    let mut mp = p.clone();
+    if let Some(last) = mp.segments.last_mut() {
+        last.ident =
+            Ident::new(&format!("{}{REFERENCE_ACCESSOR_SUFFIX}", last.ident), last.ident.span());
+        last.arguments = syn::PathArguments::None;
+    }
+    mp
+}
+
+/// Expand `#[vericl::reference]` (docs/design-shared-memory.md §4.4): re-emit
+/// the host fn untouched (done by the caller) and generate a sibling
+/// `<name>_vericl` module recording the fn's own `SOURCE_HASH`. No twin, no
+/// contract, no launch machinery — the annotated fn *is* the reference.
+fn expand_reference(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
+    let fn_name = &func.sig.ident;
+    let fn_name_str = fn_name.to_string();
+
+    // The attribute takes no arguments — a declared reference carries no
+    // contract of its own (it is compared against the kernel, not launched).
+    if !attr.is_empty() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "#[vericl::reference] on `{fn_name_str}` takes no arguments — it only records the \
+                 fn's source hash for a kernel's `reference = …` identity (docs/design-shared-\
+                 memory.md §4.4); it derives no twin and has no contract clauses"
+            ),
+        ));
+    }
+
+    // A declared reference is a *plain host fn*, deliberately NOT a #[cube]
+    // device fn — the whole point of candidate #3 is a separate hand-written
+    // artifact, not kernel-derived source. Reject a #[cube]/#[cube(launch)] fn
+    // here (that is what #[vericl::helper]/#[vericl::kernel] are for).
+    for a in &func.attrs {
+        if a.path().is_ident("cube") {
+            return Err(syn::Error::new(
+                a.span(),
+                format!(
+                    "`{fn_name_str}` is #[cube] — #[vericl::reference] is for a plain host \
+                     function used as a cooperative kernel's author-supplied declared reference \
+                     (docs/design-shared-memory.md §4.4); a #[cube] device fn is a \
+                     #[vericl::helper], and a launchable kernel is a #[vericl::kernel]"
+                ),
+            ));
+        }
+    }
+
+    // SOURCE_HASH over the fn's own tokens + the vericl version — the identical
+    // recipe as a kernel/helper's own local hash, minus the contract tokens (a
+    // reference has none). This is the byte the kernel's identity() folds in,
+    // so an edit to the reference body moves the kernel's recorded identity.
+    let mut hasher = Sha256::new();
+    hasher.update(func.to_token_stream().to_string().as_bytes());
+    hasher.update(b"||vericl:");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    let hash = format!("sha256:{:x}", hasher.finalize());
+
+    let mod_name = Ident::new(&format!("{fn_name}_vericl"), fn_name.span());
+    let accessor_name =
+        Ident::new(&format!("{fn_name}{REFERENCE_ACCESSOR_SUFFIX}"), fn_name.span());
+    let vis = &func.vis;
+
+    let doc = format!(
+        "VeriCL declared-reference identity metadata for `{fn_name_str}` (docs/design-shared-\
+         memory.md §4.4). This module carries only the fn's own `SOURCE_HASH`; a cooperative \
+         kernel declaring `reference = {fn_name_str}` folds `identity_hash()` into its own \
+         `identity()`, so editing this reference's body moves the kernel's recorded identity."
+    );
+    let accessor_doc = format!(
+        "The byte a kernel's `reference = {fn_name_str}` clause folds into `identity()` — this \
+         reference's own `SOURCE_HASH`. A sibling of `{fn_name_str}` (not nested in \
+         `{fn_name_str}_vericl`) on purpose: a kernel that names a `reference = …` fn lacking \
+         `#[vericl::reference]` then fails with `cannot find function \
+         `{fn_name_str}{REFERENCE_ACCESSOR_SUFFIX}`` at the clause, naming the missing attribute, \
+         rather than a module-resolution error suggesting `cargo add`."
+    );
+
+    Ok(quote! {
+        #[doc = #doc]
+        #[allow(non_snake_case, clippy::all)]
+        #vis mod #mod_name {
+            use super::*;
+
+            /// Source hash of this declared reference's own tokens — the byte a
+            /// kernel's `reference = …` clause folds into its identity.
+            pub const SOURCE_HASH: &str = #hash;
+
+            /// Marker distinguishing a `#[vericl::reference]` module from a
+            /// `#[vericl::helper]`/`#[vericl::kernel]` one of the same name.
+            pub const IS_VERICL_REFERENCE: bool = true;
+
+            /// This reference's identity hash — just its own `SOURCE_HASH` (a
+            /// declared reference composes nothing), exposed under the same name
+            /// as a helper's `identity_hash()` so a kernel folds it in the
+            /// identical way (`::vericl::combine_source_hash`).
+            pub fn identity_hash() -> ::std::string::String {
+                ::std::string::String::from(SOURCE_HASH)
+            }
+        }
+
+        #[doc = #accessor_doc]
+        #[doc(hidden)]
+        #[allow(non_snake_case, clippy::all)]
+        #vis fn #accessor_name() -> ::std::string::String {
+            #mod_name::identity_hash()
         }
     })
 }
@@ -3167,6 +3381,45 @@ mod tests {
         );
     }
 
+    /// Round-3 adversarial review F1 (paren-evasion audit): a *parenthesised*
+    /// callee `(triple)(x)` must classify exactly like the bare `triple(x)` —
+    /// rewritten to `triple_vericl_ref(x)`. Pre-fix the `Expr::Path` match saw
+    /// `Expr::Paren` instead and skipped both the rewrite and the rejection,
+    /// silently calling the original `#[cube]` helper host-side (invisible to a
+    /// black-box differential check, exactly like the round-2 multi-segment
+    /// bypass).
+    #[test]
+    fn uses_rewrite_fold_rewrites_parenthesised_helper_call() {
+        let uses: HashSet<String> = ["triple".to_string()].into_iter().collect();
+        let locals: HashSet<String> = HashSet::new();
+        let mut fold = UsesRewriteFold { uses: &uses, locals: &locals, errors: Vec::new() };
+        // Doubly-parenthesised, plus a turbofish, plus a `self::` prefix inside
+        // the parens — every wrapper must peel and the prefix drop.
+        let expr: Expr = syn::parse_str("((self::triple::<F>))(x)").expect("valid expr");
+        let rewritten = fold.fold_expr(expr);
+        assert!(fold.errors.is_empty(), "unexpected errors: {:?}", fold.errors);
+
+        let Expr::Call(call) = &rewritten else { panic!("expected a call expression") };
+        let Expr::Path(p) = call.func.as_ref() else { panic!("expected a bare path callee") };
+        assert_eq!(p.path.segments.len(), 1, "parens + `self::` prefix must be gone");
+        assert_eq!(p.path.segments[0].ident, "triple_vericl_ref");
+        assert!(matches!(p.path.segments[0].arguments, syn::PathArguments::None));
+    }
+
+    /// The other half: a parenthesised call to an *unlisted* callee that is
+    /// neither a local nor a known host-safe free fn must still be REJECTED
+    /// (pre-fix the paren wrapper let it slip past the rejection too).
+    #[test]
+    fn uses_rewrite_fold_rejects_parenthesised_unlisted_call() {
+        let uses: HashSet<String> = HashSet::new();
+        let locals: HashSet<String> = HashSet::new();
+        let mut fold = UsesRewriteFold { uses: &uses, locals: &locals, errors: Vec::new() };
+        let expr: Expr = syn::parse_str("(mystery_helper)(x)").expect("valid expr");
+        let _ = fold.fold_expr(expr);
+        assert_eq!(fold.errors.len(), 1, "a parenthesised unlisted call must be rejected");
+        assert!(fold.errors[0].to_string().contains("mystery_helper"));
+    }
+
     /// A multi-segment call whose last segment does NOT match a declared
     /// helper (the `Type::method` shape, e.g. `f32::max`) is left
     /// byte-for-byte untouched — the documented residual, not silently
@@ -3250,5 +3503,69 @@ mod tests {
             "demo",
         )
         .expect("empty subst must never reject anything");
+    }
+
+    // -----------------------------------------------------------------
+    // Round-3 adversarial review F2: `#[vericl::reference]` records a
+    // declared reference's own SOURCE_HASH so a kernel folds the reference
+    // *body* (not just the clause path text) into identity().
+    // -----------------------------------------------------------------
+
+    /// `#[vericl::reference]` generates the `<name>_vericl` SOURCE_HASH module
+    /// and the sibling `<name>_vericl_reference_source_hash` accessor a kernel's
+    /// `reference = …` fold calls.
+    #[test]
+    fn reference_macro_generates_source_hash_module_and_accessor() {
+        let func: ItemFn =
+            syn::parse_str("pub fn my_ref(x: &[f32], y: &mut [f32], c: usize, d: usize) {}")
+                .expect("valid fn");
+        let toks = expand_reference(TokenStream2::new(), &func)
+            .expect("plain host fn must be accepted")
+            .to_string();
+        assert!(toks.contains("mod my_ref_vericl"), "missing module: {toks}");
+        assert!(toks.contains("SOURCE_HASH"), "missing SOURCE_HASH: {toks}");
+        assert!(toks.contains("IS_VERICL_REFERENCE"), "missing marker: {toks}");
+        assert!(
+            toks.contains("fn my_ref_vericl_reference_source_hash"),
+            "missing sibling accessor: {toks}"
+        );
+    }
+
+    /// The recorded hash covers the fn body: two references differing only in
+    /// their body get different `SOURCE_HASH`es — the drift the kernel's
+    /// identity now folds in (pre-fix the kernel never saw the body at all).
+    #[test]
+    fn reference_macro_hash_tracks_the_body() {
+        let a: ItemFn =
+            syn::parse_str("pub fn r(x: &[f32], y: &mut [f32]) { y[0] = x[0]; }").expect("fn a");
+        let b: ItemFn =
+            syn::parse_str("pub fn r(x: &[f32], y: &mut [f32]) { y[0] = x[0] + 0.0; }")
+                .expect("fn b");
+        let ta = expand_reference(TokenStream2::new(), &a).unwrap().to_string();
+        let tb = expand_reference(TokenStream2::new(), &b).unwrap().to_string();
+        // Extract the sha256 literal each emits; they must differ.
+        let grab = |s: &str| -> String {
+            let i = s.find("sha256:").expect("a hash");
+            s[i..i + 71].to_string() // "sha256:" + 64 hex
+        };
+        assert_ne!(grab(&ta), grab(&tb), "a reference-body edit must move its SOURCE_HASH");
+    }
+
+    /// A `#[cube]` device fn is rejected — a declared reference is a *plain
+    /// host* fn (that is what `#[vericl::helper]`/`#[vericl::kernel]` are for).
+    #[test]
+    fn reference_macro_rejects_cube_fn() {
+        let func: ItemFn = syn::parse_str("#[cube] pub fn r(x: &[f32]) {}").expect("valid fn");
+        let err = expand_reference(TokenStream2::new(), &func).expect_err("cube fn rejected");
+        assert!(err.to_string().contains("#[cube]"), "unexpected: {}", err);
+    }
+
+    /// The attribute takes no arguments — a declared reference has no contract.
+    #[test]
+    fn reference_macro_rejects_arguments() {
+        let func: ItemFn = syn::parse_str("pub fn r(x: &[f32]) {}").expect("valid fn");
+        let err = expand_reference(quote::quote!(compare(max_ulp = 0)), &func)
+            .expect_err("args rejected");
+        assert!(err.to_string().contains("takes no arguments"), "unexpected: {}", err);
     }
 }
