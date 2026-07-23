@@ -455,6 +455,20 @@ pub fn self_path_gain_kernel<F: Float + CubeElement>(x: &Array<F>, y: &mut Array
 /// N output buffers generically, so this needed no new machinery either.
 /// Wired into `vericl::suite!`: the composed kernel carrying tested + proved
 /// claims the milestone asks for.
+///
+/// The guard is `ABSOLUTE_POS < x.len() && ABSOLUTE_POS + 1 < x.len()` — BOTH
+/// conjuncts, deliberately. The single `ABSOLUTE_POS + 1 < x.len()` this kernel
+/// carried before the overflow-soundness milestone silently relied on `+ 1` not
+/// wrapping to also cover the `x[ABSOLUTE_POS]` read (`pos + 1 < len ⟹ pos <
+/// len` holds only when `pos + 1` does not overflow — i.e. at every reachable
+/// dispatch, but NOT at the adversarial `pos == u32::MAX`, where `pos + 1`
+/// wraps to `0`, the guard passes, and `x[pos]` is out of bounds). Once the
+/// prover models `u32` wraparound faithfully (crates/vericl-ir's
+/// "Bounded-integer overflow model"), that latent reliance is exposed as a
+/// `Refuted` on the `x[ABSOLUTE_POS]` read at `pos == u32::MAX`. Stating both
+/// conjuncts makes the two reads each provable from their own guard and
+/// excludes the wrap point — the honest strengthening (safe at every reachable
+/// dispatch either way; see the README "Overflow soundness" note).
 #[vericl::kernel(
     assumes(x.len() == sum_out.len(), x.len() == diff_out.len()),
     compare(abs = 1e-5),
@@ -469,7 +483,7 @@ pub fn fir_pair_kernel<F: Float + CubeElement>(
     diff_out: &mut Array<F>,
     gain: F,
 ) {
-    if ABSOLUTE_POS + 1 < x.len() {
+    if ABSOLUTE_POS < x.len() && ABSOLUTE_POS + 1 < x.len() {
         let s_d: (F, F) = fir_pair_scaled::<F>(x[ABSOLUTE_POS], x[ABSOLUTE_POS + 1], gain);
         sum_out[ABSOLUTE_POS] = s_d.0;
         diff_out[ABSOLUTE_POS] = s_d.1;
@@ -479,11 +493,15 @@ pub fn fir_pair_kernel<F: Float + CubeElement>(
 /// Prover-composition positive control (docs/dogfood-2026-07.md-style, not
 /// wired into `vericl::suite!` — mirrors the `stepped_loop_*` precedent
 /// below of a kernel that exists purely to pin a prover finding, not to
-/// carry evidence): the guard `ABSOLUTE_POS + 1 < x.len()` covers BOTH
-/// reads `tap_pair`'s own body performs (`x[idx]`, `x[idx + 1]`) even
-/// though those accesses live inside the composed helper, not here. Must
-/// discharge `Proved` — see
-/// `tap_pair_guarded_kernel_kernel_definition_is_provably_in_bounds` below.
+/// carry evidence): the guard `ABSOLUTE_POS < x.len() && ABSOLUTE_POS + 1 <
+/// x.len()` covers BOTH reads `tap_pair`'s own body performs (`x[idx]`,
+/// `x[idx + 1]`) even though those accesses live inside the composed helper,
+/// not here. Both conjuncts are stated for the same reason `fir_pair_kernel`
+/// (above) states them: under the faithful `u32` overflow model a lone
+/// `ABSOLUTE_POS + 1 < x.len()` no longer implies `ABSOLUTE_POS < x.len()` at
+/// the adversarial `pos == u32::MAX` wrap point (where the helper's own
+/// `x[idx]` read would be out of bounds). Must discharge `Proved` — see
+/// `tap_pair_guarded_kernel_definition_is_provably_in_bounds` below.
 #[vericl::kernel(
     assumes(x.len() == y.len()),
     compare(abs = 1e-5),
@@ -493,7 +511,7 @@ pub fn fir_pair_kernel<F: Float + CubeElement>(
 )]
 #[cube(launch)]
 pub fn tap_pair_guarded_kernel<F: Float + CubeElement>(x: &Array<F>, y: &mut Array<F>) {
-    if ABSOLUTE_POS + 1 < x.len() {
+    if ABSOLUTE_POS < x.len() && ABSOLUTE_POS + 1 < x.len() {
         y[ABSOLUTE_POS] = tap_pair::<F>(x, ABSOLUTE_POS);
     }
 }

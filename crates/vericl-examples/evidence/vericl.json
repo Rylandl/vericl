@@ -388,9 +388,9 @@
     {
       "kernel": "fir_pair_kernel",
       "identity": {
-        "source_hash": "sha256:bc1b1bc409c9cf9e9f495916f8df9e4066146816b1b72b9eff64378c5fc7f792",
+        "source_hash": "sha256:d099ae669107fd2e7f56383ad104e13cb6282a0c8453453a6ccd49ef0d6c662c",
         "vericl_version": "0.1.0",
-        "ir_hash": "sha256:0e7bd13e0c849ea8ffc778b4fb94fc79a0b29927e441d075894c237e8ec86c0c"
+        "ir_hash": "sha256:bf44f0be329a4bde5321a57b9ae251dbc2f21bfb3885470eb6b02616302d7010"
       },
       "contract": {
         "assumes": [

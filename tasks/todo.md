@@ -430,20 +430,21 @@ caught deterministically.
    comptime loop bound, caller-supplied grid width — and the predicted fma tolerance finding; see
    `docs/dogfood-2026-07.md` shared-memory addendum, and `vericl-dogfood`). Resolves the README
    "open decision" on ordering: race-freedom is the gateway and is now delivered.
-7. Later: QF_BV wrapping model in the prover — needed for, among other things, the
-   unbounded-overflow-feeding-div/mod gap found in the round-2 adversarial review (roadmap item 9
-   below): a divisor provably nonzero in unbounded QF_LIA can still wrap to exactly zero via `u32`
-   overflow (e.g. `a * b == 2^32`), which the current div/mod side-obligation does not model.
-   Currently **known-inert on wgpu/Metal specifically** because naga's division-by-zero fallback
-   is dividend-preserving rather than trapping (`a / 0 == a`, `a % 0 == 0` — confirmed empirically,
-   see README "CubeCL semantics findings"), so the resulting index is wrong but not itself a crash
-   on today's one supported backend; not something to rely on in general, and the first concrete
-   motivation for this item rather than a purely speculative one. Also: fold cubecl version into
-   Identity; upstream conversation with tracel-ai; standalone `vericl check` CLI (README CI story
-   row); a `FLOAT_METHOD_CONST_ONLY` distinction
-   if a dogfooded kernel needs a runtime `new`/`from_int`. [The `f64` instantiation tier this line
-   previously listed as hypothetical debt is now DONE — see roadmap item 11 below; the production
-   codebase validates at f64 on cubecl-cpu, which drove it.]
+7. Later: prover follow-ups. [The unbounded-integer-overflow gap this line led with — a divisor
+   provably nonzero in unbounded QF_LIA that wraps to exactly zero via `u32` overflow (`a * b ==
+   2^32`), and the wider class of a wrapped value feeding any index/guard/loop-bound — is now
+   DONE; see roadmap item 14 below. It was closed WITHOUT the full QF_BV rewrite, via a faithful
+   finite-width model in QF_LIA (design decision + rationale in item 14 and the prover's
+   "Bounded-integer overflow model" module doc), so the div/mod gap is no longer "known-inert on
+   naga"; it taints, `OutOfSubset`.] Remaining: fold cubecl version into Identity; upstream
+   conversation with tracel-ai; standalone `vericl check` CLI (README CI story row); a
+   `FLOAT_METHOD_CONST_ONLY` distinction if a dogfooded kernel needs a runtime `new`/`from_int`.
+   [The `f64` instantiation tier this line previously listed as hypothetical debt is DONE — see
+   roadmap item 11; the production codebase validates at f64 on cubecl-cpu, which drove it.]
+   [A *full* QF_BV model is no longer on the critical path after item 14, but remains a possible
+   future precision upgrade — it would model `Mul` wraparound exactly (item 14 taints a possibly-
+   wrapping `Mul` rather than modeling `(a*b) mod 2^W`, which is QF_NIA-hard in the current
+   encoding) instead of conservatively.]
 8. [DONE 2026-07-22] Kernel composition — `#[vericl::helper]` + a kernel-side `uses(...)` clause
    (roadmap item 3 per docs/dogfood-2026-07.md, the last Tier-1 macro gate, unblocking 16/22
    dogfooded kernels). Design: `#[vericl::helper(instantiate(...), uses(...))]` on a non-launch
@@ -1136,3 +1137,97 @@ caught deterministically.
     differential defects still caught — `gather_oob` still `Refuted` with the element symbol at the
     boundary, its `(*v as usize) < 16` clause still recognized). Reviewer's scratch repro reproduced
     against the pre-fix build and confirmed string-only + non-provable after; scratch not committed.
+
+14. [DONE 2026-07-23] **Unbounded-integer overflow gap** — the "known-inert-on-naga" item (roadmap
+    item 7): the prover modeled integers in unbounded QF_LIA, so `divisor = a * b` guarded by
+    `a >= 1 && b >= 1` proved nonzero while real `u32` multiplication wraps `65536 * 65536 == 2^32`
+    to exactly `0`; inert only because naga's div-by-zero fallback is dividend-preserving (a backend
+    behavior, not a guarantee). All prover work in `crates/vericl-ir/src/prover.rs`; the full
+    soundness argument + design rationale is that file's new "Bounded-integer overflow model" module
+    doc (this entry summarizes).
+
+    **Design decision — approach (b), a *faithful finite-width model in QF_LIA*, NOT (a) full
+    QF_BV.** (a) would model wraparound for free but rewrite every existing encoding — bounds
+    obligations, the length/element/gather assumes, the two-thread race walk, the cooperative leaves,
+    div/mod — in a file hardened across four adversarial-review rounds, and thread signed-vs-unsigned
+    bitvector-comparison discipline through every comparison: a large, review-hungry rewrite for a
+    ~30-obligation/10-kernel suite that already solves sub-millisecond. (b) preserves every encoding:
+    the change is confined to leaf declaration and the three arithmetic handlers (plus `Cast`).
+    The refinement that makes (b) both sound AND non-disruptive: rather than the naive "taint any
+    arithmetic that might overflow" (which breaks the legitimate guarded `x[pos+1]` pattern, whose
+    wrap is benign because guard and index share the term), make the model **faithful** — every
+    non-tainted modeled integer term equals the real (wrapping) hardware value, or is tainted.
+    (i) Leaves declared in their type range `[type_min, type_max]` (a sound type fact — `usize`/
+    positions/lengths are `u32` per `AddressType::U32`); (ii) `Add`/`Sub` folded back into range by
+    an exact single-wrap `ite` (operands in range ⟹ at most one wrap); (iii) `Mul` carries a
+    no-overflow side-obligation (`(a*b) mod 2^W` is QF_NIA-hard, so bind the plain product only when
+    it provably cannot wrap, else taint — same discipline as div/mod); (iv) `Div`/`Modulo` unchanged
+    but now sound-under-wrap because operands are faithful; (v) `Cast` passes value-preserving casts
+    through, gates narrowing/sign-flip on a fits-in-destination side-obligation. **Consumer
+    enumeration → completeness by invariant:** because every non-tainted term == the real value,
+    EVERY consumer (index/bounds obligation, divisor, branch/loop guard, loop bound, race index,
+    element-assume bound) reads the true value; a possibly-diverging term is tainted and the existing
+    taint discipline already fails at whichever consumer needs it — so no consumer can be reached by
+    a wrapped-but-untainted value, with no per-consumer casework.
+
+    **The round-2 construction flips.** `a * b` divisor (`a,b >= 1`) → `checked_mul`'s side-obligation
+    `a*b <= u32::MAX` fails (`a == b == 65536`) → `a*b` taints → modulo divisor taints → dependent
+    guard `OutOfSubset`, never `Proved` (`prover::tests::mul_overflow_divisor_is_out_of_subset`). The
+    `a + b == 2^32` variant is caught too — faithful `Add` gives the divisor term `0`, so the div
+    nonzero check fails (`add_overflow_divisor_is_out_of_subset`).
+
+    **Verdict changes on the suite (each justified).** `flatten_decode_scale` KEEPS `Proved`
+    (2 obligations, unchanged) with NO assume strengthening — the anticipated "real finding" did not
+    materialize: the leaf bound `ABSOLUTE_POS <= u32::MAX` plus the Euclidean fact `row*width <=
+    ABSOLUTE_POS` discharges the `Mul` no-overflow side-obligation, and `row*width + col == ABSOLUTE_POS`
+    is faithful. `fir_pair_kernel` (suite-wired) DID change: its guard `ABSOLUTE_POS + 1 < x.len()`
+    silently relied on no-wrap to also cover the `x[ABSOLUTE_POS]` read (`pos+1 < len ⟹ pos < len`
+    holds at every reachable dispatch but NOT at `pos == u32::MAX`, where `pos+1` wraps to `0`, the
+    guard passes, and `x[pos]` is OOB — the faithful model `Refuted`s it there). Strengthened to
+    `ABSOLUTE_POS < x.len() && ABSOLUTE_POS + 1 < x.len()` (genuinely more correct; safe at every
+    reachable dispatch either way) → `Proved` again, 4 obligations unchanged. `tap_pair_guarded_kernel`
+    (prover-only control) strengthened identically. Every OTHER suite kernel: counts/verdicts
+    unchanged — `evidence/vericl.json` diff is exactly `fir_pair_kernel`'s two identity hashes
+    (source + IR), obligation count still 4. The `wrapping` rule is explicit and needs no prover code:
+    the `wrapping` clause never reaches the prover (which proves BOUNDS); a wrapped index is still OOB,
+    so a `wrapping` kernel is treated identically (its value arithmetic already taints, its indices
+    stay non-wrapping or become `OutOfSubset`).
+
+    **Tests** (`crates/vericl-ir/src/prover.rs::tests`, +9): the round-2 regression
+    (`mul_overflow_divisor_is_out_of_subset`) + `add_overflow_divisor`; per-consumer negatives —
+    wrapped index (`mul_overflow_index_is_out_of_subset`), wrapped guard-of-different-index
+    (`add_overflow_guard_refutes`, a genuine `Refuted` catching the danger), wrapped loop bound
+    (`wrapped_loop_bound_is_out_of_subset`); positive controls — guard-bounded product proves
+    (`guard_bounded_mul_proves`), the strengthened shifted-read proves
+    (`shifted_read_selfguard_strengthened_proves`) while the lone-guard form `Refuted`s
+    (`shifted_read_selfguard_refutes_at_type_max`, the `fir_pair` finding at the prover level),
+    faithful underflow surfaces the true wrapped index (`sub_underflow_unguarded_refutes`).
+
+    **Solver-time impact: negligible.** The 62 prover unit tests (all pure SMT, no GPU) run in 0.10s
+    vs the pre-change 53 in 0.12s — the added `ite`s and side-obligations are cheap; z3 collapses the
+    wrap `ite` under path facts. No kernel proof approaches a second.
+
+    **Private dogfood spot-check** (Substrate policy: `~/code/substrate` READ ONLY, `~/code/vericl-dogfood`
+    writable-private, construct classes only): reran the production kernels' bounds/race/cooperative
+    proofs against the overflow-model prover. **No production kernel flipped verdict** — the
+    counter-RNG, div/mod-index, offset-table-gather, composition, and cooperative-reduction shapes all
+    keep their prior `Proved`/`OutOfSubset`/`Refuted` verdicts and obligation counts (their
+    divisors/indices are guard-bounded, comptime-pinned, or bare `ABSOLUTE_POS`, so the no-overflow
+    side-obligations discharge and no wrap is reachable; none used an unbounded scalar product as a
+    divisor/index). No new subset wall. Two PRE-EXISTING dogfood-test statenesses surfaced during the
+    rerun, both unrelated to this milestone and confirmed so (one an `ElemsBelow*`-assume match left
+    non-exhaustive since roadmap item 12; one a counter-RNG bounds test still asserting the
+    pre-loop-carry-refinement `OutOfSubset` verdict from roadmap item 5 — verified pre-existing by
+    stashing this milestone's changes and rebuilding, which reproduced the same `Proved{6}`); both
+    corrected in `vericl-dogfood` to the true current verdicts, same precedent as the roadmap-item-8
+    dogfood-staleness note.
+
+    **Verification.** `cargo test --workspace` green (vericl 25, vericl-examples lib 56, vericl-ir 62
+    [+9], vericl-macros 23, integration all pass); `-p vericl-examples --features cpu` green
+    (conformance + f64 + cooperative_fallback + cooperative lanes); `cargo clippy --workspace
+    --all-targets` and `--features cpu` both zero warnings; `conform demo-defects` exits 0, all
+    defects still caught (`axpy_off_by_one`/`gather_oob` `Refuted`, `sum_racy` bounds `Proved`,
+    `block_sum_reduce_racy` race `Refuted`); `evidence/vericl.json` diff is fir_pair_kernel's two
+    identity hashes only, `evidence/vericl_f64.json` + `evidence/cooperative_fallback.json`
+    byte-identical. `VERICL_UPDATE=1` run for `--features cpu` first (verified), then default LAST
+    (committed default shape), per the staleness-guard lesson.

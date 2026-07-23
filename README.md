@@ -419,6 +419,30 @@ range, stated once). A write to `A`'s elements invalidates the assumption for ev
 (a stale constant bound looser than the indexed array) REFUTES with the fresh element symbol pinned at
 the boundary.
 
+**Overflow soundness (finite-width integer semantics).** The bounds proof models integer
+arithmetic *faithfully to hardware wraparound*: every non-tainted modeled integer term equals the
+real (wrapping) `u32`/etc. value at every input, so an index, a div/mod divisor, a branch/loop
+guard, and a loop bound all read the true value — a term that could diverge from hardware is
+tainted instead, and fails explicitly at whichever site needs it. Leaves are declared in their
+type's range (a `u32` really is in `[0, 2^32)`), `Add`/`Sub` are modeled exactly under wraparound,
+and `Mul` carries a no-overflow side-obligation (bind the product only when it provably cannot
+wrap, else taint). This closes the overflow-into-zero-divisor gap the round-2 review found (below):
+a divisor `a * b` that is provably nonzero in unbounded arithmetic but wraps to `65536 * 65536 ==
+2^32 ≡ 0` on hardware now taints — `OutOfSubset`, never `Proved`. A genuinely non-wrapping chain
+still proves: `flatten_decode_scale`'s `row*width + col` proves in bounds because the leaf bound
+`ABSOLUTE_POS <= u32::MAX` plus `row*width <= ABSOLUTE_POS` discharges the no-overflow
+side-obligation, with no assume strengthening needed. The chosen approach keeps the existing QF_LIA
+encodings (bounds, length/element assumes, div/mod, the race walk) intact rather than rewriting to
+QF_BV — the design rationale is in `crates/vericl-ir/src/prover.rs`'s "Bounded-integer overflow
+model" module doc. One honest consequence surfaced on our own suite: `fir_pair_kernel`'s guard
+`ABSOLUTE_POS + 1 < x.len()` silently relied on no-wrap to also cover its `x[ABSOLUTE_POS]` read
+(the implication `pos + 1 < len ⟹ pos < len` holds at every reachable dispatch but not at the
+adversarial `pos == u32::MAX`, where `pos + 1` wraps to `0`); it was strengthened to state `pos <
+x.len() && pos + 1 < x.len()` explicitly (safe at every reachable dispatch either way, and now
+provable). A `wrapping`-clause kernel declares wrap intent for its *values*; its *indices* still may
+not wrap (a wrapped index is still out of bounds), so the prover treats it exactly like any other
+kernel.
+
 The second proved claim is **data-race freedom** (`smt-race-freedom`), for the cooperative
 shared-memory kernels. It is discharged by a GPUVerify-style two-thread symbolic reduction: two
 arbitrary distinct threads `t1 ≠ t2` of one cube are walked, and within each barrier-delimited phase
@@ -472,13 +496,13 @@ see `tasks/todo.md`) that are worth knowing on their own, independent of VeriCL:
   (confirmed empirically: `ABSOLUTE_POS / 0` returns `ABSOLUTE_POS`; `ABSOLUTE_POS % 0` returns
   `0`). One consequence: a divisor that's provably nonzero in unbounded integer arithmetic but
   wraps to exactly zero via `u32` overflow (e.g. `a * b` where `a * b == 2^32`) does not itself
-  crash on this backend — the resulting index is merely wrong, not a hardware fault. VeriCL's
-  div/mod modeling (`crates/vericl-ir/src/prover.rs`'s "Div/mod-derived indices" module doc) proves
-  its nonzero-divisor side-obligation in unbounded QF_LIA, which does not model `u32` wraparound;
-  this overflow-into-zero-divisor shape is accordingly a known, currently out-of-subset gap —
-  harmless specifically *because of* naga's dividend-preserving fallback on today's backend, but
-  not something VeriCL should be relied on to catch in general. Tracked under the `QF_BV`
-  wrapping-model roadmap item (`tasks/todo.md`).
+  crash on this backend — the resulting index is merely wrong, not a hardware fault. This
+  overflow-into-zero-divisor shape *was* a known out-of-subset gap (harmless in practice only
+  because of naga's fallback, never a guarantee to rely on); it is now **closed** by the
+  finite-width overflow model (see "Overflow soundness" above and the prover's "Bounded-integer
+  overflow model" module doc): the `Mul` no-overflow side-obligation fails for `a * b == 2^32`, so
+  the divisor taints and the dependent access is `OutOfSubset` rather than falsely `Proved` — no
+  longer relying on the backend's dividend-preserving behavior.
 
 ## First release
 

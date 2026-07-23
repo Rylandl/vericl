@@ -125,18 +125,94 @@
 //!   already did — a tainted sub-condition taints the whole composed
 //!   condition, resolution failing, explicitly, only at the branch that
 //!   actually needs it (same discipline as everything else in this file).
+//! - **Bounded-integer overflow model (the soundness foundation).** Integer
+//!   values are modeled in QF_LIA (unbounded `Int`), but the encoding is made
+//!   *faithful to finite-width hardware wraparound*: the invariant is that
+//!   **every non-tainted modeled integer term equals the real (wrapping)
+//!   hardware value at every input.** This is what makes every downstream
+//!   consumer sound without a per-consumer case analysis — an index/bounds
+//!   obligation, a div/mod divisor, a branch or loop guard, a loop bound, a
+//!   race index, an element-assume bound all read the *true* value. A term
+//!   that could diverge from hardware is instead tainted, and the existing
+//!   taint discipline already fails, explicitly, at whichever consumer needs
+//!   it. Concretely:
+//!   * **Leaves** (`ABSOLUTE_POS`/`UNIT_POS`/`CUBE_POS`/`CUBE_COUNT`, buffer
+//!     `Length`s, integer `GlobalScalar`s, loop induction vars, element-read
+//!     symbols) are declared *in their type's range* `[type_min, type_max]`
+//!     (`declare_leaf`) — a sound type fact (a `u32` value really is in
+//!     `[0, 2^32)`; positions/lengths are `u32` per `AddressType::U32`). This
+//!     is load-bearing twice over: it lets the no-overflow side-obligations
+//!     below discharge for genuinely-safe arithmetic, and it keeps the
+//!     single-wrap `ite` below exact.
+//!   * **`Add`/`Sub`** are modeled *exactly* under wraparound
+//!     (`wrap_to_range`): the mathematical result is folded back into range
+//!     via `ite(raw > max, raw − 2^W, ite(raw < min, raw + 2^W, raw))`. Since
+//!     both operands are in range, the result is at most one modulus outside
+//!     it in either direction, so a single correction is exact. So `pos + 1`,
+//!     `pos − 1`, `row*w + col` are the true wrapped values — e.g. an
+//!     unguarded `x[pos − 1]` refutes with the real wrapped index `2^32 − 1`
+//!     at `pos == 0`, not a spurious `−1`.
+//!   * **`Mul`** can wrap up to `2^W` times, and `(a*b) mod 2^W` is nonlinear
+//!     (QF_NIA-hard), so instead of a faithful term the product carries a
+//!     no-overflow *side-obligation* `type_min ≤ a*b ≤ type_max` under the
+//!     live path conditions (`checked_mul`, same discipline as div/mod).
+//!     Discharged ⟹ the plain `*` term provably does not wrap and equals the
+//!     real value — bind it. Not discharged ⟹ the product may wrap — taint.
+//!   * **`Div`/`Modulo`** need no output overflow check (`a/b ≤ a`, `a%b < b`
+//!     stay in range for nonnegative operands); their existing nonzero +
+//!     nonnegativity side-obligation is now *sound under wraparound* because
+//!     the divisor term equals its real value.
+//!   * **`Cast` (int→int)** passes a value-preserving cast (widening / equal
+//!     width without a sign reinterpretation, `cast_is_value_preserving`)
+//!     through unchanged; a narrowing or same-width sign-flip cast can
+//!     truncate/reinterpret, so it passes through only when a "fits the
+//!     destination range" side-obligation discharges (`cast_int`) — else
+//!     taint. (Every cast in the current example suite is `u32 as usize`,
+//!     i.e. `u32 → u32`, value-preserving.)
+//!
+//!   The side-obligations (`checked_mul`, `cast_int`) are internal modeling
+//!   preconditions, deliberately *not* counted in `Prover::obligations`.
+//!
+//!   *Why this over full QF_BV (approach (a)).* QF_BV would model wraparound
+//!   for free but rewrite every existing encoding — bounds obligations, the
+//!   length/element/gather assumes, the two-thread race walk, the cooperative
+//!   leaves, div/mod — in a file hardened across four adversarial-review
+//!   rounds, and thread signed-vs-unsigned bitvector-comparison discipline
+//!   through every comparison. Approach (b) here preserves every existing
+//!   encoding: the change is confined to leaf declaration and the three
+//!   arithmetic handlers (plus `Cast`), composes with all the machinery above
+//!   unchanged, and closes exactly the round-2 construction — a `u32` product
+//!   provably nonzero in unbounded LIA (`a,b ≥ 1 ⟹ a*b ≥ 1`) that wraps to
+//!   `65536 * 65536 == 2^32 ≡ 0` on hardware: `checked_mul`'s side-obligation
+//!   fails, the divisor taints, and the dependent access is `OutOfSubset`,
+//!   never `Proved`. The `a + b == 2^32` variant is caught too — faithful
+//!   `Add` gives the divisor term `0`, so the div/mod nonzero check fails.
+//!
+//!   *`wrapping`-clause kernels.* A `wrapping` contract clause declares wrap
+//!   intent for a kernel's **values**; it does not reach the prover (which
+//!   receives only `def`/`buffers`/`assumes`), and it must not, because a
+//!   wrapped **index** is still out of bounds — wrapping an index does not make
+//!   it a valid index. So a `wrapping` kernel is treated identically: its value
+//!   arithmetic is already tainted (array-loaded / bitwise-derived), its
+//!   indices are non-wrapping (or become `OutOfSubset`/`Refuted` if they could
+//!   wrap), exactly like any other kernel.
 //! - **Div/mod-derived indices:** `Arithmetic::Div`/`Arithmetic::Modulo` are
 //!   modeled with SMT-LIB `div`/`mod` (Euclidean division), but only when an
 //!   internal side-obligation — the divisor is nonzero and both operands are
 //!   nonnegative, under the *live* path conditions + assumes — actually
 //!   discharges (`Prover::try_discharge`, checked fresh for every div/mod
-//!   site, not inferred from the operands' IR types: an intermediate
-//!   expression like `a - b` over two `u32` leaves is modeled as plain
-//!   integer subtraction and is not otherwise clamped nonnegative, so the
-//!   nonnegativity half of the side-obligation is a real proof, not a
-//!   type-driven assumption). Euclidean div/mod coincide with Rust's/WGSL's
+//!   site, not inferred from the operands' IR types: a *signed* intermediate
+//!   like an `i32` `a - b` can be genuinely negative, so the nonnegativity
+//!   half of the side-obligation is a real proof, not a type-driven
+//!   assumption). Euclidean div/mod coincide with Rust's/WGSL's
 //!   truncated-toward-zero semantics exactly when both operands are
 //!   nonnegative, which is why that check is required rather than optional.
+//!   (An *unsigned* operand is always nonnegative — a real hardware fact the
+//!   leaf bounds + faithful wraparound below encode, not an assumption — so
+//!   for unsigned div/mod the nonnegativity half discharges trivially and
+//!   correctly; the divisor-nonzero half is the load-bearing check, and it is
+//!   now sound under wraparound because the divisor term equals its real
+//!   hardware value — see the "Bounded-integer overflow model" bullet.)
 //!   If the side-obligation does not discharge (SAT, or an inconclusive
 //!   `unknown`), the result is left tainted — never hard-errored, since the
 //!   value may never feed an obligation — per the same taint discipline as
@@ -338,8 +414,8 @@
 use std::collections::{HashMap, HashSet};
 
 use cubecl::ir::{
-    Arithmetic, Branch, Builtin, Comparison, ConstantValue, Id, Instruction, Loop, Metadata,
-    Operation, Operator, Scope, Synchronization, Type, Variable, VariableKind,
+    Arithmetic, Branch, Builtin, Comparison, ConstantValue, ElemType, Id, Instruction, Loop,
+    Metadata, Operation, Operator, Scope, Synchronization, Type, UIntKind, Variable, VariableKind,
 };
 use cubecl::prelude::KernelDefinition;
 use easy_smt::{Context, ContextBuilder, Response, SExpr};
@@ -918,12 +994,40 @@ impl<'a, 'b> Prover<'a, 'b> {
         Ok(e)
     }
 
+    /// Declare a fresh integer leaf constrained to its type's hardware range
+    /// `[type_min, type_max]` (module docs' "Bounded-integer overflow model").
+    /// This is a *sound type fact* — a `u32` value really is in `[0, 2^32)` —
+    /// and it is load-bearing for the overflow model: it is what lets the
+    /// no-wrap side-obligations of `checked_mul`/`cast_int` discharge for
+    /// genuinely-safe arithmetic (e.g. `flatten_decode_scale`'s `row*w <= pos
+    /// <= u32::MAX`), and what keeps the single-wrap `wrap_to_range` `ite`
+    /// exact (operands in range ⟹ at most one wrap each direction).
+    fn declare_leaf(&mut self, hint: &str, ty: &Type) -> Result<SExpr, Stop> {
+        let e = self.declare_int(hint, is_unsigned(ty))?;
+        let max = self.smt.numeral(type_max(ty));
+        let le = self.smt.lte(e, max);
+        self.smt.assert(le).map_err(smt_err)?;
+        if !is_unsigned(ty) {
+            let min = int_const(self.smt, type_min(ty));
+            let ge = self.smt.gte(e, min);
+            self.smt.assert(ge).map_err(smt_err)?;
+        }
+        Ok(e)
+    }
+
+    /// A synthetic leaf with no IR `Type` of its own (a position/length
+    /// builtin) — modeled at the address-type width (`u32`, see
+    /// `address_type`).
+    fn declare_u32_leaf(&mut self, hint: &str) -> Result<SExpr, Stop> {
+        self.declare_leaf(hint, &address_type())
+    }
+
     fn length_of(&mut self, id: Id) -> Result<SExpr, Stop> {
         if let Some(e) = self.buffer_len.get(&id) {
             return Ok(*e);
         }
         let hint = format!("len_{}_", self.buffer_name(id));
-        let e = self.declare_int(&hint, true)?;
+        let e = self.declare_u32_leaf(&hint)?;
         self.buffer_len.insert(id, e);
         Ok(e)
     }
@@ -1014,24 +1118,24 @@ impl<'a, 'b> Prover<'a, 'b> {
         Ok(sym)
     }
 
-    /// The `CubePos` leaf: a fresh nonnegative (cube-uniform) symbol.
+    /// The `CubePos` leaf: a fresh (cube-uniform) `u32`-range symbol.
     fn cube_pos_sym(&mut self) -> Result<SExpr, Stop> {
         let kind = VariableKind::Builtin(Builtin::CubePos);
         if let Some(Some(e)) = self.memo.get(&kind) {
             return Ok(*e);
         }
-        let sym = self.declare_int("cube_pos", true)?;
+        let sym = self.declare_u32_leaf("cube_pos")?;
         self.memo.insert(kind, Some(sym));
         Ok(sym)
     }
 
-    /// The `CubeCount` leaf: a fresh nonnegative (cube-uniform) symbol.
+    /// The `CubeCount` leaf: a fresh (cube-uniform) `u32`-range symbol.
     fn cube_count_sym(&mut self) -> Result<SExpr, Stop> {
         let kind = VariableKind::Builtin(Builtin::CubeCount);
         if let Some(Some(e)) = self.memo.get(&kind) {
             return Ok(*e);
         }
-        let sym = self.declare_int("cube_count", true)?;
+        let sym = self.declare_u32_leaf("cube_count")?;
         self.memo.insert(kind, Some(sym));
         Ok(sym)
     }
@@ -1043,7 +1147,7 @@ impl<'a, 'b> Prover<'a, 'b> {
     fn builtin_value(&mut self, b: Builtin) -> Option<SExpr> {
         let Some(cube_dim) = self.coop else {
             return match b {
-                Builtin::AbsolutePos => self.declare_int("abs_pos", true).ok(),
+                Builtin::AbsolutePos => self.declare_u32_leaf("abs_pos").ok(),
                 _ => None,
             };
         };
@@ -1153,15 +1257,124 @@ impl<'a, 'b> Prover<'a, 'b> {
             return Ok(());
         }
         let val = match a {
-            Arithmetic::Add(b) => self.binary_int(b, |s, l, r| s.plus(l, r)),
-            Arithmetic::Sub(b) => self.binary_int(b, |s, l, r| s.sub(l, r)),
-            Arithmetic::Mul(b) => self.binary_int(b, |s, l, r| s.times(l, r)),
+            // Add/Sub are modeled *faithfully* under finite-width wraparound
+            // (`wrap_to_range`): the SMT term equals the real hardware value at
+            // every input, wrap included (module docs' "Bounded-integer
+            // overflow model"). Operands are in range (leaf bounds), so at most
+            // one wrap can occur in either direction.
+            Arithmetic::Add(b) => self.wrapping_binary(b, &out.ty, |s, l, r| s.plus(l, r)),
+            Arithmetic::Sub(b) => self.wrapping_binary(b, &out.ty, |s, l, r| s.sub(l, r)),
+            // Mul can wrap up to `2^W` times; `(a*b) mod 2^W` is nonlinear, so
+            // instead of a faithful term we discharge a no-overflow
+            // side-obligation and bind the plain product only when it provably
+            // cannot wrap — else taint. This is the case the round-2 adversarial
+            // review's `a*b == 2^32` divisor construction lands in.
+            Arithmetic::Mul(b) => self.checked_mul(b, &out.ty)?,
             Arithmetic::Div(b) => self.divmod_int(b, |s, l, r| s.div(l, r))?,
             Arithmetic::Modulo(b) => self.divmod_int(b, |s, l, r| s.modulo(l, r))?,
             _ => None,
         };
         self.bind_out(inst, val);
         Ok(())
+    }
+
+    /// Faithful finite-width Add/Sub: resolve both modeled-integer operands,
+    /// apply `f` (`plus`/`sub`) to get the *mathematical* result, then fold it
+    /// back into `[type_min, type_max]` with `wrap_to_range` so the SMT term is
+    /// the exact hardware value at every input. Returns `None` (taint) if an
+    /// operand is not a modeled integer or does not resolve — the same
+    /// discipline as `binary_int`.
+    fn wrapping_binary(
+        &mut self,
+        b: &cubecl::ir::BinaryOperator,
+        out_ty: &Type,
+        f: impl FnOnce(&Context, SExpr, SExpr) -> SExpr,
+    ) -> Option<SExpr> {
+        if !is_modeled_int(&b.lhs.ty) || !is_modeled_int(&b.rhs.ty) {
+            return None;
+        }
+        let l = self.value_of(&b.lhs)?;
+        let r = self.value_of(&b.rhs)?;
+        let raw = f(self.smt, l, r);
+        Some(self.wrap_to_range(raw, out_ty))
+    }
+
+    /// Fold the mathematical result `raw` back into `ty`'s hardware range via
+    /// `ite(raw > max, raw - 2^W, ite(raw < min, raw + 2^W, raw))`. Sound
+    /// (exact) only when `raw` is at most one modulus outside the range in
+    /// either direction, which holds because every operand feeding an Add/Sub
+    /// is itself in range (leaf bounds / prior faithful/tainted results). The
+    /// two `ite` conditions are mutually exclusive, so at most one correction
+    /// applies. See the module docs' "Bounded-integer overflow model".
+    fn wrap_to_range(&mut self, raw: SExpr, ty: &Type) -> SExpr {
+        let max = self.smt.numeral(type_max(ty));
+        let modulus = self.smt.numeral(wrap_modulus(ty));
+        let min = int_const(self.smt, type_min(ty));
+        let over = self.smt.gt(raw, max);
+        let raw_minus_mod = self.smt.sub(raw, modulus);
+        let under = self.smt.lt(raw, min);
+        let raw_plus_mod = self.smt.plus(raw, modulus);
+        let inner = self.smt.ite(under, raw_plus_mod, raw);
+        self.smt.ite(over, raw_minus_mod, inner)
+    }
+
+    /// Model `Arithmetic::Mul` with a no-overflow side-obligation: resolve both
+    /// modeled-integer operands, then try to discharge `type_min <= a*b <=
+    /// type_max` under the *live* path conditions + leaf bounds. Discharged ⟹
+    /// the product provably does not wrap, so the plain SMT `*` term equals the
+    /// real hardware value — bind it. Not discharged (SAT / `unknown`) ⟹ the
+    /// product may wrap, so it is left tainted (`Ok(None)`), exactly like the
+    /// div/mod side-obligation. `Err` only on a genuine solver I/O failure. The
+    /// side-obligation is deliberately *not* counted in `Prover::obligations`
+    /// (it is an internal modeling precondition, not a public bounds check).
+    fn checked_mul(
+        &mut self,
+        b: &cubecl::ir::BinaryOperator,
+        out_ty: &Type,
+    ) -> Result<Option<SExpr>, Stop> {
+        if !is_modeled_int(&b.lhs.ty) || !is_modeled_int(&b.rhs.ty) {
+            return Ok(None);
+        }
+        let (Some(l), Some(r)) = (self.value_of(&b.lhs), self.value_of(&b.rhs)) else {
+            return Ok(None);
+        };
+        let product = self.smt.times(l, r);
+        let max = self.smt.numeral(type_max(out_ty));
+        let le = self.smt.lte(product, max);
+        let min = int_const(self.smt, type_min(out_ty));
+        let ge = self.smt.gte(product, min);
+        let in_range = self.smt.and(ge, le);
+        if !self.try_discharge(in_range)? {
+            return Ok(None);
+        }
+        Ok(Some(product))
+    }
+
+    /// Model an integer→integer `Cast`. A value-preserving cast (widening /
+    /// equal width without a sign reinterpretation, `cast_is_value_preserving`)
+    /// passes the operand term through unchanged. A narrowing or same-width
+    /// signedness-flip cast can change the value, so it passes through only when
+    /// a "fits the destination range" side-obligation discharges (so the value
+    /// is unchanged by the cast); otherwise it taints. Keeps the invariant that
+    /// every modeled term equals the real hardware value or is tainted (module
+    /// docs' "Bounded-integer overflow model", Cast paragraph).
+    fn cast_int(&mut self, input: &Variable, dst_ty: &Type) -> Result<Option<SExpr>, Stop> {
+        if !is_modeled_int(dst_ty) || !is_modeled_int(&input.ty) {
+            return Ok(None);
+        }
+        let Some(v) = self.value_of(input) else { return Ok(None) };
+        if cast_is_value_preserving(&input.ty, dst_ty) {
+            return Ok(Some(v));
+        }
+        let max = self.smt.numeral(type_max(dst_ty));
+        let le = self.smt.lte(v, max);
+        let min = int_const(self.smt, type_min(dst_ty));
+        let ge = self.smt.gte(v, min);
+        let fits = self.smt.and(ge, le);
+        if !self.try_discharge(fits)? {
+            return Ok(None);
+        }
+        Ok(Some(v))
     }
 
     fn process_comparison(&mut self, inst: &Instruction, c: &Comparison) -> Result<(), Stop> {
@@ -1299,11 +1512,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             }
             Operator::Cast(u) => {
                 let Some(out) = inst.out else { return Ok(()) };
-                let val = if is_modeled_int(&out.ty) && is_modeled_int(&u.input.ty) {
-                    self.value_of(&u.input)
-                } else {
-                    None
-                };
+                let val = self.cast_int(&u.input, &out.ty)?;
                 self.bind_out(inst, val);
                 Ok(())
             }
@@ -1430,7 +1639,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             return Ok(false);
         }
         let Some(bounds) = self.elem_bounds.get(&id).cloned() else { return Ok(false) };
-        let v = self.declare_int("elem", is_unsigned(&out.ty))?;
+        let v = self.declare_leaf("elem", &out.ty)?;
         for b in bounds {
             let lt = self.smt.lt(v, b);
             self.smt.assert(lt).map_err(smt_err)?;
@@ -2257,7 +2466,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             )
         })?;
 
-        let i_sym = self.declare_int("loop_i", is_unsigned(&rl.i.ty))?;
+        let i_sym = self.declare_leaf("loop_i", &rl.i.ty)?;
         self.memo.insert(rl.i.kind, Some(i_sym));
 
         self.smt.push().map_err(smt_err)?;
@@ -2315,10 +2524,10 @@ impl<'a, 'b> Prover<'a, 'b> {
         // Induction variables: carried, integer-typed operands the guard
         // *upper-bounds* (the ascending shape). Everything else carried is an
         // accumulator (tainted).
-        let mut induction: HashMap<VariableKind, bool> = HashMap::new();
+        let mut induction: HashMap<VariableKind, Type> = HashMap::new();
         for v in &bg.induction_candidates {
             if carried.contains(&v.kind) && is_modeled_int(&v.ty) {
-                induction.insert(v.kind, is_unsigned(&v.ty));
+                induction.insert(v.kind, v.ty);
             }
         }
 
@@ -2327,8 +2536,8 @@ impl<'a, 'b> Prover<'a, 'b> {
         // read-before-write of an accumulator sees taint, not the stale
         // pre-loop value.
         for &k in &carried {
-            if let Some(&unsigned) = induction.get(&k) {
-                let sym = self.declare_int("loop_iv_", unsigned)?;
+            if let Some(ty) = induction.get(&k).copied() {
+                let sym = self.declare_leaf("loop_iv_", &ty)?;
                 self.set_var(k, Some(sym));
             } else {
                 self.set_var(k, None);
@@ -2438,7 +2647,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             VariableKind::Builtin(b) => self.builtin_value(b),
             VariableKind::GlobalScalar(id) => {
                 if is_modeled_int(&var.ty) {
-                    self.declare_int(&format!("scalar{id}_"), is_unsigned(&var.ty)).ok()
+                    self.declare_leaf(&format!("scalar{id}_"), &var.ty).ok()
                 } else {
                     None
                 }
@@ -2488,6 +2697,94 @@ fn is_modeled_int(ty: &Type) -> bool {
 
 fn is_unsigned(ty: &Type) -> bool {
     ty.is_unsigned_int() && !ty.is_bool()
+}
+
+// ---------------------------------------------------------------------------
+// Bounded-integer (finite-width) modeling for the overflow-soundness model.
+// See the module docs' "Bounded-integer overflow model" bullet. Every modeled
+// integer term is kept faithful to real (wrapping) hardware semantics or left
+// tainted; these helpers supply the type-width facts that make that possible.
+// ---------------------------------------------------------------------------
+
+/// The address-type width vericl models integer *positions*/*lengths* at.
+/// `usize`/`isize` lower to `U32`/`I32` in CubeCL 0.10 (see cubecl-ir's
+/// `impl_into_variable!`), and the kernels register `AddressType::U32`, so a
+/// position/length is a 32-bit value on the hardware this checker reasons
+/// about. This is the width of the synthetic leaves (`ABSOLUTE_POS`,
+/// `CUBE_POS`, `CUBE_COUNT`, buffer `Length`) that carry no IR `Type` of their
+/// own.
+fn address_type() -> Type {
+    Type::scalar(ElemType::UInt(UIntKind::U32))
+}
+
+/// Bit width of a modeled integer type (8/16/32/64) — the element width, so a
+/// (rejected-elsewhere) vector type would still report its lane width.
+fn int_bits(ty: &Type) -> u32 {
+    ty.elem_type().size_bits() as u32
+}
+
+/// The inclusive maximum a value of `ty` can hold on hardware: `2^W - 1`
+/// (unsigned) or `2^(W-1) - 1` (signed). Returned as `u128` so every width up
+/// to 64 bits (`u64::MAX`) is exactly representable.
+fn type_max(ty: &Type) -> u128 {
+    let w = int_bits(ty);
+    if is_unsigned(ty) {
+        (1u128 << w) - 1
+    } else {
+        (1u128 << (w - 1)) - 1
+    }
+}
+
+/// The inclusive minimum a value of `ty` can hold: `0` (unsigned) or
+/// `-2^(W-1)` (signed). Returned as `i128` (negative for signed).
+fn type_min(ty: &Type) -> i128 {
+    if is_unsigned(ty) {
+        0
+    } else {
+        -(1i128 << (int_bits(ty) - 1))
+    }
+}
+
+/// The wrap modulus `2^W` of `ty` (the amount added/subtracted to fold an
+/// out-of-range mathematical result back into `[type_min, type_max]`).
+fn wrap_modulus(ty: &Type) -> u128 {
+    1u128 << int_bits(ty)
+}
+
+/// Build an SMT integer literal for a possibly-negative `i128` (SMT-LIB spells
+/// a negative as `(- n)`, not `-n`, so a bare `numeral` would be malformed —
+/// mirrors `constant_expr`'s existing handling of negative `Int` constants).
+fn int_const(smt: &Context, v: i128) -> SExpr {
+    if v < 0 {
+        let mag = smt.numeral(v.unsigned_abs());
+        smt.negate(mag)
+    } else {
+        smt.numeral(v as u128)
+    }
+}
+
+/// Whether an integer→integer `Cast` from `src` to `dst` is value-preserving
+/// for *every* in-range source value (so the SMT term can pass through
+/// unchanged): a widening or equal-width cast that does not reinterpret sign.
+/// A narrowing cast (truncation) or a same-width signedness flip
+/// (reinterpretation) can change the value, so it is not accepted here — the
+/// caller instead discharges a "fits the destination range" side-obligation
+/// (module docs' "Bounded-integer overflow model", Cast paragraph).
+fn cast_is_value_preserving(src: &Type, dst: &Type) -> bool {
+    let (sw, dw) = (int_bits(src), int_bits(dst));
+    let (su, du) = (is_unsigned(src), is_unsigned(dst));
+    if su == du {
+        // same signedness: widening or equal width preserves the value.
+        dw >= sw
+    } else if su {
+        // unsigned -> signed: fits only if strictly wider (the top source bit
+        // must not land on the destination's sign bit).
+        dw > sw
+    } else {
+        // signed -> unsigned: a negative source reinterprets to a large
+        // unsigned; never value-preserving by type alone.
+        false
+    }
 }
 
 /// Every `VariableKind` that `scope` (recursively, through nested branches)
@@ -3752,6 +4049,303 @@ mod tests {
         match prove_bounds_freedom(&def, AXPY_BUFFERS, &[]) {
             ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
             other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    // =================================================================
+    // Bounded-integer overflow model. See the module docs'
+    // "Bounded-integer overflow model" bullet. These pin the round-2
+    // adversarial-review construction (a `u32` multiply provably nonzero in
+    // unbounded LIA but wrapping to exactly 0) and one negative control per
+    // consumer of a modeled integer (divisor, guard, index, loop bound),
+    // plus positive controls that a genuinely non-wrapping (guard-bounded)
+    // arithmetic chain still proves.
+    // =================================================================
+
+    /// Two `u32` arrays plus two `u32` scalars `a`, `b` — the overflow tests'
+    /// shared signature. Buffers are `[x, y]` (AXPY_BUFFERS); `a`/`b` are
+    /// `GlobalScalar`s, not buffers.
+    macro_rules! build_ab_kernel {
+        ($kernel:path) => {{
+            let mut builder = KernelBuilder::default();
+            builder.runtime_properties(Default::default());
+            cubecl::ir::AddressType::U32.register(&mut builder.scope);
+            let x =
+                <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+            let y = <Array<u32> as LaunchArg>::expand_output(
+                &ArrayCompilationArg { inplace: None },
+                &mut builder,
+            );
+            let a = <u32 as LaunchArg>::expand(&Default::default(), &mut builder);
+            let b = <u32 as LaunchArg>::expand(&Default::default(), &mut builder);
+            $kernel(&mut builder.scope, x, y, a, b);
+            builder.build(KernelSettings::default())
+        }};
+    }
+
+    /// THE round-2 adversarial-review construction (task headline): `a * b`
+    /// guarded by `a >= 1 && b >= 1` is provably nonzero in unbounded QF_LIA,
+    /// so the old model modeled `ABSOLUTE_POS % (a*b)` and `Proved` the guarded
+    /// write. But real `u32` multiplication wraps `65536 * 65536` to exactly
+    /// `0`, so the divisor can be zero on hardware. Under the overflow model the
+    /// `Mul` no-overflow side-obligation fails (`a == b == 65536`), `a*b` is
+    /// tainted, the modulo divisor is tainted, and the dependent guard is
+    /// `OutOfSubset` — never `Proved`. This is the exact verdict flip the
+    /// milestone exists to produce.
+    #[cube(launch)]
+    fn prover_test_mul_overflow_divisor(x: &Array<u32>, y: &mut Array<u32>, a: u32, b: u32) {
+        if a >= 1u32 && b >= 1u32 {
+            let d = (a * b) as usize;
+            let idx = ABSOLUTE_POS % d;
+            if idx < y.len() {
+                y[idx] = x[0usize];
+            }
+        }
+    }
+
+    #[test]
+    fn mul_overflow_divisor_is_out_of_subset() {
+        let def = build_ab_kernel!(prover_test_mul_overflow_divisor::expand);
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[]) {
+            ProveResult::OutOfSubset { reason } => {
+                // The wrapped divisor taints the modulo, so the `if idx <
+                // y.len()` guard depends on a construct outside the subset.
+                assert!(reason.contains("if"), "unexpected reason: {reason}");
+            }
+            other => panic!(
+                "expected OutOfSubset (wrapped a*b divisor tainted), got {other:?} — \
+                 this was `Proved` before the overflow model"
+            ),
+        }
+    }
+
+    /// The `Add` sibling of the divisor construction: `a + b` also wraps
+    /// (`a == b == 2^31 ⟹ a + b == 2^32 ⟹ 0`). Unlike `Mul`, `Add` is modeled
+    /// *faithfully* (the SMT term is the real wrapped value), so `a + b` is not
+    /// tainted — instead the div/mod nonzero side-obligation itself fails,
+    /// because the faithful divisor term can be `0`. Either way: the guard that
+    /// depends on the modulo is `OutOfSubset`, never `Proved`.
+    #[cube(launch)]
+    fn prover_test_add_overflow_divisor(x: &Array<u32>, y: &mut Array<u32>, a: u32, b: u32) {
+        if a >= 1u32 && b >= 1u32 {
+            let d = (a + b) as usize;
+            let idx = ABSOLUTE_POS % d;
+            if idx < y.len() {
+                y[idx] = x[0usize];
+            }
+        }
+    }
+
+    #[test]
+    fn add_overflow_divisor_is_out_of_subset() {
+        let def = build_ab_kernel!(prover_test_add_overflow_divisor::expand);
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(reason.contains("if"), "unexpected reason: {reason}");
+            }
+            other => panic!(
+                "expected OutOfSubset (faithful a+b divisor can be 0), got {other:?} — \
+                 this was `Proved` before the overflow model"
+            ),
+        }
+    }
+
+    /// Wrapped *index* consumer: `a >= 1 && b >= 1 && (a*b) < y.len()` bounds the
+    /// product in the OLD model (`a <= a*b < y.len()`), so `y[(a*b) as usize]`
+    /// used to `Prove`. Under the overflow model the `Mul` taints `a*b`, so both
+    /// the guard sub-condition and the index depend on a construct outside the
+    /// subset — `OutOfSubset`.
+    #[cube(launch)]
+    fn prover_test_mul_overflow_index(_x: &Array<u32>, y: &mut Array<u32>, a: u32, b: u32) {
+        if a >= 1u32 && b >= 1u32 && (a * b) < y.len() as u32 {
+            y[(a * b) as usize] = 1u32;
+        }
+    }
+
+    #[test]
+    fn mul_overflow_index_is_out_of_subset() {
+        let def = build_ab_kernel!(prover_test_mul_overflow_index::expand);
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[]) {
+            ProveResult::OutOfSubset { .. } => {}
+            other => panic!(
+                "expected OutOfSubset (wrapped a*b index tainted), got {other:?} — \
+                 this was `Proved` before the overflow model"
+            ),
+        }
+    }
+
+    /// Wrapped *guard* consumer, the "guard bounds a DIFFERENT index" hazard the
+    /// task flags as exactly as dangerous as a wrapped divisor: `if (a + b) <
+    /// y.len() { y[a] }`. In the OLD unbounded model `a + b < y.len()` implies
+    /// `a < y.len()` (since `a <= a + b`), so `y[a]` `Proved`. Under the
+    /// faithful overflow model `a + b` wraps (`a == b == 2^31 ⟹ 0 < y.len()`),
+    /// the guard passes, and `y[a] == y[2^31]` is out of bounds — the checker
+    /// `Refuted`s with that real two-scalar counterexample, catching the danger
+    /// rather than being fooled by the monotonicity the unbounded model assumed.
+    #[cube(launch)]
+    fn prover_test_add_overflow_guard(_x: &Array<u32>, y: &mut Array<u32>, a: u32, b: u32) {
+        if (a + b) < y.len() as u32 {
+            y[a as usize] = 1u32;
+        }
+    }
+
+    #[test]
+    fn add_overflow_guard_refutes() {
+        let def = build_ab_kernel!(prover_test_add_overflow_guard::expand);
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[]) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains('y'), "unexpected obligation: {obligation}");
+                assert!(!counterexample.is_empty());
+            }
+            other => panic!(
+                "expected Refuted (wrapped guard admits an OOB index), got {other:?} — \
+                 this was `Proved` before the overflow model"
+            ),
+        }
+    }
+
+    /// Wrapped *loop bound* consumer: `for i in 0..(a*b) { if i < y.len() {...} }`.
+    /// The OLD model modeled the end bound `a*b` and (with the per-iteration
+    /// guard) `Proved`. Under the overflow model the `Mul` taints `a*b`, so the
+    /// range-loop's end bound depends on a construct outside the subset —
+    /// `OutOfSubset`, reported at the loop bound.
+    #[cube(launch)]
+    fn prover_test_wrapped_loop_bound(x: &Array<u32>, y: &mut Array<u32>, a: u32, b: u32) {
+        for i in 0..(a * b) as usize {
+            if i < y.len() {
+                y[i] = x[i % x.len()];
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_loop_bound_is_out_of_subset() {
+        let def = build_ab_kernel!(prover_test_wrapped_loop_bound::expand);
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("end bound") || reason.contains("range-loop"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!(
+                "expected OutOfSubset (wrapped loop bound tainted), got {other:?} — \
+                 this was `Proved` before the overflow model"
+            ),
+        }
+    }
+
+    /// Positive control (task: "assume-bounded arithmetic proves"): a multiply
+    /// whose operand is guard-bounded so the product provably cannot wrap. `a <
+    /// 1000` bounds `a`, so `a * 7 < 7000 <= u32::MAX` discharges the `Mul`
+    /// no-overflow side-obligation, `d = a * 7` is modeled faithfully, and the
+    /// inner `d < y.len()` guard proves the `y[d]`/`x[d]` accesses. Genuinely
+    /// non-wrapping arithmetic still proves.
+    #[cube(launch)]
+    fn prover_test_guard_bounded_mul(x: &Array<u32>, y: &mut Array<u32>, a: u32, _b: u32) {
+        if (a as usize) < 1000usize {
+            let d = a as usize * 7usize;
+            if d < y.len() {
+                y[d] = x[d];
+            }
+        }
+    }
+
+    #[test]
+    fn guard_bounded_mul_proves() {
+        let def = build_ab_kernel!(prover_test_guard_bounded_mul::expand);
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            // y[d] write, x[d] read.
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved (guard-bounded product cannot wrap), got {other:?}"),
+        }
+    }
+
+    /// Two `u32` arrays only — for the shift/underflow controls below.
+    macro_rules! build_u32_xy {
+        ($kernel:path) => {{
+            let mut builder = KernelBuilder::default();
+            builder.runtime_properties(Default::default());
+            cubecl::ir::AddressType::U32.register(&mut builder.scope);
+            let x =
+                <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+            let y = <Array<u32> as LaunchArg>::expand_output(
+                &ArrayCompilationArg { inplace: None },
+                &mut builder,
+            );
+            $kernel(&mut builder.scope, x, y);
+            builder.build(KernelSettings::default())
+        }};
+    }
+
+    /// The `fir_pair_kernel`/`tap_pair_guarded_kernel` finding, at the prover
+    /// level: a lone `ABSOLUTE_POS + 1 < x.len()` guard does NOT cover the
+    /// `x[ABSOLUTE_POS]` read under faithful `u32` wraparound. At `pos ==
+    /// u32::MAX`, `pos + 1` wraps to `0 < x.len()`, the guard passes, and
+    /// `x[pos]` is out of bounds — `Refuted`. This is why those two example
+    /// kernels were strengthened to state `pos < x.len()` explicitly; see their
+    /// doc comments and the README "Overflow soundness" note.
+    #[cube(launch)]
+    fn prover_test_shifted_selfguard(x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS + 1 < x.len() {
+            y[ABSOLUTE_POS] = x[ABSOLUTE_POS + 1];
+        }
+    }
+
+    #[test]
+    fn shifted_read_selfguard_refutes_at_type_max() {
+        let def = build_u32_xy!(prover_test_shifted_selfguard::expand);
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                // The write `y[ABSOLUTE_POS]` (== x[ABSOLUTE_POS] by len-eq) is
+                // the OOB access at pos == u32::MAX.
+                assert!(obligation.contains('y') || obligation.contains('x'));
+                assert!(counterexample.contains("abs_pos"), "want abs_pos: {counterexample}");
+            }
+            other => panic!("expected Refuted (pos+1 guard does not cover pos), got {other:?}"),
+        }
+    }
+
+    /// The strengthened form (what the examples now ship): stating `pos <
+    /// x.len()` AND `pos + 1 < x.len()` proves both accesses and excludes the
+    /// wrap point — genuinely-safe shifted-read arithmetic still proves.
+    #[cube(launch)]
+    fn prover_test_shifted_selfguard_strengthened(x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS < x.len() && ABSOLUTE_POS + 1 < x.len() {
+            y[ABSOLUTE_POS] = x[ABSOLUTE_POS + 1];
+        }
+    }
+
+    #[test]
+    fn shifted_read_selfguard_strengthened_proves() {
+        let def = build_u32_xy!(prover_test_shifted_selfguard_strengthened::expand);
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            // y[pos] write, x[pos+1] read.
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved (both guards stated), got {other:?}"),
+        }
+    }
+
+    /// Unguarded unsigned underflow: `x[ABSOLUTE_POS - 1]` with no `pos >= 1`
+    /// guard. Faithful `Sub` gives the true wrapped value `2^32 - 1` at `pos ==
+    /// 0`, so the read is genuinely out of bounds — `Refuted` (the counterexample
+    /// exhibits `pos == 0`). Confirms the faithful underflow model surfaces the
+    /// real wrapped index rather than a spurious negative one.
+    #[cube(launch)]
+    fn prover_test_underflow_unguarded(x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS < y.len() {
+            y[ABSOLUTE_POS] = x[ABSOLUTE_POS - 1];
+        }
+    }
+
+    #[test]
+    fn sub_underflow_unguarded_refutes() {
+        let def = build_u32_xy!(prover_test_underflow_unguarded::expand);
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::Refuted { obligation, .. } => {
+                assert!(obligation.contains('x'), "unexpected obligation: {obligation}");
+            }
+            other => panic!("expected Refuted (pos-1 underflows at pos==0), got {other:?}"),
         }
     }
 
