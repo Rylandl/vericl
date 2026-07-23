@@ -405,9 +405,17 @@ caught deterministically.
    defect kernel touches `&&`/div/mod/loop-carry).
 6. Next proved property: race-freedom via two-thread symbolic reduction (the sum_racy class
    proved, not just differentially caught).
-7. Later: QF_BV wrapping model in the prover; fold cubecl version into Identity; upstream
-   conversation with tracel-ai; standalone `vericl check` CLI (README CI story row);
-   array-value-dependent indices (offset tables / gather) via quantified assumes
+7. Later: QF_BV wrapping model in the prover — needed for, among other things, the
+   unbounded-overflow-feeding-div/mod gap found in the round-2 adversarial review (roadmap item 9
+   below): a divisor provably nonzero in unbounded QF_LIA can still wrap to exactly zero via `u32`
+   overflow (e.g. `a * b == 2^32`), which the current div/mod side-obligation does not model.
+   Currently **known-inert on wgpu/Metal specifically** because naga's division-by-zero fallback
+   is dividend-preserving rather than trapping (`a / 0 == a`, `a % 0 == 0` — confirmed empirically,
+   see README "CubeCL semantics findings"), so the resulting index is wrong but not itself a crash
+   on today's one supported backend; not something to rely on in general, and the first concrete
+   motivation for this item rather than a purely speculative one. Also: fold cubecl version into
+   Identity; upstream conversation with tracel-ai; standalone `vericl check` CLI (README CI story
+   row); array-value-dependent indices (offset tables / gather) via quantified assumes
    (docs/dogfood-2026-07.md Tier-2 gap #3, still open); a `FLOAT_METHOD_CONST_ONLY` distinction
    if a dogfooded kernel needs a runtime `new`/`from_int`; an `f64` instantiation tier if a
    dogfooded kernel ever needs one (see roadmap item 8's "one concrete type per helper" note —
@@ -602,3 +610,192 @@ caught deterministically.
    `composition_subset.rs` (2 tests: differential pass on wgpu across 5 sizes, bounds `Proved` 54
    obligations) passes; `dogfood-rejects` still fails to build with the same class of expected
    rejections (generics/topology/usize gates), unaffected.
+9. [DONE 2026-07-22] Adversarial soundness review round 2 (SMT prover + instantiate()/uses(...)
+   hardening) — DONE. One CRITICAL confirmed bug, one MEDIUM, one LOW, plus a docs-only finding
+   pair; all four fixed and regression-tested. Same posture as the round-1 review above: every
+   fix closes a real, demonstrated hole rather than a hypothetical one — the reviewer's scratch
+   repro crate (path-deps on this repo, never committed here per the Substrate-scratch precedent)
+   reproduced each bug against the pre-fix build and was re-run against the fixed build to confirm
+   the new verdict.
+
+   **CRITICAL — branch-scoped value-map rollback in `process_branch`
+   (`crates/vericl-ir/src/prover.rs`).** Root cause: `self.smt.push()/pop()` scopes *path
+   conditions* around an `If`/`IfElse` arm, but `self.memo` (the `VariableKind` -> symbolic-value
+   map) was mutated in place with no save/restore at all — a variable reassigned inside one arm
+   was treated as certain in the other arm, and after the branch closed, unconditionally. Three
+   confirmed false-`Proved` manifestations, each independently demonstrated: (1) a variable
+   clamped to a safe value inside an `If` with no `else` leaked past the branch close (a
+   near-impossible guard clamping `idx` to `0` made an unrelated, unguarded, genuinely-unbounded
+   later use of `idx` look safe); (2) the `else` arm of an `IfElse` saw the `if` arm's writes (both
+   arms walked sequentially against the same unscoped map, no reset between them); (3) a
+   post-`IfElse` read resolved to whichever arm was walked *last* (the `else` arm's write always
+   won, regardless of which arm the real, per-thread execution actually took). Confirmed with a
+   real OOB write on Metal (`crates/vericl-ir/src/prover.rs`'s pre-fix behavior on the reviewer's
+   `if_else_merge_bug_kernel`: `Proved { obligations: 1 }` with `y.len() == 1` assumed, while a
+   real 4-thread wgpu/Metal dispatch of the same kernel — declared length 1, backing allocation 4
+   — wrote past the declared length at indices 1–3).
+
+   Fix: `process_branch`'s `If`/`IfElse` cases now snapshot `self.memo` (a full `HashMap` clone —
+   `SExpr` is `Copy`, so this is cheap) before walking an arm, restore that snapshot before walking
+   the *other* arm (fixing manifestation 2), and restore it once more after the construct, then
+   explicitly taint (`None`) every variable written *anywhere* in either arm rather than trusting
+   either arm's leftover value (fixing 1 and 3) — no if/else value merging in v0; a variable set to
+   the identical value in both arms still taints, deliberately conservative. "Written anywhere in
+   either arm" is tracked by a new `Prover::write_log_stack: Vec<HashSet<VariableKind>>` (one frame
+   per currently-open arm) and a new `Prover::set_var` helper that both writes `self.memo` and
+   records the write into the top-of-stack frame — the single point every genuine variable write
+   (`bind_out`, `taint_out`, and the loop-carry pre/post taint in `process_range_loop`, all
+   rerouted through it) goes through, as opposed to `value_of`'s read-only resolution caching,
+   which must NOT be logged (logging it would spuriously re-taint e.g. `ABSOLUTE_POS` the first
+   time a branch happens to be where it's lazily resolved, breaking unrelated obligations after the
+   branch). Composes correctly for nested branches with no special-casing: an inner branch's own
+   merge step re-applies its taints through `set_var` too, which — since the inner frame is already
+   popped by then — logs into whatever frame is now on top (the *enclosing* arm's), so a write two
+   levels deep still reaches the outermost merge. (First implementation attempt used a raw
+   `memo.insert` for the merge's own taint-application loop instead of `set_var`, which passed
+   every single-level test but failed the nested-branch regression test below immediately — a
+   genuine catch, not a hypothetical one; fixed by routing that loop through `set_var` too.) Full
+   soundness argument in the module doc's new "Branch-scoped write taint (If/IfElse)" bullet.
+
+   Regression tests (`crates/vericl-ir/src/prover.rs::tests`, new "Branch-scoped write taint"
+   section): `branch_write_does_not_leak_past_if` (manifestation 1 — now `OutOfSubset`, reason
+   names the write index and `y`), `if_arm_write_does_not_leak_into_else_arm` (manifestation 2, the
+   task's exact `if pos >= HUGE { idx = 0 } else { y[idx] = v }` shape with `y.len() == 1` assumed
+   — now `Refuted` on genuine grounds, not a leaked value that happened to still be unsafe),
+   `post_ifelse_merge_taints_branch_written_vars` (manifestation 3 — now `OutOfSubset`), and two
+   nested-composition tests: `nested_branches_restore_correctly` (a write two levels deep, inside
+   an `IfElse` nested in an outer `If`'s only arm, must still reach the outer merge's taint set —
+   this is the test that caught the `set_var`-routing bug above) and
+   `nested_branch_write_does_not_leak_into_outer_sibling` (the other half — the same two-level-deep
+   write, now inside the outer `IfElse`'s `if` arm, must not leak into the outer's own `else` arm,
+   a true sibling — `Refuted` on the sibling's genuinely-unbounded `idx`). Positive controls: the
+   full pre-existing 21-test
+   `vericl-ir` suite (axpy/fir3/flatten_decode_scale/composed kernels and every If/IfElse-using
+   kernel that does NOT write a branch-arm variable into an index) passes unchanged, and all seven
+   suite kernels' obligation counts are byte-identical (confirmed by `git diff` on
+   `crates/vericl-examples/evidence/vericl.json` being empty — not merely "same numbers", the
+   evidence file itself never needed regenerating): axpy=3, xorshift_step=2, mix_u32=2, fir3=4,
+   flatten_decode_scale=2, gain_kernel=2, fir_pair_kernel=4.
+
+   **MEDIUM — `instantiate(...)` substitution namespace collision (`crates/vericl-macros/src/
+   lib.rs`).** `subst_type_tokens`/`transform_body`'s `instantiate(F = f32)` substitution is purely
+   lexical (a `TokenTree::Ident` string match), with no notion of Rust's separate type/value
+   namespaces — a local binding legally named `F` (type parameter and local live in different
+   namespaces in the *original* kernel) or named like the concrete type (`let f32 = ...`) gets
+   silently rewritten right along with the type parameter, producing a twin that computes something
+   different from the real kernel with no compile-time signal. Demonstrated: the reviewer's
+   `f_name_collision_kernel` (`let f32 = x[ABSOLUTE_POS]; let F = F::new(999.0);` — two genuinely
+   distinct locals in the real kernel) had its twin silently write the second, shadowing local's
+   value (`999.0`) instead of the first (`x[ABSOLUTE_POS]`) on every input. Fix: new
+   `check_instantiate_local_collisions` (called from both `expand` and `expand_helper`, right after
+   `params` is classified, on the ORIGINAL pre-substitution body) reuses `collect_locals` to scan
+   for any local/parameter whose name equals either an `instantiate(...)` generic type parameter's
+   own ident or its pinned concrete type's bare ident (when the concrete type reduces to a single
+   identifier — the only shape a local's name could ever collide with), and rejects with a targeted
+   error naming the collision and its role (`"local binding \`F\` collides with kernel
+   \`name\`'s type parameter under instantiate(...) — rename the local; outside the vericl v0
+   subset"`). Deliberately conservative (flags a local merely *named* either sensitive string, not
+   only the narrower "a second, independent binding already uses the resulting name" condition
+   that's the only shape that's actually unsound) — same "reject rather than silently approximate"
+   posture as everything else in this project. Tests: `crates/vericl-macros/src/lib.rs::tests`
+   `instantiate_local_collision_is_rejected` / `instantiate_no_collision_is_accepted` /
+   `instantiate_empty_subst_is_always_accepted` (unit-level, direct calls into the checker); the
+   reviewer's exact `f_name_collision_kernel` re-run against the fixed build now fails to compile
+   with this targeted error (confirmed in the scratch crate, not committed — compile-fail
+   demonstrated per the existing `wrapping`-subset-rejection precedent, no trybuild harness yet).
+
+   **LOW — multi-segment call bypass in `UsesRewriteFold` (`crates/vericl-macros/src/lib.rs`).**
+   The fold only ever inspected `p.path.segments.len() == 1` — a multi-segment call to a declared
+   helper (e.g. `self::triple::<F>(x)`, reached via a `self::`-qualified path) skipped BOTH the
+   rewrite-to-`_vericl_ref` AND the unlisted-callee rejection entirely, silently falling through to
+   call the ORIGINAL, un-rewritten `#[cube]` item host-side — invisible to a black-box differential
+   check whenever the original happens to be host-safe (as it was in the reviewer's repro,
+   confirmed: `self_path_call_kernel_vericl::reference` produced the numerically-correct answer
+   either way, since `triple`'s body is host-safe arithmetic — the bypass is a real hole but not
+   one a differential-only check could ever have caught). Fix: `fold_expr_call` now also handles
+   `segments.len() > 1`, rewriting when the LAST segment matches a `uses(...)`-declared name —
+   turbofish stripped (same reasoning as the single-segment case) and **the whole path prefix
+   dropped**, not just the last segment renamed in place. Dropping the prefix is necessary, not
+   merely simpler: the twin body lives one module level deeper than the original call site (nested
+   in the generated `<name>_vericl` module, which does `use super::*;`), so a prefix meaningful at
+   the ORIGINAL call site — `self::`, above all — does not still mean the same thing one level
+   down; the rewritten bare target is reachable via that same glob import regardless, exactly the
+   mechanism the single-segment case already relies on. A multi-segment call whose last segment
+   does NOT match a declared helper (`f32::max(...)`, an unrelated module path, ...) is left
+   completely untouched — a **documented residual** (in `UsesRewriteFold`'s doc comment), not a
+   soundness gap this fold's rejection guarantee covers: a multi-segment call to an unlisted,
+   genuinely-cross-module helper is a case this fold cannot distinguish from a legitimate external
+   call. Tests: `crates/vericl-macros/src/lib.rs::tests`
+   `uses_rewrite_fold_rewrites_self_qualified_helper_call` (asserts the resulting AST directly —
+   bare `triple_vericl_ref(x)`, turbofish stripped; chosen over a black-box differential/GPU probe
+   specifically because those can't distinguish "correctly rewritten" from "bypassed but
+   coincidentally correct", as the repro above demonstrates) and
+   `uses_rewrite_fold_leaves_non_matching_multi_segment_call_untouched` (`f32::max(a, b)`
+   byte-for-byte unchanged). Also added a real macro-pipeline regression,
+   `crates/vericl-examples/src/lib.rs`'s `self_path_gain_kernel` (identical to `gain_kernel` except
+   `self::single_tap::<F>(...)` in place of the bare call; not suite-wired, no new evidence entry
+   needed — exists purely to pin the fix, same precedent as `tap_pair_guarded_kernel`):
+   `self_path_gain_kernel_twin_matches_hand_computed` (same expected output as
+   `gain_kernel_twin_matches_hand_computed`) and `self_path_gain_kernel_definition_is_provably_in_
+   bounds` (`Proved { obligations: 2 }`, matching `gain_kernel`'s own count).
+
+   **Docs-only findings** (README "CubeCL semantics findings", new subsection under "Proved
+   claims"): (a) CubeCL 0.10 lowers `&&`/`||` to **eager**, unconditionally-evaluated instructions
+   inside a kernel body, not short-circuiting branches — a guard shaped `idx_ok && x[idx] > 0.0`
+   does not protect the `x[idx]` read the way it would in host Rust (the prover already refutes an
+   insufficiently-guarded access composed this way; WGSL's own robustness, which silently clamps
+   rather than traps, can mask the effect at runtime on wgpu specifically); (b) naga's
+   division-by-zero fallback is dividend-preserving (`a / 0 == a`, `a % 0 == 0`, confirmed
+   empirically), not trapping — noted in roadmap item 7 above as the concrete motivation for the
+   still-open QF_BV wrapping-model item, since it's what makes the
+   unbounded-overflow-feeding-div/mod gap (a `u32` multiplication provably nonzero in QF_LIA but
+   wrapping to exactly `0`) currently harmless-in-practice on wgpu/Metal specifically, rather than
+   a live crash risk — not something to be relied on in general. `uses(...)` declaration-order
+   hash sensitivity (same dependency *set*, different `SOURCE_HASH`/`identity()` on reorder —
+   confirmed via the reviewer's `diamond_kernel`/`diamond_kernel_reordered` scratch pair) is now
+   documented in three places: `crates/vericl/src/contract.rs`'s `combine_source_hash` doc (the
+   central, authoritative explanation), the macro-generated `identity()` doc comment (what a user
+   actually sees hovering over their own generated code), and README's "Identity and composition"
+   paragraph — all noting it's the safe direction (spurious staleness only, never silently drops a
+   real change).
+
+   **Surfaces the review probed that survived without changes needed** (re-run against the fixed
+   build, scratch crate not committed): eager `&&`-RHS array access
+   (`and_rhs_has_array_access`, refutes correctly — the read is genuinely unconditional in IR, and
+   the prover already models it that way, per the docs finding above); div-chain and mod-chain
+   composition (`a/b/c`, `(a%b)%c)` — both `Proved { obligations: 2 }`, unaffected); loop-carry
+   shadowing (`shadowed_carry` — an inner loop-local named the same as an outer carried
+   accumulator, `Proved`, since cubecl allocates distinct `VariableKind` ids per binding regardless
+   of surface-name reuse) and a carried variable feeding its own loop's bound
+   (`carried_own_bound` — correctly `OutOfSubset` on the range-loop's `end` resolution, since
+   `rl.end`'s `Variable` is read once at loop-entry time in the IR itself, before any in-body
+   taint applies); `wrapping` kernel composing a non-`wrapping` helper (`add_one_u32` overflow
+   inside a composed helper's twin — panics loudly on overflow, a LOUD differential failure, not a
+   silent wrong pass, since `#[vericl::helper]` rejects a `wrapping` clause outright and Rust's
+   default checked arithmetic panics on debug-profile overflow); read-before-write inside a
+   loop-carried accumulator (`read_before_write_carry` — correctly `OutOfSubset`, the pre-loop
+   taint applies before the body walk starts, so a read of the carried variable before its own
+   first write in program order never sees the stale pre-loop value).
+
+   Verification: the three branch-scoping regression tests + the two nested-composition tests all
+   pass; `cargo test --workspace` and `-p vericl-examples --features cpu` both green (89 tests
+   default: 15 vericl core + 39 vericl-examples lib + 1 conformance + 2 float-whitelist + 26
+   vericl-ir + 6 vericl-macros — vericl-ir gained 5, vericl-macros gained 5, vericl-examples lib
+   gained 2 over their round-1-review-era counts; `--features cpu` variant identical pass count);
+   `cargo clippy
+   --workspace --all-targets` zero warnings on both feature sets; `evidence/vericl.json` byte-
+   identical (`git diff` empty) — no `VERICL_UPDATE` run was needed, since none of the four fixes
+   changed any existing suite-wired kernel's source tokens (Fix 1 touches only
+   `crates/vericl-ir/src/prover.rs`; Fixes 2/3 only change macro-expansion-time *rejection*/
+   *rewrite* behavior, not any example kernel's own source; the one new kernel,
+   `self_path_gain_kernel`, is deliberately NOT suite-wired, so it never touches evidence);
+   `conform demo-defects` exits 0, output unchanged (neither defective kernel touches branches-
+   with-arm-writes, instantiate(), or uses()). The reviewer's scratch repro crate (path-deps on
+   this repo) was re-run in full against the fixed build: `if_merge_bug`/`if_else_merge_bug`
+   (manifestations 1/2) now `OutOfSubset`/`Refuted` respectively (were both falsely `Proved`);
+   `post_ifelse_merge`/`post_ifelse_false_proved` (manifestation 3 shapes) now `OutOfSubset` (one
+   of the two was already incidentally `Refuted` pre-fix, for the wrong reason — a leaked value
+   that happened to still be unsafe, not a correctly-scoped one); `f_name_collision_kernel` now
+   fails to compile with the targeted collision error (was a silent wrong twin); the ground-truth
+   GPU probe (`probe3_ground_truth`, real 4-thread wgpu/Metal dispatch) independently confirms the
+   underlying OOB write the manifestation-2/3 kernels' pre-fix `Proved` verdict was wrong about.

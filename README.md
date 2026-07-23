@@ -208,7 +208,12 @@ deep in a helper-call chain still moves the top-level kernel's recorded identity
 in depth alongside, not instead of, the IR-level hash: cube expansion inlines a used helper's real
 IR directly into the composing kernel's own `Scope`, so `ir_hash` already reflects a helper body
 change too — `identity()` makes the source-level hash honor composition the same way rather than
-leaving that half silently stale. A helper (or kernel) whose `uses(...)` graph is cyclic — including
+leaving that half silently stale. **`uses(...)`'s declaration order is folded into the combine, so
+purely reordering a `uses(a, b)` clause to `uses(b, a)` — the same dependency *set* — changes
+`SOURCE_HASH` and `identity()`, even though nothing about the kernel's actual behavior changed.**
+This is a safe direction to be sensitive in (it only ever causes spurious "stale evidence, please
+re-run" churn, never lets real drift through unnoticed) but is worth knowing before reordering a
+`uses(...)` list expecting evidence to stay untouched. A helper (or kernel) whose `uses(...)` graph is cyclic — including
 the degenerate case of listing itself — is rejected at compile time on a best-effort basis: a
 process-local registry accumulates every `uses(...)` edge seen so far in the compilation and checks
 for a cycle on each new declaration, which reliably catches any cycle written in ordinary top-to-
@@ -305,6 +310,35 @@ IR-level content hash alongside the source-level one, so evidence goes stale on 
 drift. `axpy_off_by_one` REFUTES with a counterexample exhibiting the out-of-bounds position, and
 `sum_racy`'s bounds PROVE even though its differential check correctly fails — the race is a
 distinct, differential finding, never conflated with the bounds claim.
+
+### CubeCL semantics findings
+
+Two upstream CubeCL/WGSL behaviors surfaced while adversarially reviewing the SMT prover (round 2,
+see `tasks/todo.md`) that are worth knowing on their own, independent of VeriCL:
+
+- **`&&`/`||` are eager inside a `#[cube]` kernel body, not short-circuiting.** CubeCL 0.10 lowers
+  both operands of `a && b` (and `a || b`) to ordinary, unconditionally-evaluated instructions
+  *before* combining them into a single boolean — there is no branch, so the right-hand side
+  executes even when the left-hand side alone would already decide the result. A guard shaped
+  `idx_ok && x[idx] > 0.0` does **not** protect the `x[idx]` read the way the same expression would
+  in host Rust: the read happens on every thread, guard or not. VeriCL's prover models this
+  correctly — a guard's `&&` composes as SMT `and` over both operands' obligations, which are
+  already unconditional in the IR, so an insufficiently-guarded access still `Refuted`s — but on
+  WGSL the backend's own robustness (out-of-bounds reads/writes silently clamp rather than trap)
+  can mask the effect at runtime, exactly the kind of gap a differential-only check (no static
+  prover) would miss entirely.
+- **naga's division-by-zero fallback is dividend-preserving, not trapping.** On the wgpu/Metal
+  backend, `a / 0` (and `a % 0`) does not trap or return a fixed sentinel — it returns `a` unchanged
+  (confirmed empirically: `ABSOLUTE_POS / 0` returns `ABSOLUTE_POS`; `ABSOLUTE_POS % 0` returns
+  `0`). One consequence: a divisor that's provably nonzero in unbounded integer arithmetic but
+  wraps to exactly zero via `u32` overflow (e.g. `a * b` where `a * b == 2^32`) does not itself
+  crash on this backend — the resulting index is merely wrong, not a hardware fault. VeriCL's
+  div/mod modeling (`crates/vericl-ir/src/prover.rs`'s "Div/mod-derived indices" module doc) proves
+  its nonzero-divisor side-obligation in unbounded QF_LIA, which does not model `u32` wraparound;
+  this overflow-into-zero-divisor shape is accordingly a known, currently out-of-subset gap —
+  harmless specifically *because of* naga's dividend-preserving fallback on today's backend, but
+  not something VeriCL should be relied on to catch in general. Tracked under the `QF_BV`
+  wrapping-model roadmap item (`tasks/todo.md`).
 
 ## First release
 

@@ -185,6 +185,18 @@ impl Contract {
 /// silently drops a real change — the reverse (a dependency change that
 /// fails to move the combined hash) would be the unsound direction, and
 /// isn't possible here since every `deps` entry is mixed into the digest.
+///
+/// **`deps`'s order matters, not just its contents.** `deps` is fed to the
+/// hasher in whatever order the caller passes it — which, for the generated
+/// `identity()`, is exactly the order the corresponding `uses(...)` clause
+/// listed its helpers in. Reordering a `uses(a, b)` clause to `uses(b, a)`
+/// (the same dependency *set*) therefore changes the resulting hash, even
+/// though nothing about the kernel's or helper's actual behavior changed.
+/// This is deliberately the safe direction to be sensitive in — it can only
+/// ever cause spurious "evidence is stale, please re-run" churn after a
+/// purely cosmetic reordering, never let a real dependency change through
+/// unnoticed — but is worth knowing before reordering a `uses(...)` list
+/// expecting evidence to stay untouched.
 pub fn combine_source_hash(local: &str, deps: &[String]) -> String {
     if deps.is_empty() {
         return local.to_string();

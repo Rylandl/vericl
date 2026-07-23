@@ -283,6 +283,33 @@ pub fn gain_kernel<F: Float + CubeElement>(x: &Array<F>, y: &mut Array<F>, gain:
     }
 }
 
+/// Fix 3 regression pin (round-2 adversarial review, `UsesRewriteFold`
+/// multi-segment call bypass): identical to `gain_kernel` above, except the
+/// call to `single_tap` is `self::`-qualified. Before the fix, a
+/// multi-segment path bypassed both the rewrite AND the unlisted-callee
+/// rejection entirely, so the twin silently called the ORIGINAL `#[cube]
+/// fn single_tap` host-side instead of `single_tap_vericl_ref` — never
+/// caught, since (for this host-safe helper) both compute the same answer,
+/// making it invisible to a black-box differential check; see
+/// `self_path_gain_kernel_twin_matches_hand_computed` below, which pins the
+/// fix at the AST level via `gain_kernel_twin_matches_hand_computed`'s own
+/// expected values instead. Not suite-wired (no new evidence entry needed
+/// — this exists purely to pin the fix, same precedent as
+/// `tap_pair_guarded_kernel` below).
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-5),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, gain in -4.0..=4.0),
+    instantiate(F = f32),
+    uses(single_tap)
+)]
+#[cube(launch)]
+pub fn self_path_gain_kernel<F: Float + CubeElement>(x: &Array<F>, y: &mut Array<F>, gain: F) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = self::single_tap::<F>(x[ABSOLUTE_POS], gain);
+    }
+}
+
 /// Composed kernel B: calls `fir_pair_scaled`, which itself calls
 /// `fir_pair` and `single_tap` — two levels of composition end to end, and
 /// `single_tap` reused across both `gain_kernel` (directly) and this kernel
@@ -906,6 +933,44 @@ mod tests {
         let mut y = vec![9.0f32; 3];
         gain_kernel_vericl::reference(&x, &mut y, 2.0, 256);
         assert_eq!(y, vec![2.0, 2.0, 2.0]);
+    }
+
+    /// Fix 3 regression pin: `self_path_gain_kernel`'s twin (`self::`-
+    /// qualified `single_tap` call) must produce byte-identical results to
+    /// `gain_kernel`'s (bare call) — the same expected values as
+    /// `gain_kernel_twin_matches_hand_computed` above, for the same inputs.
+    /// Pre-fix, this would have *coincidentally* still passed (the
+    /// bypassed, un-rewritten path called the original `#[cube] fn
+    /// single_tap`, which is host-safe and computes the same thing as
+    /// `single_tap_vericl_ref`) — the differential can't distinguish the
+    /// two; see `uses_rewrite_fold_rewrites_self_qualified_helper_call` in
+    /// `vericl-macros` for the AST-level pin that actually catches the
+    /// bypass.
+    #[test]
+    fn self_path_gain_kernel_twin_matches_hand_computed() {
+        let x = vec![1.0f32, -2.0, 3.0];
+        let mut y = vec![0.0f32; x.len()];
+        self_path_gain_kernel_vericl::reference(&x, &mut y, 2.0, x.len());
+        assert_eq!(y, vec![2.0, -4.0, 6.0]);
+    }
+
+    /// Fix 3 regression pin: `self_path_gain_kernel`'s bounds proof
+    /// discharges identically to `gain_kernel`'s (same obligation count) —
+    /// the `self::`-qualified call composes through the prover exactly like
+    /// the bare call, since both inline the same helper IR into the same
+    /// kernel `Scope` either way.
+    #[test]
+    fn self_path_gain_kernel_definition_is_provably_in_bounds() {
+        let def = self_path_gain_kernel_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = self_path_gain_kernel_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved, got {other:?}"),
+        }
     }
 
     /// `fir_pair_kernel`'s twin (two-level composition: kernel ->

@@ -516,6 +516,103 @@ fn subst_type_tokens(ts: TokenStream2, subst: &GenericSubst) -> TokenStream2 {
     out
 }
 
+/// `Some(ident string)` when `ts` is exactly one bare identifier token
+/// (e.g. `f32`), `None` for anything else (a multi-segment path, a
+/// generic-args-carrying type, ...). Used by
+/// [`check_instantiate_local_collisions`]: an identifier is a single
+/// token, so a local binding's name can only ever collide with a concrete
+/// `instantiate(...)` type when that type reduces to exactly one.
+fn single_ident_string(ts: &TokenStream2) -> Option<String> {
+    let mut it = ts.clone().into_iter();
+    match (it.next(), it.next()) {
+        (Some(TokenTree::Ident(id)), None) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+/// Reject any local binding (`let`/`for`/closure pattern, or a parameter —
+/// see [`collect_locals`]) in a kernel's/helper's ORIGINAL (pre-
+/// substitution) body whose name collides with either an `instantiate(...)`
+/// generic type parameter's own ident (e.g. `F`) or its pinned concrete
+/// type's bare ident (e.g. `f32`, only when the concrete type reduces to a
+/// single identifier — see [`single_ident_string`]).
+///
+/// **Why this is needed:** `transform_body`/`subst_type_tokens`'s
+/// `instantiate(...)` substitution is purely lexical — a `TokenTree::Ident`
+/// string lookup with no notion of Rust's separate type/value namespaces.
+/// In real Rust, a type parameter `F` and a local binding also named `F`
+/// (or one named `f32`, matching the concrete type instantiate(...) pins
+/// `F` to) never collide — different namespaces, tracked correctly by
+/// rustc. The substitution doesn't know that: it rewrites every `F` token
+/// to `f32` regardless of which namespace it came from, so `let F = ...;`
+/// in the original kernel becomes `let f32 = ...;` in the derived twin —
+/// silently shadowing (or being shadowed by) an unrelated, already-present
+/// `f32` local, producing a twin that computes something different from
+/// the real kernel with no compile-time signal. Confirmed, not
+/// hypothetical: adversarial review round 2 demonstrated exactly this
+/// shape (`f_name_collision_kernel` in the reviewer's scratch crate) —
+/// the twin silently returned the *second*, shadowing local's value.
+///
+/// Deliberately conservative per this project's "reject rather than
+/// silently approximate" convention (see module docs): this flags a local
+/// merely *named* either sensitive string, not only the specific
+/// (harder-to-detect) shapes that actually produce a silent divergence —
+/// e.g. a lone `let F = ...` with no separate `f32` local anywhere would,
+/// in fact, still compute correctly (a pure, internally-consistent rename,
+/// since every use of `F` gets rewritten right along with its binding),
+/// but is rejected anyway rather than trying to prove the narrower "only
+/// reject when a *second*, independent binding already uses the resulting
+/// name" condition, which would need real scope-and-shadowing analysis
+/// `syn` alone can't give a proc-macro.
+fn check_instantiate_local_collisions(
+    block: &syn::Block,
+    params: &[Param],
+    subst: &GenericSubst,
+    span: proc_macro2::Span,
+    item_kind: &str,
+    fn_name_str: &str,
+) -> syn::Result<()> {
+    if subst.is_empty() {
+        return Ok(());
+    }
+    let mut sensitive: HashMap<String, &'static str> = HashMap::new();
+    for (param_name, ty_tokens) in subst {
+        sensitive.entry(param_name.clone()).or_insert("type parameter");
+        if let Some(concrete_name) = single_ident_string(ty_tokens) {
+            sensitive.entry(concrete_name).or_insert("instantiate(...)-pinned concrete type");
+        }
+    }
+
+    let locals = collect_locals(block, params);
+    let mut colliding: Vec<&String> = locals.iter().filter(|n| sensitive.contains_key(n.as_str())).collect();
+    colliding.sort();
+
+    let errors: Vec<syn::Error> = colliding
+        .into_iter()
+        .map(|name| {
+            let role = sensitive[name.as_str()];
+            syn::Error::new(
+                span,
+                format!(
+                    "local binding `{name}` collides with {item_kind} `{fn_name_str}`'s {role} \
+                     under instantiate(...) — rename the local; outside the vericl v0 subset \
+                     (instantiate(...)'s substitution is purely lexical, with no notion of \
+                     Rust's separate type/value namespaces, so this local would be silently \
+                     rewritten along with the type parameter)"
+                ),
+            )
+        })
+        .collect();
+
+    if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
+    Ok(())
+}
+
 /// `true` for the integer scalar types the `wrapping` clause accepts.
 /// Matched by trailing path segment so `u32`, `std::primitive::u32`, etc.
 /// all count, mirroring how `elem_of_array` matches `Array` by last segment.
@@ -809,8 +906,8 @@ fn collect_locals(block: &syn::Block, params: &[Param]) -> HashSet<String> {
 }
 
 /// Rewrites calls to `uses(...)`-listed helpers (`foo(args)` ->
-/// `foo_vericl_ref(args)`, `foo::<F>(args)` -> `foo_vericl_ref::<F>(args)`)
-/// in a twin body, and rejects any other bare (single-segment, e.g. not
+/// `foo_vericl_ref(args)`, `foo::<F>(args)` -> `foo_vericl_ref(args)`) in a
+/// twin body, and rejects any other bare (single-segment, e.g. not
 /// `Type::method`) call whose callee isn't recognized as either a local
 /// binding or a small, explicit allowlist of known host-safe free functions
 /// (`KNOWN_HOST_SAFE_FREE_FNS`).
@@ -843,6 +940,43 @@ fn collect_locals(block: &syn::Block, params: &[Param]) -> HashSet<String> {
 /// scope too (a spurious local match just avoids flagging something that
 /// might otherwise still not compile for unrelated reasons — real rustc
 /// still has the final word).
+///
+/// **Multi-segment paths** (e.g. `self::foo(...)`, round-2 adversarial
+/// review — a bare `p.path.segments.len() == 1` check let a call like
+/// `self::triple::<F>(x)` to a declared helper skip rewriting entirely,
+/// silently falling through to call the ORIGINAL, un-rewritten `#[cube]`
+/// item host-side): when a multi-segment call's LAST segment matches a
+/// `uses(...)`-declared helper name, it's rewritten too — turbofish
+/// stripped (same reasoning as the single-segment case) and, critically,
+/// **the whole path prefix is dropped**, not just the last segment renamed
+/// in place. This is necessary, not merely simpler: the twin body this
+/// fold runs over lives one module level deeper than the original call
+/// site (nested inside the generated `<name>_vericl` module, which does
+/// `use super::*;` to see everything the original item's own scope sees),
+/// so a prefix that was meaningful at the ORIGINAL call site — most
+/// commonly `self::`, meaning "this module" — does not still mean the same
+/// thing one level down (`self::` inside the twin module refers to the
+/// *twin* module, not the original one). The rewritten target
+/// (`<name>_vericl_ref`) is always reachable as a *bare* name via that same
+/// `use super::*;` glob (it's emitted as a plain sibling of the original
+/// item, in the original item's own declaring scope) — exactly the
+/// mechanism the single-segment case already relies on — so dropping the
+/// prefix entirely and emitting a bare call is both correct and uniform
+/// with the existing rewrite. A multi-segment call whose last segment does
+/// **not** match a declared helper is left completely untouched (not even
+/// checked against `locals`/the free-fn allowlist) — it's presumed to be a
+/// type-associated function (`f32::max(...)`) or some other path this
+/// crate has no sound way to validate; this is a **documented residual**,
+/// not a soundness gap covered by this fold's rejection guarantee (a
+/// multi-segment path to an *unlisted* helper, e.g. reached via
+/// `crate::other_module::helper(...)` where `helper_vericl_ref` isn't
+/// reachable via `use super::*;`, is a case this fold cannot distinguish
+/// from a legitimate external call — it stays untouched, which for an
+/// actual helper call means the ORIGINAL `#[cube]` item, not its twin,
+/// still gets called by the twin; not silently wrong in the way the
+/// `self::`-prefixed case was, since the composition design's own
+/// established shapes are single-module, but not exhaustively covered
+/// either).
 struct UsesRewriteFold<'a> {
     uses: &'a HashSet<String>,
     locals: &'a HashSet<String>,
@@ -886,6 +1020,29 @@ impl Fold for UsesRewriteFold<'_> {
                              this construct may be outside the vericl v0 subset"
                         ),
                     ));
+                }
+            } else if p.path.leading_colon.is_none() && p.path.segments.len() > 1 {
+                // Multi-segment path (module-qualified, e.g. `self::foo`) —
+                // see this struct's doc for why only a last-segment match
+                // against a declared helper is handled, and why handling it
+                // means dropping the whole prefix rather than rewriting the
+                // last segment in place.
+                if let Some(last) = p.path.segments.last() {
+                    let name = last.ident.to_string();
+                    if self.uses.contains(&name) {
+                        let span = last.ident.span();
+                        let mut new_seg = syn::PathSegment::from(Ident::new(
+                            &format!("{name}_vericl_ref"),
+                            span,
+                        ));
+                        new_seg.arguments = syn::PathArguments::None;
+                        let mut bare = Punctuated::new();
+                        bare.push(new_seg);
+                        p.path.segments = bare;
+                    }
+                    // A non-matching multi-segment call (`Type::method`, an
+                    // unrelated module path, ...) is left untouched — the
+                    // documented residual above.
                 }
             }
         }
@@ -1340,6 +1497,20 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         .collect::<syn::Result<_>>()?;
     let params: Vec<Param> = subst_args.iter().map(classify_param).collect::<syn::Result<_>>()?;
 
+    // instantiate(...) namespace-collision gate (see
+    // `check_instantiate_local_collisions`'s doc): must run on the
+    // ORIGINAL, pre-substitution body — `func.block`, not the twin body
+    // derived below — since a colliding local's name is still its real
+    // name at this point.
+    check_instantiate_local_collisions(
+        &func.block,
+        &params,
+        &plan.generic_subst,
+        func.sig.span(),
+        "kernel",
+        &fn_name_str,
+    )?;
+
     // `wrapping` rewrites `+`/`-`/`*`/`<<`/`>>` untyped — syn has no type
     // information at macro-expansion time — so it must not be allowed to
     // touch float math. Every parameter (including a #[comptime] const,
@@ -1670,6 +1841,10 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             /// already changes on a helper body edit too — this function
             /// additionally makes the *source-level* hash honor composition
             /// the same way, rather than leaving that half silently stale.
+            ///
+            /// NOTE: sensitive to `uses(...)`'s declaration *order*, not
+            /// just its set — see `::vericl::combine_source_hash`'s doc.
+            /// Safe direction (spurious staleness only), but worth knowing.
             pub fn identity() -> ::vericl::Identity {
                 ::vericl::check_helper_composition_depth(#fn_name_str, 0);
                 let mut __vericl_id = contract().identity();
@@ -1954,6 +2129,17 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
         .map(|arg| substitute_fn_arg(arg, &plan.generic_subst))
         .collect::<syn::Result<_>>()?;
     let params: Vec<Param> = subst_args.iter().map(classify_param).collect::<syn::Result<_>>()?;
+
+    // instantiate(...) namespace-collision gate — same check, same reason,
+    // as a kernel's (see `check_instantiate_local_collisions`'s doc).
+    check_instantiate_local_collisions(
+        &func.block,
+        &params,
+        &plan.generic_subst,
+        func.sig.span(),
+        "helper",
+        &fn_name_str,
+    )?;
 
     // --- twin body: the same ABSOLUTE_POS-banned (see `transform_body`'s
     // `allow_absolute_pos` doc) + generic-substituted + banned-construct
@@ -2658,5 +2844,124 @@ mod tests {
                 "`{name}` is both whitelisted and rejected"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Fix 3 (round-2 adversarial review): multi-segment call bypass in
+    // `UsesRewriteFold`. A black-box differential/GPU probe can't actually
+    // distinguish "correctly rewritten to call `triple_vericl_ref`" from
+    // "silently still calling the original `triple`" here, since both are
+    // mechanically derived from identical source and (for a host-safe
+    // body) compute the same answer either way — these are white-box unit
+    // tests over the fold itself, asserting on the resulting AST directly.
+    // -----------------------------------------------------------------
+
+    /// A `self::`-qualified call to a declared helper is rewritten to a
+    /// *bare* call (whole prefix dropped, not just the last segment
+    /// renamed in place — see the struct doc for why that's required) with
+    /// turbofish stripped, exactly like the single-segment case.
+    #[test]
+    fn uses_rewrite_fold_rewrites_self_qualified_helper_call() {
+        let uses: HashSet<String> = ["triple".to_string()].into_iter().collect();
+        let locals: HashSet<String> = HashSet::new();
+        let mut fold = UsesRewriteFold { uses: &uses, locals: &locals, errors: Vec::new() };
+        let expr: Expr = syn::parse_str("self::triple::<F>(x)").expect("valid expr");
+        let rewritten = fold.fold_expr(expr);
+        assert!(fold.errors.is_empty(), "unexpected errors: {:?}", fold.errors);
+
+        let Expr::Call(call) = &rewritten else { panic!("expected a call expression") };
+        let Expr::Path(p) = call.func.as_ref() else { panic!("expected a path callee") };
+        assert_eq!(p.path.segments.len(), 1, "the `self::` prefix must be dropped entirely");
+        assert_eq!(p.path.segments[0].ident, "triple_vericl_ref");
+        assert!(
+            matches!(p.path.segments[0].arguments, syn::PathArguments::None),
+            "turbofish must be stripped, got {:?}",
+            p.path.segments[0].arguments
+        );
+    }
+
+    /// A multi-segment call whose last segment does NOT match a declared
+    /// helper (the `Type::method` shape, e.g. `f32::max`) is left
+    /// byte-for-byte untouched — the documented residual, not silently
+    /// mis-rewritten.
+    #[test]
+    fn uses_rewrite_fold_leaves_non_matching_multi_segment_call_untouched() {
+        let uses: HashSet<String> = ["triple".to_string()].into_iter().collect();
+        let locals: HashSet<String> = HashSet::new();
+        let mut fold = UsesRewriteFold { uses: &uses, locals: &locals, errors: Vec::new() };
+        let expr: Expr = syn::parse_str("f32::max(a, b)").expect("valid expr");
+        let before = expr.to_token_stream().to_string();
+        let rewritten = fold.fold_expr(expr);
+        assert!(fold.errors.is_empty(), "unexpected errors: {:?}", fold.errors);
+        assert_eq!(rewritten.to_token_stream().to_string(), before);
+    }
+
+    // -----------------------------------------------------------------
+    // Fix 2 (round-2 adversarial review): instantiate(...) namespace
+    // collision.
+    // -----------------------------------------------------------------
+
+    /// A local named exactly as the generic type parameter, or exactly as
+    /// its pinned concrete type, is rejected — both collisions, in one
+    /// body, produce one combined error naming each.
+    #[test]
+    fn instantiate_local_collision_is_rejected() {
+        let block: syn::Block = syn::parse_str("{ let F = 1; let f32 = 2; }").expect("valid block");
+        let mut subst: GenericSubst = HashMap::new();
+        subst.insert("F".to_string(), quote::quote! { f32 });
+
+        let err = check_instantiate_local_collisions(
+            &block,
+            &[],
+            &subst,
+            proc_macro2::Span::call_site(),
+            "kernel",
+            "demo",
+        )
+        .expect_err("expected a collision error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("local binding `F`") && msg.contains("type parameter"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    /// No collision, no error — the ordinary, unaffected case (most
+    /// kernels/helpers, generic or not).
+    #[test]
+    fn instantiate_no_collision_is_accepted() {
+        let block: syn::Block =
+            syn::parse_str("{ let idx = 0usize; let val = idx; }").expect("valid block");
+        let mut subst: GenericSubst = HashMap::new();
+        subst.insert("F".to_string(), quote::quote! { f32 });
+
+        check_instantiate_local_collisions(
+            &block,
+            &[],
+            &subst,
+            proc_macro2::Span::call_site(),
+            "kernel",
+            "demo",
+        )
+        .expect("no local collides, should be accepted");
+    }
+
+    /// An empty substitution (no `instantiate(...)` clause, or one with no
+    /// generic type parameters — e.g. comptime-only) is always a no-op,
+    /// regardless of what the body contains.
+    #[test]
+    fn instantiate_empty_subst_is_always_accepted() {
+        let block: syn::Block = syn::parse_str("{ let F = 1; let f32 = 2; }").expect("valid block");
+        let subst: GenericSubst = HashMap::new();
+
+        check_instantiate_local_collisions(
+            &block,
+            &[],
+            &subst,
+            proc_macro2::Span::call_site(),
+            "kernel",
+            "demo",
+        )
+        .expect("empty subst must never reject anything");
     }
 }

@@ -29,6 +29,46 @@
 //!   a position that would affect the proof, only from positions that
 //!   provably can't (array contents, which this checker never reasons
 //!   about).
+//! - **Branch-scoped write taint (If/IfElse):** `self.smt.push()/pop()`
+//!   scopes *path conditions* around an `If`/`IfElse` arm, but `self.memo`
+//!   (the `VariableKind` -> symbolic-value map) is a completely separate
+//!   piece of state with no SMT-level equivalent — a naive walk that just
+//!   mutates it in place while walking an arm would let a variable
+//!   reassignment made *inside* one arm leak into the other arm, and into
+//!   code after the branch closes, unconditionally (REGRESSION, adversarial
+//!   review round 2: confirmed false `Proved` on a real OOB write — a
+//!   variable clamped to a safe value only on a near-impossible path made an
+//!   unrelated, unguarded, genuinely-unbounded use of that same variable
+//!   look safe). `process_branch` fixes this with snapshot/restore +
+//!   write-taint: before walking an arm, `self.memo` is fully cloned
+//!   (`SExpr` is `Copy` and the map is small, so this is cheap); the arm is
+//!   walked against that snapshot; for `IfElse`, the snapshot is restored
+//!   *before* walking the else arm (so the if-arm's writes are invisible to
+//!   it); after the construct, the snapshot is restored once more and then
+//!   every `VariableKind` written *anywhere* in either arm (both arms, for
+//!   `IfElse`; the one arm, for `If`) is set back to tainted (`None`) —
+//!   deliberately conservative, per the same taint discipline as everywhere
+//!   else in this file: v0 does not attempt if/else value merging (a
+//!   variable set to the *same* value in both arms still taints), and a
+//!   later use that actually needs the value fails explicitly at that site
+//!   as `OutOfSubset` rather than silently, or worse, `Proved`ing on a
+//!   leaked value. "Written anywhere in either arm" is tracked by
+//!   `write_log_stack`, a stack of `VariableKind` sets with one frame per
+//!   currently-open arm, pushed before and popped after that arm's walk;
+//!   every genuine variable write (`bind_out`/`taint_out`, and the loop-carry
+//!   pre/post taint below — anything that goes through the shared `set_var`
+//!   helper) records into whatever frame is currently on *top* of the
+//!   stack, never `value_of`'s read-only resolution caching. This composes
+//!   correctly for nested branches with no special-casing: an inner
+//!   `If`/`IfElse` finishes (and pops its own frame) strictly before its
+//!   enclosing arm's walk completes, and its own merge step re-applies its
+//!   taints via the same `set_var` helper — which, by then, logs into
+//!   whatever frame is now on top (the *enclosing* arm's), so a write two
+//!   levels deep still reaches the outermost merge without needing every
+//!   frame to observe every write directly. Obligations checked *inside* an
+//!   arm are unaffected by any of this — they still resolve against
+//!   whatever `self.memo` holds live at that point in the walk, under that
+//!   arm's own pushed path condition, exactly as before.
 //! - `Branch::RangeLoop` is modeled as "fresh var `i` with `start <= i (<)= end`,
 //!   walk the body once" (no unrolling) per the architecture doc. This is
 //!   sound for per-iteration obligations (proving in-bounds for an arbitrary
@@ -197,6 +237,7 @@ pub fn prove_bounds_freedom(
         fresh: 0,
         obligations: 0,
         carried_stack: Vec::new(),
+        write_log_stack: Vec::new(),
     };
 
     if let Err(e) = prover.assert_structured_assumes(assumes) {
@@ -254,6 +295,16 @@ struct Prover<'a, 'b> {
     /// being walked. Empty outside of (nested) carried loops, so this costs
     /// nothing for every kernel that doesn't have one.
     carried_stack: Vec<HashSet<VariableKind>>,
+    /// Stack of "written variable" sets, one frame per currently-open
+    /// `If`/`IfElse` arm being walked (see the module docs' "Branch-scoped
+    /// write taint"). Every genuine variable write goes through `set_var`,
+    /// which records `kind` into whichever frame is on *top* of this stack
+    /// (if any) — `process_branch` pushes a fresh frame before walking an
+    /// arm and pops it after, using the popped set to know exactly which
+    /// variables to re-taint once the arm's private memo state is
+    /// discarded. Empty outside of (nested) branches, so this costs
+    /// nothing for a kernel with no `If`/`IfElse` at all.
+    write_log_stack: Vec<HashSet<VariableKind>>,
 }
 
 impl<'a, 'b> Prover<'a, 'b> {
@@ -354,9 +405,26 @@ impl<'a, 'b> Prover<'a, 'b> {
         Ok(())
     }
 
+    /// Write `val` to `kind`'s memo slot, and — if a branch arm is
+    /// currently being walked — record the write into the top frame of
+    /// `write_log_stack` (module docs' "Branch-scoped write taint"). This is
+    /// the single point every *genuine* variable write goes through
+    /// (`bind_out`, `taint_out`, and the loop-carry pre/post taint in
+    /// `process_range_loop`), as opposed to `value_of`'s read-only
+    /// resolution caching, which must NOT be logged here — see the module
+    /// docs for why logging a read's cache-fill would be actively wrong
+    /// (it would spuriously re-taint e.g. `ABSOLUTE_POS` the first time a
+    /// branch happens to be where it's lazily resolved).
+    fn set_var(&mut self, kind: VariableKind, val: Option<SExpr>) {
+        self.memo.insert(kind, val);
+        if let Some(frame) = self.write_log_stack.last_mut() {
+            frame.insert(kind);
+        }
+    }
+
     fn taint_out(&mut self, inst: &Instruction) {
         if let Some(out) = inst.out {
-            self.memo.insert(out.kind, None);
+            self.set_var(out.kind, None);
         }
     }
 
@@ -369,7 +437,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             // uses within that same single symbolic iteration, and nothing
             // here tracks that scoping precisely enough to bound its reuse.
             let val = if self.is_carried(out.kind) { None } else { val };
-            self.memo.insert(out.kind, val);
+            self.set_var(out.kind, val);
         }
     }
 
@@ -666,28 +734,70 @@ impl<'a, 'b> Prover<'a, 'b> {
 
     fn process_branch(&mut self, b: &Branch) -> Result<(), Stop> {
         match b {
+            // Branch-scoped write taint (module docs): `self.memo` is
+            // snapshotted before the arm, walked against the snapshot, and
+            // — for `IfElse` — restored again before the other arm, so
+            // neither arm ever sees the other's writes. After the
+            // construct, the snapshot is restored once more and every
+            // variable written anywhere in the arm(s) (tracked via
+            // `write_log_stack`) is explicitly re-tainted, rather than
+            // trusting whichever arm happened to run last.
             Branch::If(if_) => {
                 let cond = self.cond_of(&if_.cond, "if")?;
+                let snapshot = self.memo.clone();
+                self.write_log_stack.push(HashSet::new());
                 self.smt.push().map_err(smt_err)?;
                 self.smt.assert(cond).map_err(smt_err)?;
                 let r = self.process_scope(&if_.scope);
                 self.smt.pop().map_err(smt_err)?;
-                r
+                let written =
+                    self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
+                r?;
+                self.memo = snapshot;
+                // Routed through `set_var` (not a raw `memo.insert`) so a
+                // write two levels deep still reaches an *enclosing* arm's
+                // own write-log frame, if there is one — see the module
+                // docs' "composes correctly for nested branches".
+                for k in written {
+                    self.set_var(k, None);
+                }
+                Ok(())
             }
             Branch::IfElse(ie) => {
                 let cond = self.cond_of(&ie.cond, "if/else")?;
+                let snapshot = self.memo.clone();
+
+                self.write_log_stack.push(HashSet::new());
                 self.smt.push().map_err(smt_err)?;
                 self.smt.assert(cond).map_err(smt_err)?;
                 let r1 = self.process_scope(&ie.scope_if);
                 self.smt.pop().map_err(smt_err)?;
+                let written_if =
+                    self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
                 r1?;
 
+                // Restore the pre-branch snapshot before walking the else
+                // arm: without this, the else arm would see the if arm's
+                // writes (the confirmed round-2 manifestation).
+                self.memo = snapshot.clone();
+
+                self.write_log_stack.push(HashSet::new());
                 let not_cond = self.smt.not(cond);
                 self.smt.push().map_err(smt_err)?;
                 self.smt.assert(not_cond).map_err(smt_err)?;
                 let r2 = self.process_scope(&ie.scope_else);
                 self.smt.pop().map_err(smt_err)?;
-                r2
+                let written_else =
+                    self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
+                r2?;
+
+                self.memo = snapshot;
+                // Same `set_var` routing as the `If` arm above, for the
+                // same nested-composition reason.
+                for k in written_if.into_iter().chain(written_else) {
+                    self.set_var(k, None);
+                }
+                Ok(())
             }
             Branch::RangeLoop(rl) => self.process_range_loop(rl),
             Branch::Loop(_) => Err(Stop::OutOfSubset(
@@ -743,7 +853,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         let outer: HashSet<VariableKind> = self.memo.keys().copied().collect();
         let carried = scope_reassigned_vars(&rl.scope, &outer);
         for &k in &carried {
-            self.memo.insert(k, None);
+            self.set_var(k, None);
         }
         self.carried_stack.push(carried.clone());
 
@@ -754,8 +864,12 @@ impl<'a, 'b> Prover<'a, 'b> {
         // key is `None` by now (any write to it during the walk was forced
         // tainted), but re-asserting it here makes "and after the loop" an
         // explicit invariant rather than one that merely happens to hold.
+        // Routed through `set_var` (not a raw `memo.insert`) so this also
+        // registers as a write for an enclosing branch arm, if this loop is
+        // itself nested inside one — see module docs' "Branch-scoped write
+        // taint".
         for &k in &carried {
-            self.memo.insert(k, None);
+            self.set_var(k, None);
         }
         r
     }
@@ -1045,6 +1159,273 @@ mod tests {
     fn z3_version_reports_a_version_string() {
         let v = z3_version().expect("z3 should be on PATH");
         assert!(v.to_lowercase().contains("z3"), "unexpected version string: {v}");
+    }
+
+    // -----------------------------------------------------------------
+    // Branch-scoped write taint (If/IfElse) — REGRESSION, adversarial
+    // soundness review round 2. See the module docs' "Branch-scoped write
+    // taint" bullet for the fix; each test here pins one of the three
+    // confirmed false-`Proved` manifestations, plus a nested-branch
+    // composition check.
+    // -----------------------------------------------------------------
+
+    /// Manifestation 1 (reviewer's `if_merge_bug` shape): a variable
+    /// clamped to a safe value inside an `If` with no `else` must not leak
+    /// that clamp past the branch — `idx` is really `ABSOLUTE_POS`
+    /// (unbounded) on every thread that doesn't take the (near-impossible)
+    /// guard, but pre-fix the prover treated `idx == 0` as unconditional
+    /// after the `if` closed, `Proved`ing an access that's genuinely
+    /// unbounded. Post-fix: `idx` is tainted (written inside the arm), so
+    /// the write index resolution fails explicitly, right here, rather
+    /// than silently (or worse, `Proved`).
+    #[cube(launch)]
+    fn prover_test_if_write_leak(y: &mut Array<f32>) {
+        let mut idx: usize = ABSOLUTE_POS;
+        if ABSOLUTE_POS >= 1000000usize {
+            idx = 0usize;
+        }
+        y[idx] = 1.0f32;
+    }
+
+    #[test]
+    fn branch_write_does_not_leak_past_if() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_if_write_leak::expand(&mut builder.scope, y);
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        // Pin y.len() == 1: if the merge bug were still present, the
+        // prover would see `idx` as unconditionally 0 here (0 < 1, safe)
+        // even though the real value is ABSOLUTE_POS on almost every
+        // thread of any dispatch with more than one thread.
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "y", value: 1 }]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("write index") && reason.contains("y"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (idx tainted, never Proved), got {other:?}"),
+        }
+    }
+
+    /// Manifestation 2 (reviewer's `if_else_merge_bug` shape): the else
+    /// arm must not see the if arm's writes. `idx` is untouched on the
+    /// else path, so its real value there is `ABSOLUTE_POS` — genuinely
+    /// unbounded against `y.len() == 1`. Pre-fix, walking both arms
+    /// against the same unscoped `self.memo` meant the else arm inherited
+    /// whatever the if arm (walked first) had already written, which
+    /// happened to still be unsafe here (so this exact kernel refuted even
+    /// before the fix) — but for the wrong reason (a leaked value, not a
+    /// correctly-scoped one). Fixed: the else arm resolves `idx` from the
+    /// restored pre-branch snapshot (`ABSOLUTE_POS`), and the obligation
+    /// is refuted on genuine grounds.
+    // `idx = 0usize` below is a dead write by design (mirrors the
+    // reviewer's exact repro kernel) — the whole point of this shape is
+    // that it must not leak, not that it's ever read.
+    #[cube(launch)]
+    #[allow(unused_assignments)]
+    fn prover_test_if_arm_write_leaks_into_else(y: &mut Array<f32>) {
+        let mut idx: usize = ABSOLUTE_POS;
+        if ABSOLUTE_POS >= 1000000usize {
+            idx = 0usize;
+        } else {
+            y[idx] = 2.0f32;
+        }
+    }
+
+    #[test]
+    fn if_arm_write_does_not_leak_into_else_arm() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_if_arm_write_leaks_into_else::expand(&mut builder.scope, y);
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "y", value: 1 }]) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains('y'), "unexpected obligation: {obligation}");
+                assert!(!counterexample.is_empty());
+            }
+            other => panic!("expected Refuted (else arm's real, unbounded idx), got {other:?}"),
+        }
+    }
+
+    /// Manifestation 3 (reviewer's `post_ifelse_false_proved` shape): a
+    /// post-`IfElse` read must not silently resolve to whichever arm was
+    /// walked last. Both arms write `idx` (the if arm writes the real,
+    /// unbounded `ABSOLUTE_POS`; the else arm clamps to a safe `0`) — pre-
+    /// fix, the else arm's write (processed last, per the original
+    /// sequential walk with no restore) always won at the merge point,
+    /// making the post-branch `y[idx]` look like `y[0]`, always safe, even
+    /// though `idx == ABSOLUTE_POS` on the overwhelmingly common dispatch
+    /// (the if arm's own condition, `ABSOLUTE_POS < 1_000_000`). Fixed: the
+    /// merge taints `idx` (written in both arms) rather than merging to
+    /// either arm's value, so the post-branch use fails explicitly.
+    // The initial `idx = ABSOLUTE_POS` below is unconditionally overwritten
+    // on both arms (that's the point — both arms write `idx`, feeding the
+    // post-merge taint this test pins).
+    #[cube(launch)]
+    #[allow(unused_assignments)]
+    fn prover_test_post_ifelse_merge_taints(y: &mut Array<f32>) {
+        let mut idx: usize = ABSOLUTE_POS;
+        if ABSOLUTE_POS < 1000000usize {
+            idx = ABSOLUTE_POS;
+        } else {
+            idx = 0usize;
+        }
+        y[idx] = 5.0f32;
+    }
+
+    #[test]
+    fn post_ifelse_merge_taints_branch_written_vars() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_post_ifelse_merge_taints::expand(&mut builder.scope, y);
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "y", value: 1 }]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("write index") && reason.contains("y"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (idx tainted post-merge), got {other:?}"),
+        }
+    }
+
+    /// Nested branches: a write two levels deep (inside an `IfElse` nested
+    /// inside an outer `If`'s only arm) must still reach the *outer*
+    /// merge's taint set — proving the write-log stack composes
+    /// recursively, not just for a single level of nesting — AND must not
+    /// leak into the outer `If`'s sibling had there been one (there isn't
+    /// one here; `if_arm_write_does_not_leak_into_else_arm` above already
+    /// covers the single-level sibling-leak case). Real semantics: `idx`
+    /// is written by the inner `IfElse` (to `0` or `1`, depending on which
+    /// inner arm), so by the time the outer `If` closes, `idx`'s value on
+    /// the taken-outer-arm path is genuinely path-dependent — the outer
+    /// merge must taint it, not leave it at its restored pre-outer-if
+    /// value (`ABSOLUTE_POS`, which would itself still correctly refute —
+    /// the interesting failure mode this test guards against is the
+    /// *opposite*: the inner merge's taint failing to propagate up at all,
+    /// silently leaving `idx` resolved to whatever `self.memo` last held
+    /// for it before the inner branch, which is exactly the bug this test
+    /// would need to exist to catch if write-log composition were broken).
+    #[cube(launch)]
+    fn prover_test_nested_branches(y: &mut Array<f32>) {
+        let mut idx: usize = ABSOLUTE_POS;
+        if ABSOLUTE_POS < 1000000usize {
+            if ABSOLUTE_POS < 500000usize {
+                idx = 0usize;
+            } else {
+                idx = 1usize;
+            }
+        }
+        y[idx] = 5.0f32;
+    }
+
+    #[test]
+    fn nested_branches_restore_correctly() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_nested_branches::expand(&mut builder.scope, y);
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "y", value: 1 }]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("write index") && reason.contains("y"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!(
+                "expected OutOfSubset (idx tainted by the outer If's merge, via the nested \
+                 IfElse's writes propagating up through write_log_stack), got {other:?}"
+            ),
+        }
+    }
+
+    /// The other half of "nested branches restore correctly": a write two
+    /// levels deep (inside an `IfElse` nested inside the OUTER `IfElse`'s
+    /// `if` arm) must not leak into the OUTER construct's own `else` arm
+    /// (a true sibling, unlike the no-else case above). `idx` is untouched
+    /// on the outer else path, so its real value there is `ABSOLUTE_POS` —
+    /// genuinely unbounded against `y.len() == 1`. If the inner branch's
+    /// writes ever escaped their own snapshot/restore *before* the outer
+    /// snapshot is restored for the outer else arm, they'd corrupt what the
+    /// outer else arm sees; since the outer restore is a full `self.memo`
+    /// clone taken before the outer `if` arm (nested branch included) ever
+    /// runs, this composes automatically — this test exists to pin that
+    /// down explicitly, at two levels of nesting, rather than trust it by
+    /// construction.
+    // Both nested-arm writes below are dead by design (mirrors the other
+    // sibling-leak shape above) — the point is that they must not leak,
+    // not that they're read.
+    #[cube(launch)]
+    #[allow(unused_assignments)]
+    fn prover_test_nested_branch_write_does_not_leak_into_outer_sibling(y: &mut Array<f32>) {
+        let mut idx: usize = ABSOLUTE_POS;
+        if ABSOLUTE_POS >= 1000000usize {
+            if ABSOLUTE_POS >= 2000000usize {
+                idx = 0usize;
+            } else {
+                idx = 1usize;
+            }
+        } else {
+            y[idx] = 8.0f32;
+        }
+    }
+
+    #[test]
+    fn nested_branch_write_does_not_leak_into_outer_sibling() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_nested_branch_write_does_not_leak_into_outer_sibling::expand(
+            &mut builder.scope,
+            y,
+        );
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "y", value: 1 }]) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains('y'), "unexpected obligation: {obligation}");
+                assert!(!counterexample.is_empty());
+            }
+            other => panic!(
+                "expected Refuted (outer else arm's real, unbounded idx — untouched by the \
+                 nested IfElse in the outer if arm), got {other:?}"
+            ),
+        }
     }
 
     #[cube(launch)]
