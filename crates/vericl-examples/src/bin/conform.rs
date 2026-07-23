@@ -50,6 +50,9 @@ fn prove_kernel(
             vericl::StructuredAssume::ElemsBelowConst { arr, bound } => {
                 vericl_ir::Assume::ElemsBelowConst { arr, bound }
             }
+            vericl::StructuredAssume::LenPlusConstLe { a, k, b } => {
+                vericl_ir::Assume::LenPlusConstLe { a, k, b }
+            }
         })
         .collect();
     vericl_ir::prove_bounds_freedom(def, &buffers, &assumes)

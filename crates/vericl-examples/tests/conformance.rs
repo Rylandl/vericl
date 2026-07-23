@@ -25,6 +25,15 @@ vericl::suite! {
         // SMT bounds), the latter only reachable because the element-range
         // assume models the loaded offset `< x.len()`.
         gather_copy,
+        // match / Switch (quick-wins batch 1): a `match` on the scalar `mode`
+        // lowers to `Branch::Switch`, modeled by the prover as an exhaustive
+        // if-chain. Carries `tested` (differential) + `proved` (6-obligation
+        // SMT bounds, 3 arms × {x read, y write}).
+        select_mode,
+        // Length-relationship assume (quick-wins batch 1): `y.len() + 4 <=
+        // x.len()` discharges the forward read `x[i + 4]` under a `i < y.len()`
+        // guard. Carries `tested` + `proved` (3-obligation SMT bounds).
+        offset_window,
         // Cooperative (workgroup-shared-memory) reduction — the shared-memory
         // milestone (docs/design-shared-memory.md). Carries the triple: tested
         // (differential, race-freedom dependency cited) + proved smt-oob-freedom

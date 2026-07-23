@@ -331,6 +331,76 @@ pub fn gather_oob(x: &Array<f32>, offsets: &Array<u32>, y: &mut Array<f32>) {
 }
 
 // ---------------------------------------------------------------------------
+// match / Switch (quick-wins batch 1) — a Rust `match` on an integer scalar
+// lowers to `Branch::Switch`, modeled by the prover as an exhaustive if-chain
+// (crates/vericl-ir/src/prover.rs, "Switch modeling"). Each arm is bounds-
+// checked under its own path condition `mode == case_i`; the default under the
+// conjunction of the negations.
+// ---------------------------------------------------------------------------
+
+/// Mode-selected elementwise op: a `match` on the scalar `mode` selects the
+/// transform applied to each element (identity / negate / double). The guard
+/// `ABSOLUTE_POS < y.len()` bounds every arm's `x`/`y` access; the `match`
+/// lowers to a `Branch::Switch` whose three arms (case 0, case 1, default) the
+/// prover bounds-checks individually. Every op is a single exact f32 operation
+/// (copy, negate, ×2 — no fma contraction possible), so the comparison is
+/// bit-exact (`max_ulp = 0`). `mode` is drawn across `0..=3` so the two cases
+/// and the default arm are all exercised on the differential lane. Wired into
+/// `vericl::suite!` — carries `tested` (differential) + `proved` (6-obligation
+/// SMT bounds: 3 arms × {`x` read, `y` write}) claims.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(mode in 0..=3, x in -10.0..=10.0, y in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn select_mode(mode: u32, x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        match mode {
+            0 => {
+                y[ABSOLUTE_POS] = x[ABSOLUTE_POS];
+            }
+            1 => {
+                y[ABSOLUTE_POS] = -x[ABSOLUTE_POS];
+            }
+            _ => {
+                y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * 2.0f32;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Length-relationship assume (quick-wins batch 1) — `A.len() + K <= B.len()`,
+// the "additive anchor" host-side buffer-sizing invariant. An offset read
+// `x[i + K]` guarded only by `i < y.len()` is in bounds exactly when
+// `y.len() + K <= x.len()`; the new `StructuredAssume::LenPlusConstLe` supplies
+// that relationship for the prover.
+// ---------------------------------------------------------------------------
+
+/// Offset-window sum: `y[i] = x[i] + x[i + 4]`, guarded by `i < y.len()`. The
+/// forward read `x[i + 4]` needs `i + 4 < x.len()`, which the length-
+/// relationship assume `y.len() + 4 <= x.len()` supplies (combined with the
+/// guard `i < y.len()`). This is the additive-anchor shape from the dogfood
+/// findings, isolated to the pure length relationship. `gen(... len(x = n + 4))`
+/// sizes `x` four elements longer than the dispatch/`y`, satisfying the
+/// declared invariant on every differential case. A single f32 add is bit-exact
+/// vs the backend (`max_ulp = 0`). Wired into `vericl::suite!` — carries
+/// `tested` (differential) + `proved` (3-obligation SMT bounds: `x[i]`,
+/// `x[i + 4]`, `y[i]`) claims.
+#[vericl::kernel(
+    assumes(y.len() + 4 <= x.len()),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, len(x = n + 4))
+)]
+#[cube(launch)]
+pub fn offset_window(x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + x[ABSOLUTE_POS + 4usize];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Kernel composition: #[vericl::helper] + uses(...) — the milestone this
 // section demonstrates (docs/dogfood-2026-07.md Tier-1 gap #2, blocking
 // 16/22 dogfooded kernels). See README "Kernel composition" for the design.
@@ -1640,6 +1710,105 @@ mod tests {
                 );
             }
             other => panic!("expected Refuted (offset overruns x), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // match / Switch (quick-wins batch 1).
+    // -----------------------------------------------------------------
+
+    /// The derived twin re-emits the `match` and selects the same arm the GPU
+    /// does — guards the twin derivation for the Switch shape (mode 0 =
+    /// identity, mode 1 = negate, default = double).
+    #[test]
+    fn select_mode_twin_matches_hand_computed() {
+        let x = vec![1.0f32, -2.0, 3.0, -4.0];
+        let expect = |mode: u32, f: fn(f32) -> f32| {
+            let mut y = vec![0.0f32; 4];
+            select_mode_vericl::reference(mode, &x, &mut y, 4);
+            let want: Vec<f32> = x.iter().copied().map(f).collect();
+            assert_eq!(y, want, "mode {mode}");
+        };
+        expect(0, |v| v);
+        expect(1, |v| -v);
+        expect(2, |v| v * 2.0); // default arm
+        expect(7, |v| v * 2.0); // any un-listed value → default
+    }
+
+    /// A guarded `match` proves in bounds: each of the three arms (case 0,
+    /// case 1, default) is bounds-checked under its own path condition, 3 arms
+    /// × {`x` read, `y` write} = 6 obligations.
+    #[test]
+    fn select_mode_kernel_definition_is_provably_in_bounds() {
+        let def = select_mode_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = select_mode_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 6),
+            other => panic!("expected Proved (guarded match), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Length-relationship assume (quick-wins batch 1).
+    // -----------------------------------------------------------------
+
+    /// The length-relationship clause is recognized into the structured shape.
+    #[test]
+    fn offset_window_structured_assumes() {
+        assert_eq!(
+            offset_window_vericl::contract().structured_assumes,
+            &[vericl::StructuredAssume::LenPlusConstLe { a: "y", k: 4, b: "x" }]
+        );
+    }
+
+    /// The derived twin performs the offset-window sum its body says.
+    #[test]
+    fn offset_window_twin_matches_hand_computed() {
+        // x is longer than y by the window (4); y indexes 0..4.
+        let x = vec![1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let mut y = vec![0.0f32; 4];
+        offset_window_vericl::reference(&x, &mut y, 4);
+        // y[i] = x[i] + x[i + 4]
+        assert_eq!(y, vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    /// The milestone's headline: `x[i + 4]` proves in bounds only because the
+    /// length relationship `y.len() + 4 <= x.len()` is declared (3 obligations:
+    /// `x[i]`, `x[i + 4]`, `y[i]`).
+    #[test]
+    fn offset_window_kernel_definition_is_provably_in_bounds() {
+        let def = offset_window_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = offset_window_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenPlusConstLe { a: "y", k: 4, b: "x" }];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved (offset window), got {other:?}"),
+        }
+    }
+
+    /// Backstop: WITHOUT the length relationship, the forward read is NOT
+    /// provable — a string-only (unrecognized) length clause cannot be
+    /// laundered into a bounds certificate. Only `x.len() == y.len()` is given,
+    /// which proves `x[i]` but leaves `x[i + 4]` unbounded.
+    #[test]
+    fn offset_window_is_not_provable_without_relationship() {
+        let def = offset_window_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = offset_window_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+        if let vericl_ir::ProveResult::Proved { .. } =
+            vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes)
+        {
+            panic!("offset window must NOT prove without the length relationship");
         }
     }
 

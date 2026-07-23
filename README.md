@@ -393,8 +393,8 @@ produced from is rejected, not warned about.
 The first proved claim is live: out-of-bounds freedom for `axpy`, `xorshift_step`, and `mix_u32`,
 discharged in QF_LIA by z3 (subprocess, via `easy-smt`) over each kernel's CubeCL IR — every
 `Index`/`IndexAssign` obligation negated and checked UNSAT, with anything outside the supported
-subset (bare loops, `Switch`, vectorized indexing, float-valued indices) reported explicitly rather
-than silently skipped. The z3 binary, its bounds-obligation encoding, and CubeCL's front-end
+subset (unbounded `while`/`loop`, vectorized indexing, float-valued indices) reported explicitly
+rather than silently skipped. The z3 binary, its bounds-obligation encoding, and CubeCL's front-end
 expansion are recorded as trusted for this claim, since the proof is about the IR and codegen below
 it stays covered only by the tested differential claims. Kernel identity now also carries an
 IR-level content hash alongside the source-level one, so evidence goes stale on either kind of
@@ -418,6 +418,28 @@ range, stated once). A write to `A`'s elements invalidates the assumption for ev
 `A` (including across loop iterations), and a *wrong* (too-loose) bound does not hide a bug: `gather_oob`
 (a stale constant bound looser than the indexed array) REFUTES with the fresh element symbol pinned at
 the boundary.
+
+**`match` on integers (`Branch::Switch`).** A Rust `match` on an integer scrutinee lowers to a
+`Branch::Switch`, which the prover models as an exhaustive if-chain: each case arm is bounds-checked
+under its own path condition `value == case_i`, and the default arm under the conjunction of all
+`value != case_i` (so a case set that fully covers a bounded scrutinee's range makes the default
+provably unreachable). Branch-scoped write taint is the same machinery as `if`/`else`, generalized to
+N+1 arms — a per-arm write is never merged across arms, so it cannot leak past the switch. A
+thread-varying scrutinee with a `sync_cube()` inside an arm is barrier divergence, rejected exactly
+like any other conditional barrier. `select_mode` (a `match` on a scalar `mode`) is wired into the
+suite with a tested + a 6-obligation proved claim. The reference twin re-emits the `match` verbatim
+(host Rust `match` is the reference), so the differential lane needs no special handling.
+
+**Length-relationship assume (`A.len() + K <= B.len()`).** A third recognized `assumes(...)` shape (an
+integer literal `K`; the `A.len() <= B.len()` `K = 0` case included) — the "additive anchor" host-side
+buffer-sizing invariant. The prover asserts `len_a + K <= len_b` directly, which — combined with a
+guard `i < A.len()` — discharges a forward/offset read `B[i + K]` in bounds. Unlike the element-range
+proxy, the recognized relation `<=` maps onto the modeled `<=` verbatim (the source clause *is* the
+constraint, with no index-validity reinterpretation), so `<=` is exactly correct here where only `<`
+was sound for the element case. The recognizer is strict (only the two literal shapes; `<`, `>=`,
+non-literal `K`, subtraction, and any other arithmetic stay string-only). `offset_window`
+(`y[i] = x[i] + x[i + 4]` with `y.len() + 4 <= x.len()`) is wired into the suite with a tested + a
+3-obligation proved claim.
 
 **Overflow soundness (finite-width integer semantics).** The bounds proof models integer
 arithmetic *faithfully to hardware wraparound*: every non-tainted modeled integer term equals the

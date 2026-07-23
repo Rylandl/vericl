@@ -3054,6 +3054,9 @@ enum RecognizedAssume {
     ElemsBelowLen { arr: String, len_of: String },
     /// `A.iter().all(|v| *v < N)`.
     ElemsBelowConst { arr: String, bound: u64 },
+    /// `A.len() + K <= B.len()` (integer literal `K`; `K = 0` for the bare
+    /// `A.len() <= B.len()` form).
+    LenPlusConstLe { a: String, k: u64, b: String },
 }
 
 impl RecognizedAssume {
@@ -3071,6 +3074,9 @@ impl RecognizedAssume {
             }
             RecognizedAssume::ElemsBelowConst { arr, bound } => {
                 quote!(::vericl::StructuredAssume::ElemsBelowConst { arr: #arr, bound: #bound })
+            }
+            RecognizedAssume::LenPlusConstLe { a, k, b } => {
+                quote!(::vericl::StructuredAssume::LenPlusConstLe { a: #a, k: #k, b: #b })
             }
         }
     }
@@ -3103,7 +3109,73 @@ fn recognize_assume(
     elem_kinds: &HashMap<String, IntKind>,
 ) -> Option<RecognizedAssume> {
     recognize_len_assume(expr, array_params)
+        .or_else(|| recognize_lenrel_assume(expr, array_params))
         .or_else(|| recognize_elem_assume(expr, array_params, elem_kinds))
+}
+
+/// Recognize the length-*relationship* form `A.len() + K <= B.len()` (and the
+/// `K = 0` case `A.len() <= B.len()`), for an integer literal `K` and array
+/// parameters `A`, `B`. Returns `LenPlusConstLe { a, k, b }`, from which the
+/// prover asserts `len_a + K <= len_b`.
+///
+/// STRICT by design (round-4 recognizer lesson — a recognizer defect is
+/// critical-class, so the recognized form must IMPLY the modeled constraint
+/// exactly). Only two literal shapes are accepted — `A.len() <= B.len()`
+/// (→ `k = 0`) and `A.len() + <int literal> <= B.len()` — where the LHS is
+/// *exactly* a length-call (optionally `+ literal`) on an array parameter and
+/// the RHS is *exactly* a bare length-call on an array parameter. Everything
+/// else stays string-only (sound: the prover simply never receives the
+/// constraint) — including: strict `<` (a stronger source claim; not modeled);
+/// `>=`/`>`/`==` (wrong or already-handled relation); a non-literal `K` (a
+/// scalar/`#[comptime]` value — the model needs a concrete constant, and a
+/// symbolic offset is not this shape); subtraction, multiplication, or any other
+/// LHS arithmetic ("no smuggled arithmetic" — only `len + literal` is the
+/// additive anchor); an RHS that is not a bare `B.len()` (e.g. `B.len() + M`, a
+/// literal, a second len term); and either side referring to a
+/// non-array-parameter name.
+///
+/// Why `<=` is the correct relation here (unlike the element-range case, where
+/// only `<` is sound): the element form `v < B.len()` is a *proxy* the prover
+/// reinterprets as "`v` is a valid index into `B`", so admitting `v == B.len()`
+/// (via `<=`) would model an out-of-bounds index — the direction is
+/// load-bearing. Here the recognized relation and the modeled constraint are
+/// the SAME predicate (`len_a + K <= len_b`), asserted verbatim with no
+/// reinterpretation, so `<=` maps onto `<=` exactly and there is no soundness
+/// gap to guard.
+fn recognize_lenrel_assume(expr: &Expr, array_params: &[String]) -> Option<RecognizedAssume> {
+    // RHS/LHS positions and the `<=` operator are fixed (not commuted) — the
+    // strictest reading of the documented shape.
+    let Expr::Binary(ExprBinary { left, op: BinOp::Le(_), right, .. }) = expr else {
+        return None;
+    };
+    // RHS must be exactly `B.len()` on an array parameter (no arithmetic).
+    let b = len_call_target(right, array_params)?;
+    // LHS is either `A.len()` (K = 0) or `A.len() + <int literal>`.
+    let (a, k) = match &**left {
+        Expr::Binary(ExprBinary { left: ll, op: BinOp::Add(_), right: lr, .. }) => {
+            // Exactly `A.len() + <int literal>` — the len call on the left of
+            // the `+`, the literal on the right. `<literal> + A.len()` and any
+            // other arithmetic deliberately stay string-only.
+            let a = len_call_target(ll, array_params)?;
+            let k = int_literal(lr)?;
+            (a, k)
+        }
+        other => {
+            let a = len_call_target(other, array_params)?;
+            (a, 0)
+        }
+    };
+    // A self length-relationship (`A.len() + K <= A.len()`) is never a useful
+    // invariant — a tautology at `K = 0`, a *contradiction* at `K > 0`. The
+    // prover's own infeasible-assumption guard would already reject the
+    // contradiction (never a false `Proved`), but recognizing a nonsensical
+    // self-relationship at all is pointless, so it stays string-only (where the
+    // executable `check_assumes` makes the impossibility obvious at authoring
+    // time — a `K > 0` self-clause is always false, so generation resample-panics).
+    if a == b {
+        return None;
+    }
+    Some(RecognizedAssume::LenPlusConstLe { a, k, b })
 }
 
 fn recognize_len_assume(expr: &Expr, array_params: &[String]) -> Option<RecognizedAssume> {
@@ -4410,5 +4482,88 @@ mod tests {
         assert_eq!(k("isize"), Some(IntKind { signed: true, width: 32 }));
         assert_eq!(k("f32"), None);
         assert_eq!(k("bool"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Length-relationship assume recognizer (`A.len() + K <= B.len()`).
+    // Round-4 posture: STRICT — accept only the two literal shapes, every
+    // other shape stays string-only. White-box over `recognize_assume`.
+    // -----------------------------------------------------------------
+
+    /// The two accepted shapes: `A.len() + K <= B.len()` (integer literal `K`)
+    /// and the `K = 0` form `A.len() <= B.len()`.
+    #[test]
+    fn lenrel_accepted_shapes_recognized() {
+        let params = ["a".to_string(), "b".to_string()];
+        let no_elems = HashMap::new();
+
+        let e: Expr = syn::parse_str("a.len() + 4 <= b.len()").unwrap();
+        assert!(
+            matches!(
+                recognize_assume(&e, &params, &no_elems),
+                Some(RecognizedAssume::LenPlusConstLe { a, k: 4, b }) if a == "a" && b == "b"
+            ),
+            "expected LenPlusConstLe{{a,4,b}}"
+        );
+
+        // K = 0: bare `A.len() <= B.len()`.
+        let e: Expr = syn::parse_str("a.len() <= b.len()").unwrap();
+        assert!(
+            matches!(
+                recognize_assume(&e, &params, &no_elems),
+                Some(RecognizedAssume::LenPlusConstLe { a, k: 0, b }) if a == "a" && b == "b"
+            ),
+            "expected LenPlusConstLe{{a,0,b}}"
+        );
+
+        // Explicit `+ 0` also lands on k = 0.
+        let e: Expr = syn::parse_str("a.len() + 0 <= b.len()").unwrap();
+        assert!(matches!(
+            recognize_assume(&e, &params, &no_elems),
+            Some(RecognizedAssume::LenPlusConstLe { k: 0, .. })
+        ));
+    }
+
+    /// Every non-accepted shape stays string-only (`None`). Each is a distinct
+    /// hazard the strict recognizer must reject rather than mismodel.
+    #[test]
+    fn lenrel_rejected_shapes_are_string_only() {
+        let params = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let no_elems = HashMap::new();
+        let reject = |src: &str| {
+            let e: Expr = syn::parse_str(src).unwrap();
+            assert!(
+                recognize_assume(&e, &params, &no_elems).is_none(),
+                "shape must stay string-only: `{src}`"
+            );
+        };
+        // Strict `<` is a stronger claim, not the modeled `<=` — string-only.
+        reject("a.len() + 4 < b.len()");
+        reject("a.len() < b.len()");
+        // Wrong / reversed relation.
+        reject("a.len() + 4 >= b.len()");
+        reject("b.len() >= a.len() + 4");
+        reject("a.len() + 4 > b.len()");
+        // Non-literal K (a scalar/comptime value — model needs a constant).
+        reject("a.len() + k <= b.len()");
+        // Commuted `+` (literal on the left) — deliberately not accepted.
+        reject("4 + a.len() <= b.len()");
+        // Smuggled arithmetic: subtraction / multiplication, not the additive anchor.
+        reject("a.len() - 4 <= b.len()");
+        reject("a.len() * 4 <= b.len()");
+        // RHS is not a bare len call.
+        reject("a.len() + 4 <= b.len() + 1");
+        reject("a.len() + 4 <= 128");
+        reject("a.len() + 4 <= b.len() + c.len()");
+        // Two len terms on the LHS (not `len + literal`).
+        reject("a.len() + b.len() <= c.len()");
+        // A non-array-parameter name on either side.
+        reject("z.len() + 4 <= b.len()");
+        reject("a.len() + 4 <= z.len()");
+        // Self length-relationship: a tautology at K=0, a *contradiction* at
+        // K>0 — never a useful invariant, so string-only (defense-in-depth
+        // against a contradictory assume that would otherwise reach the prover).
+        reject("a.len() + 4 <= a.len()");
+        reject("a.len() <= a.len()");
     }
 }

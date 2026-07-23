@@ -366,6 +366,9 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
                             ::vericl::StructuredAssume::ElemsBelowConst { arr, bound } => {
                                 ::vericl_ir::Assume::ElemsBelowConst { arr, bound }
                             }
+                            ::vericl::StructuredAssume::LenPlusConstLe { a, k, b } => {
+                                ::vericl_ir::Assume::LenPlusConstLe { a, k, b }
+                            }
                         })
                         .collect();
                     match ::vericl_ir::prove_cooperative(
@@ -494,6 +497,9 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
                             }
                             ::vericl::StructuredAssume::ElemsBelowConst { arr, bound } => {
                                 ::vericl_ir::Assume::ElemsBelowConst { arr, bound }
+                            }
+                            ::vericl::StructuredAssume::LenPlusConstLe { a, k, b } => {
+                                ::vericl_ir::Assume::LenPlusConstLe { a, k, b }
                             }
                         })
                         .collect();

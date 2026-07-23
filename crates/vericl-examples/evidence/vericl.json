@@ -516,6 +516,130 @@
       ]
     },
     {
+      "kernel": "select_mode",
+      "identity": {
+        "source_hash": "sha256:389d4b3a0437dae611aab8e0b57632d8061c814814a10a9eb9ff2f3c5dec4049",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:4ab17a619ce231dcaec94bc090c4d44ea04ac6de73babe0d3bd1049ff64ae636"
+      },
+      "contract": {
+        "assumes": [
+          "x.len() == y.len()"
+        ],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 6,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    },
+    {
+      "kernel": "offset_window",
+      "identity": {
+        "source_hash": "sha256:62efbf7e670e359f655cc41c4245bf71e15d2084d0edf1ad8e84fb2cddeea13e",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:9e80306606f51d7a4ab1196ff16c7665e2afa7e461c43e4dca53ab475e365d31"
+      },
+      "contract": {
+        "assumes": [
+          "y.len() + 4 <= x.len()"
+        ],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 3,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    },
+    {
       "kernel": "block_sum_reduce",
       "identity": {
         "source_hash": "sha256:a1b1ed1eaff3e165ebf10ae58472aad8f2c1d8587c70c34781dd208cff3eeb80",

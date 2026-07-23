@@ -69,6 +69,38 @@
 //!   arm are unaffected by any of this — they still resolve against
 //!   whatever `self.memo` holds live at that point in the walk, under that
 //!   arm's own pushed path condition, exactly as before.
+//! - **Switch modeling (match on integers).** CubeCL 0.10 lowers a Rust
+//!   `match` on an integer scrutinee to a `Branch::Switch { value,
+//!   scope_default, cases: Vec<(Variable, Scope)> }` — verified by extracting
+//!   IR for a guarded `match mode { 0 => …, 1 | 2 => …, _ => … }` kernel: the
+//!   scrutinee is the modeled `value`, each case value is an integer-literal
+//!   `Constant` (an `Or`-pattern such as `1 | 2` becomes two separate cases
+//!   sharing a cloned body), and the `_` arm is `scope_default` (cubecl's
+//!   `numeric_match` requires a wildcard default, so `scope_default` is always
+//!   present and covers every un-listed scrutinee value). `process_switch`
+//!   models it as an **exhaustive if-chain**: each case arm is walked under the
+//!   path condition `value == case_i`, and the default under the conjunction of
+//!   all `value != case_i`. This is exact — the case conditions are mutually
+//!   exclusive constants and the default's condition is precisely their joint
+//!   negation, so a case set that covers the guarded range makes the default's
+//!   path condition unsatisfiable under the live facts (its obligations then
+//!   discharge vacuously, correctly, because that arm is genuinely unreachable
+//!   for those inputs). Branch-scoped write taint is the **same** machinery as
+//!   `If`/`IfElse`, only generalized from 2 arms to N+1: `self.memo` is
+//!   snapshotted before each arm, restored between arms (so no arm sees
+//!   another's writes), and after the construct every variable written in *any*
+//!   arm (tracked through the shared `write_log_stack`/`set_var`) is tainted
+//!   — v0 does no cross-arm value merge, so a per-arm write can never leak past
+//!   the switch's close (the round-2 `IfElse` manifestations, replayed through
+//!   Switch, refute rather than false-`Proved`). A tainted scrutinee, or a case
+//!   value that is not a modeled constant, takes the whole switch
+//!   `OutOfSubset` (same rule as a tainted `if` condition), never mismodeled.
+//!   Race walk: each arm's condition is pushed via `race_push_guard` keyed on
+//!   the scrutinee `sw.value`, so a `sync_cube()` inside a switch arm sits under
+//!   a non-loop guard and is rejected by the *same* barrier-uniformity gate as
+//!   any other conditional barrier — a thread-varying scrutinee is barrier
+//!   divergence, a uniform one is a (v1.1-deferred) conditional barrier; both
+//!   `OutOfSubset`, never a silent `Proved`.
 //! - `Branch::RangeLoop` is modeled as "fresh var `i` with `start <= i (<)= end`,
 //!   walk the body once" (no unrolling) per the architecture doc. This is
 //!   sound for per-iteration obligations (proving in-bounds for an arbitrary
@@ -262,6 +294,26 @@
 //!   happens-before an earlier iteration's read — the in-order rule alone would
 //!   unsoundly model a read that textually precedes the write. Every case is
 //!   conservative (invalidation only ever *removes* a model), hence sound.
+//! - **Length relationships (`A.len() + K <= B.len()`).** A third structured
+//!   assume shape (`Assume::LenPlusConstLe`, integer literal `K`; the `K = 0`
+//!   case `A.len() <= B.len()`) asserts `len_a + K <= len_b` directly over the
+//!   two buffers' u32-range length leaves. Combined with a guard `i < A.len()`
+//!   it discharges a forward/offset read `B[i + K]` in bounds. The `<=` is
+//!   asserted verbatim (the recognized clause *is* the constraint — no
+//!   index-validity reinterpretation like the element-range proxy, so `<=`
+//!   is exactly correct here where only `<` was sound for elements).
+//! - **Infeasible-assumption guard.** After all structured assumes are
+//!   asserted (and *only* the global length facts are in scope — element-range
+//!   assumes populate `elem_bounds` and assert nothing global), a `check-sat`
+//!   verifies the assumption context is satisfiable. An UNSAT context (mutually
+//!   contradictory assumes — the single-clause `A.len() + K <= A.len()` with
+//!   `K > 0`, or a contradictory pair like `y.len() == 1` ∧ `y.len() == 2`)
+//!   would discharge *every* obligation vacuously — a false `Proved`. It is
+//!   rejected as `OutOfSubset` instead (the round-1 "infeasible context
+//!   vacuously proves" trap, generalized to the whole assume set). Real
+//!   kernels' assumes are satisfiable, so this never fires for them, and a
+//!   solver `Unknown` is treated as "not provably contradictory" (allowed
+//!   through — conservative).
 //! - **Cooperative mode (shared-memory milestone M1):** a second entry point
 //!   `prove_bounds_freedom_cooperative(def, buffers, assumes, cube_dim)` opts
 //!   the walk into *workgroup-cooperative* modeling by pinning `CUBE_DIM` to a
@@ -433,7 +485,8 @@ use std::collections::{HashMap, HashSet};
 
 use cubecl::ir::{
     Arithmetic, Branch, Builtin, Comparison, ConstantValue, ElemType, Id, Instruction, Loop,
-    Metadata, Operation, Operator, Scope, Synchronization, Type, UIntKind, Variable, VariableKind,
+    Metadata, Operation, Operator, Scope, Switch, Synchronization, Type, UIntKind, Variable,
+    VariableKind,
 };
 use cubecl::prelude::KernelDefinition;
 use easy_smt::{Context, ContextBuilder, Response, SExpr};
@@ -473,6 +526,13 @@ pub enum Assume<'a> {
     /// `arr` is below the constant `bound` (the constant-bound sibling of
     /// `ElemsBelowLen`).
     ElemsBelowConst { arr: &'a str, bound: u64 },
+    /// `A.len() + K <= B.len()` (integer literal `K`; the `K = 0` case is
+    /// `A.len() <= B.len()`) — a length *relationship* asserted directly as
+    /// `len_a + K <= len_b` over the two buffers' (u32-range) length leaves.
+    /// Combined with a guard `i < A.len()` it discharges an offset read
+    /// `B[i + K]` in bounds. Adding this constraint only narrows the
+    /// counterexample search, so it can never mint a false `Proved`.
+    LenPlusConstLe { a: &'a str, k: u64, b: &'a str },
 }
 
 #[derive(Debug, Clone)]
@@ -1150,7 +1210,49 @@ impl<'a, 'b> Prover<'a, 'b> {
                     let b = self.smt.numeral(bound);
                     self.elem_bounds.entry(arr_id).or_default().push(b);
                 }
+                // Length relationship `len_a + K <= len_b`, asserted verbatim.
+                // Both lengths are u32-range leaves (`length_of`); `k` is a
+                // small literal. A raw `plus`/`lte` is exactly right here (no
+                // faithful-wrap handling needed): the constraint IS `len_a + K
+                // <= len_b`, and any state where the mathematical `len_a + K`
+                // exceeds `len_b`'s u32 range is genuinely infeasible (it would
+                // require `len_b > 2^32 - 1`), which the assertion correctly
+                // rules out rather than mismodeling.
+                Assume::LenPlusConstLe { a, k, b } => {
+                    let ida = self.buffer_id_by_name(a)?;
+                    let idb = self.buffer_id_by_name(b)?;
+                    let la = self.length_of(ida)?;
+                    let lb = self.length_of(idb)?;
+                    let kk = self.smt.numeral(k);
+                    let sum = self.smt.plus(la, kk);
+                    let le = self.smt.lte(sum, lb);
+                    self.smt.assert(le).map_err(smt_err)?;
+                }
             }
+        }
+        // Infeasible-assumption guard (round-1 "infeasible context vacuously
+        // proves" trap, generalized to the assume context): if the declared
+        // assumptions are mutually contradictory — their conjunction, over the
+        // buffer-length range facts asserted above, is UNSAT — then EVERY
+        // bounds obligation would discharge vacuously, minting a false `Proved`.
+        // The single-clause form `A.len() + K <= A.len()` (K > 0) is the most
+        // insidious (one clause), but a contradictory *pair* (`y.len() == 1` and
+        // `y.len() == 2`, or two `LenPlusConstLe` clauses that transitively
+        // contradict) is the same class. Reject any unsatisfiable assumption set
+        // as `OutOfSubset` rather than yield a vacuous certificate. This runs at
+        // the outermost scope, before any obligation is emitted, and only the
+        // *global* length facts are in scope here (element-range assumes populate
+        // `elem_bounds` and assert nothing global), so it tests exactly the
+        // assumption feasibility. Real kernels' assumes are satisfiable, so it
+        // never fires for them (`check-sat` returns SAT); `Unknown` is treated as
+        // "not provably contradictory" and allowed through (conservative).
+        if self.smt.check().map_err(smt_err)? == Response::Unsat {
+            return Err(Stop::OutOfSubset(
+                "the declared assumptions are mutually contradictory (their conjunction is \
+                 unsatisfiable) — a contradictory contract would vacuously discharge every bounds \
+                 obligation, so it is rejected rather than yielding a false `Proved`"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -2606,9 +2708,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             }
             Branch::RangeLoop(rl) => self.process_range_loop(rl),
             Branch::Loop(l) => self.process_loop(l),
-            Branch::Switch(_) => {
-                Err(Stop::OutOfSubset("`Branch::Switch` is outside the vericl v0 subset".into()))
-            }
+            Branch::Switch(sw) => self.process_switch(sw),
             Branch::Return | Branch::Break | Branch::Unreachable => Ok(()),
         }
     }
@@ -2619,6 +2719,101 @@ impl<'a, 'b> Prover<'a, 'b> {
                 "`{site}` condition depends on a construct outside the vericl v0 subset"
             ))
         })
+    }
+
+    /// Model a `Branch::Switch` (Rust `match` on an integer, module docs'
+    /// "Switch modeling (match on integers)") as an exhaustive if-chain: each
+    /// case arm walked under the path condition `value == case_i`, the default
+    /// arm walked under the conjunction of all `value != case_i`. Reuses the
+    /// exact same branch-scoped write-taint machinery as `If`/`IfElse`
+    /// (snapshot `self.memo` before each arm, restore between arms, then taint
+    /// every variable written in *any* arm after the construct via `set_var`),
+    /// generalized from 2 arms to N+1 — a per-arm write leaking past the merge
+    /// is impossible for exactly the same reason as `IfElse`. The race walk
+    /// pushes each arm's condition as a `race_push_guard` keyed on the scrutinee
+    /// `sw.value`, so a `sync_cube()` inside a switch arm is classified (and, in
+    /// v0/v1, always rejected) by the same barrier-uniformity gate as any other
+    /// conditional barrier.
+    fn process_switch(&mut self, sw: &Switch) -> Result<(), Stop> {
+        // A tainted scrutinee is out of subset at the switch, exactly like a
+        // tainted `if` condition (`cond_of`) — never silently modeled.
+        let value = self.value_of(&sw.value).ok_or_else(|| {
+            Stop::OutOfSubset(
+                "`match`/switch scrutinee depends on a construct outside the vericl v0 subset"
+                    .into(),
+            )
+        })?;
+
+        // Resolve every case's value up front. cubecl only ever emits
+        // integer-literal case constants for a numeric `match` (each an
+        // `Or`-pattern literal is its own case, sharing a cloned body), so these
+        // always resolve via `constant_expr`; a value that does not resolve
+        // (not a modeled constant) takes the whole switch out of subset rather
+        // than being mismodeled.
+        let mut case_exprs: Vec<SExpr> = Vec::with_capacity(sw.cases.len());
+        for (case_var, _) in &sw.cases {
+            let c = self.value_of(case_var).ok_or_else(|| {
+                Stop::OutOfSubset(
+                    "`match`/switch case value is not a modeled constant — outside the vericl v0 \
+                     subset"
+                        .into(),
+                )
+            })?;
+            case_exprs.push(c);
+        }
+
+        let snapshot = self.memo.clone();
+        let mut all_written: HashSet<VariableKind> = HashSet::new();
+
+        // Each case arm under `value == case_i`. Same snapshot/restore +
+        // write-log discipline as one `IfElse` arm.
+        for ((_, scope), case_expr) in sw.cases.iter().zip(&case_exprs) {
+            let cond = self.smt.eq(value, *case_expr);
+            self.write_log_stack.push(HashSet::new());
+            self.race_push_guard(&sw.value, cond, false);
+            self.smt.push().map_err(smt_err)?;
+            self.smt.assert(cond).map_err(smt_err)?;
+            let r = self.process_scope(scope);
+            self.smt.pop().map_err(smt_err)?;
+            self.race_pop_guard();
+            let written = self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
+            r?;
+            self.memo = snapshot.clone();
+            all_written.extend(written);
+        }
+
+        // Default arm under the conjunction of `value != case_i` for every case.
+        // This is exactly the negation of "some case matched", so the default
+        // path condition is sound: a case set that covers the guard's whole
+        // range makes the conjunction unsatisfiable under the live facts, and
+        // the default arm's obligations then discharge vacuously — correct,
+        // because that arm is genuinely unreachable for those inputs.
+        let mut negations: Vec<SExpr> = Vec::with_capacity(case_exprs.len());
+        for c in &case_exprs {
+            let eq = self.smt.eq(value, *c);
+            negations.push(self.smt.not(eq));
+        }
+        let default_cond = self.and_fold(&negations);
+        self.write_log_stack.push(HashSet::new());
+        self.race_push_guard(&sw.value, default_cond, false);
+        self.smt.push().map_err(smt_err)?;
+        self.smt.assert(default_cond).map_err(smt_err)?;
+        let r = self.process_scope(&sw.scope_default);
+        self.smt.pop().map_err(smt_err)?;
+        self.race_pop_guard();
+        let written = self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
+        r?;
+        self.memo = snapshot;
+        all_written.extend(written);
+
+        // No if/else value merging in v0: taint every variable written in any
+        // arm. Routed through `set_var` (not a raw `memo.insert`) for the same
+        // nested-composition correctness as `If`/`IfElse` (a write two levels
+        // deep still reaches an enclosing arm's write-log frame).
+        for k in all_written {
+            self.set_var(k, None);
+        }
+        Ok(())
     }
 
     /// Pre-scan a loop body for element-assumption invalidation (module docs'
@@ -6119,6 +6314,551 @@ mod tests {
                 "expected OutOfSubset (loop pre-scan invalidates the self-mutated array), \
                  got {other:?}"
             ),
+        }
+    }
+
+    // =================================================================
+    // Switch modeling (Rust `match` on an integer) — module docs'
+    // "Switch modeling (match on integers)" bullet. Positive/negative
+    // pairs for: guarded access, per-arm write leak past the merge (the
+    // round-2 If/IfElse manifestations replayed through Switch), default-
+    // arm reachability (does the default receive the case negations?), and
+    // race + switch (a barrier inside a switch arm is barrier divergence).
+    // =================================================================
+
+    macro_rules! build_mode_u32_xy {
+        ($kernel:path) => {{
+            let mut builder = KernelBuilder::default();
+            builder.runtime_properties(Default::default());
+            cubecl::ir::AddressType::U32.register(&mut builder.scope);
+            let mode = <u32 as LaunchArg>::expand(&Default::default(), &mut builder);
+            let x =
+                <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+            let y = <Array<u32> as LaunchArg>::expand_output(
+                &ArrayCompilationArg { inplace: None },
+                &mut builder,
+            );
+            $kernel(&mut builder.scope, mode, x, y);
+            builder.build(KernelSettings::default())
+        }};
+    }
+
+    macro_rules! build_mode_f32_y {
+        ($kernel:path) => {{
+            let mut builder = KernelBuilder::default();
+            builder.runtime_properties(Default::default());
+            cubecl::ir::AddressType::U32.register(&mut builder.scope);
+            let mode = <u32 as LaunchArg>::expand(&Default::default(), &mut builder);
+            let y = <Array<f32> as LaunchArg>::expand_output(
+                &ArrayCompilationArg { inplace: None },
+                &mut builder,
+            );
+            $kernel(&mut builder.scope, mode, y);
+            builder.build(KernelSettings::default())
+        }};
+    }
+
+    const MODE_XY_BUFFERS: &[BufferParam] =
+        &[BufferParam { name: "x", is_output: false }, BufferParam { name: "y", is_output: true }];
+
+    /// Positive: a guarded `match mode` where every arm writes `y[pos]` and
+    /// reads `x[pos]` under `if ABSOLUTE_POS < y.len()` proves. Each arm
+    /// (case 0, case 1, default) re-emits its own obligations: 3 arms × (x
+    /// read + y write) = 6.
+    #[cube(launch)]
+    fn prover_test_switch_guarded(mode: u32, x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS < y.len() {
+            match mode {
+                0 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + 1u32;
+                }
+                1 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + 2u32;
+                }
+                _ => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS];
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switch_guarded_access_proves() {
+        let def = build_mode_u32_xy!(prover_test_switch_guarded::expand);
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 6),
+            other => panic!("expected Proved (guarded match), got {other:?}"),
+        }
+    }
+
+    /// Positive: an `Or`-pattern arm (`1 | 2`) lowers to two separate cases
+    /// sharing a cloned body — the guarded access still proves. The cloned
+    /// body re-emits its obligations, so there are 4 arms (0, 1, 2, default)
+    /// × 2 = 8.
+    #[cube(launch)]
+    fn prover_test_switch_or_pattern(mode: u32, x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS < y.len() {
+            match mode {
+                0 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + 1u32;
+                }
+                1 | 2 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + 3u32;
+                }
+                _ => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS];
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switch_or_pattern_arm_proves() {
+        let def = build_mode_u32_xy!(prover_test_switch_or_pattern::expand);
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 8),
+            other => panic!("expected Proved (or-pattern match), got {other:?}"),
+        }
+    }
+
+    /// Negative control for `switch_guarded_access_proves`: the SAME arms with
+    /// NO `if ABSOLUTE_POS < y.len()` guard — the switch does not magically
+    /// make an unguarded access safe, so it refutes.
+    #[cube(launch)]
+    fn prover_test_switch_unguarded(mode: u32, x: &Array<u32>, y: &mut Array<u32>) {
+        match mode {
+            0 => {
+                y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + 1u32;
+            }
+            _ => {
+                y[ABSOLUTE_POS] = x[ABSOLUTE_POS];
+            }
+        }
+    }
+
+    #[test]
+    fn switch_unguarded_access_refutes() {
+        let def = build_mode_u32_xy!(prover_test_switch_unguarded::expand);
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains('y') || obligation.contains('x'));
+                assert!(!counterexample.is_empty());
+            }
+            other => panic!("expected Refuted (unguarded match access), got {other:?}"),
+        }
+    }
+
+    // -- Per-arm write leak past the merge (round-2 manifestations, Switch) --
+
+    /// Manifestation 1 through Switch: a variable clamped to a safe value
+    /// inside a case arm must not leak that clamp past the switch. `idx` is
+    /// really `ABSOLUTE_POS` (unbounded vs `y.len() == 1`) on every thread
+    /// where `mode != 0`; if the case-0 clamp leaked, the post-switch
+    /// `y[idx]` would look like `y[0]` (safe) unconditionally. Post-fix: `idx`
+    /// is tainted (written in an arm) → `OutOfSubset` at the write, never
+    /// `Proved`.
+    // The single-case-plus-default `match` is deliberate: it must lower to a
+    // `Branch::Switch` (not an `if`) to exercise the switch write-taint path.
+    #[allow(clippy::single_match)]
+    #[cube(launch)]
+    fn prover_test_switch_write_leak(mode: u32, y: &mut Array<f32>) {
+        let mut idx: usize = ABSOLUTE_POS;
+        match mode {
+            0 => {
+                idx = 0usize;
+            }
+            _ => {}
+        }
+        y[idx] = 1.0f32;
+    }
+
+    #[test]
+    fn switch_arm_write_does_not_leak_past_merge() {
+        let def = build_mode_f32_y!(prover_test_switch_write_leak::expand);
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "y", value: 1 }]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("write index") && reason.contains('y'),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (idx tainted post-switch), got {other:?}"),
+        }
+    }
+
+    /// Manifestation 2 through Switch: a case arm's write must not leak into
+    /// the default arm. The case-0 arm clamps `idx = 0`; the default arm reads
+    /// `y[idx]` where `idx` is genuinely the pre-switch `ABSOLUTE_POS` (the
+    /// case-0 write is invisible to the default). Refuted on genuine grounds.
+    #[cube(launch)]
+    #[allow(unused_assignments)]
+    fn prover_test_switch_arm_leaks_into_default(mode: u32, y: &mut Array<f32>) {
+        let mut idx: usize = ABSOLUTE_POS;
+        match mode {
+            0 => {
+                idx = 0usize;
+            }
+            _ => {
+                y[idx] = 2.0f32;
+            }
+        }
+    }
+
+    #[test]
+    fn switch_case_write_does_not_leak_into_default() {
+        let def = build_mode_f32_y!(prover_test_switch_arm_leaks_into_default::expand);
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "y", value: 1 }]) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains('y'), "unexpected obligation: {obligation}");
+                assert!(!counterexample.is_empty());
+            }
+            other => panic!("expected Refuted (default arm's real, unbounded idx), got {other:?}"),
+        }
+    }
+
+    /// Manifestation 3 through Switch: a post-switch read must not silently
+    /// resolve to whichever arm was walked last. Both the case-0 arm (real,
+    /// unbounded `ABSOLUTE_POS`) and the default (`0`) write `idx`; the merge
+    /// must taint it, not merge to either arm's value.
+    #[cube(launch)]
+    #[allow(unused_assignments)]
+    fn prover_test_switch_post_merge(mode: u32, y: &mut Array<f32>) {
+        let mut idx: usize = ABSOLUTE_POS;
+        match mode {
+            0 => {
+                idx = ABSOLUTE_POS;
+            }
+            _ => {
+                idx = 0usize;
+            }
+        }
+        y[idx] = 5.0f32;
+    }
+
+    #[test]
+    fn switch_post_merge_taints_arm_written_vars() {
+        let def = build_mode_f32_y!(prover_test_switch_post_merge::expand);
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "y", value: 1 }]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("write index") && reason.contains('y'),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (idx tainted post-merge), got {other:?}"),
+        }
+    }
+
+    /// Nested switch (the Switch analog of `nested_branches_restore_correctly`):
+    /// a clamp `idx = 0` written *two levels deep* — inside an inner switch,
+    /// inside an outer switch arm — must still reach the OUTERMOST merge's taint
+    /// set, so the post-switch `y[idx]` sees `idx` tainted (never the leaked
+    /// clamp). Confirms the write-log stack composes recursively through
+    /// nested switches exactly as it does through nested `if`s (shared
+    /// `set_var`/`write_log_stack`). Pre-hypothetical-bug: if the deep clamp
+    /// leaked, `idx == 0` unconditionally → false `Proved`.
+    #[allow(clippy::single_match)]
+    #[cube(launch)]
+    fn prover_test_nested_switch_clamp(mode: u32, y: &mut Array<f32>) {
+        let mut idx: usize = ABSOLUTE_POS;
+        match mode {
+            0 => {
+                match ABSOLUTE_POS % 2usize {
+                    0 => {
+                        idx = 0usize;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        y[idx] = 1.0f32;
+    }
+
+    #[test]
+    fn nested_switch_write_does_not_leak_past_merges() {
+        let def = build_mode_f32_y!(prover_test_nested_switch_clamp::expand);
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEqConst { a: "y", value: 1 }]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("write index") && reason.contains('y'),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!(
+                "expected OutOfSubset (deep clamp tainted through both switch merges), got {other:?}"
+            ),
+        }
+    }
+
+    // -- Default-arm reachability: does the default receive the negations? --
+
+    /// Positive: a scrutinee bounded to `[0, 3)` (`ABSOLUTE_POS % 3`) whose
+    /// cases 0, 1, 2 cover the whole range makes the default **unreachable** —
+    /// the default's path condition (`mode != 0 && mode != 1 && mode != 2`,
+    /// combined with the modeled `0 <= mode < 3`) is UNSAT, so a deliberately
+    /// out-of-bounds write in the default discharges vacuously and the kernel
+    /// PROVES. This pins that the default arm genuinely receives the
+    /// conjunction of case negations (without them, or with the case set not
+    /// covering the range, the default's OOB write would refute — see the
+    /// negative control below).
+    #[cube(launch)]
+    fn prover_test_switch_default_covered(x: &Array<u32>, y: &mut Array<u32>) {
+        let mode = ABSOLUTE_POS % 3usize;
+        if ABSOLUTE_POS < y.len() {
+            match mode {
+                0 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS];
+                }
+                1 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + 1u32;
+                }
+                2 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + 2u32;
+                }
+                _ => {
+                    y[999999999usize] = 7u32;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switch_default_covered_by_cases_proves() {
+        let def = build_u32_xy!(prover_test_switch_default_covered::expand);
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::Proved { .. } => {}
+            other => panic!(
+                "expected Proved (default unreachable: cases cover mode%3's range), got {other:?}"
+            ),
+        }
+    }
+
+    /// Negative control for `switch_default_covered_by_cases_proves`: the SAME
+    /// arms, but the scrutinee is the FREE `mode` scalar (any `u32`), so cases
+    /// 0, 1, 2 do NOT cover its range — the default IS reachable (e.g.
+    /// `mode == 3`), and its unguarded out-of-bounds write refutes. Confirms
+    /// the default's vacuous discharge above was genuinely due to the negations
+    /// making it unreachable, not a mis-modeled default.
+    #[cube(launch)]
+    fn prover_test_switch_default_uncovered(mode: u32, x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS < y.len() {
+            match mode {
+                0 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS];
+                }
+                1 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + 1u32;
+                }
+                2 => {
+                    y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + 2u32;
+                }
+                _ => {
+                    y[999999999usize] = 7u32;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switch_default_not_covered_refutes() {
+        let def = build_mode_u32_xy!(prover_test_switch_default_uncovered::expand);
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains('y'), "unexpected obligation: {obligation}");
+                assert!(!counterexample.is_empty());
+            }
+            other => panic!("expected Refuted (default reachable, OOB write), got {other:?}"),
+        }
+    }
+
+    // -- Race + switch: barrier inside a switch arm is barrier divergence --
+
+    /// Positive (the false-`Proved`-preventing one): a `sync_cube()` inside a
+    /// switch arm whose scrutinee (`tid`, thread-varying) makes the arm a
+    /// non-uniform guard is barrier divergence — `OutOfSubset`, never silently
+    /// treated as a top-level phase boundary. The switch arm's condition is
+    /// classified by the exact same barrier-uniformity gate as any `if`.
+    // Single-case-plus-default `match` on purpose — must be a `Branch::Switch`,
+    // with the `sync_cube()` inside a switch arm (the barrier-divergence shape).
+    #[allow(clippy::single_match)]
+    #[cube(launch)]
+    fn prover_test_switch_barrier_divergence(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        match tid {
+            0 => {
+                sync_cube();
+            }
+            _ => {}
+        }
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn switch_arm_barrier_is_barrier_divergence() {
+        let def = build_shared!(prover_test_switch_barrier_divergence::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("barrier divergence")
+                        || reason.contains("conditional"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (barrier inside switch arm), got {other:?}"),
+        }
+    }
+
+    /// Negative control for `switch_arm_barrier_is_barrier_divergence`: a
+    /// switch with NO barrier inside any arm, sitting before a genuine
+    /// top-level `sync_cube()`, still proves race-free — the switch's own
+    /// guard push/pop balances correctly, so the subsequent barrier is still
+    /// recognized as top-level/uniform. Each thread writes its own `tile[tid]`
+    /// in both arms (no write-write race under `t1 != t2`).
+    #[cube(launch)]
+    fn prover_test_switch_then_barrier(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        match CUBE_POS % 2usize {
+            0 => {
+                tile[tid] = 1.0f32;
+            }
+            _ => {
+                tile[tid] = 0.0f32;
+            }
+        }
+        let _ = input;
+        sync_cube();
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn switch_without_inner_barrier_proves_race_free() {
+        let def = build_shared!(prover_test_switch_then_barrier::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::Proved { .. } => {}
+            other => panic!(
+                "expected Proved (benign switch, top-level barrier still uniform), got {other:?}"
+            ),
+        }
+    }
+
+    // =================================================================
+    // Length-relationship assume (`A.len() + K <= B.len()`) — the
+    // "additive anchor" host-side buffer-sizing invariant. An offset read
+    // `x[pos + K]` guarded only by `pos < y.len()` is in bounds exactly
+    // when `y.len() + K <= x.len()`; the assume supplies that relationship.
+    // =================================================================
+
+    /// Offset-window read: `y[i] = x[i] + x[i + 4]` guarded by `i < y.len()`.
+    /// The `x[i + 4]` read needs `i + 4 < x.len()`, which follows from
+    /// `i < y.len()` and `y.len() + 4 <= x.len()`.
+    #[cube(launch)]
+    fn prover_test_offset_window(x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS < y.len() {
+            y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + x[ABSOLUTE_POS + 4usize];
+        }
+    }
+
+    /// Positive: with `y.len() + 4 <= x.len()` declared, the offset read
+    /// proves (3 obligations: `x[i]`, `x[i + 4]`, `y[i]`).
+    #[test]
+    fn lenrel_offset_window_proves() {
+        let def = build_u32_xy!(prover_test_offset_window::expand);
+        let assumes = [Assume::LenPlusConstLe { a: "y", k: 4, b: "x" }];
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &assumes) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved (offset window with len relationship), got {other:?}"),
+        }
+    }
+
+    /// Negative control: `x.len() == y.len()` alone is NOT enough — it makes
+    /// `x[i]` provable (`i < y.len() == x.len()`) but leaves `x[i + 4]`
+    /// unbounded (`i + 4` can reach `x.len()` even when `i < x.len()`). The
+    /// `+ 4` offset read is refuted, pinning that the length *relationship* is
+    /// what's load-bearing, not merely equal lengths.
+    #[test]
+    fn lenrel_offset_window_without_relationship_refutes() {
+        let def = build_u32_xy!(prover_test_offset_window::expand);
+        let assumes = [Assume::LenEq { a: "x", b: "y" }];
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &assumes) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains('x'), "unexpected obligation: {obligation}");
+                assert!(!counterexample.is_empty());
+            }
+            other => panic!("expected Refuted (offset read unbounded), got {other:?}"),
+        }
+    }
+
+    /// The `K = 0` form (`A.len() <= B.len()`): a plain guarded `x[i]` read
+    /// under `i < y.len()` proves when `y.len() <= x.len()` — the length
+    /// relationship subsuming the `LenEq` case for this one-sided need.
+    #[cube(launch)]
+    fn prover_test_len_le_read(x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS < y.len() {
+            y[ABSOLUTE_POS] = x[ABSOLUTE_POS];
+        }
+    }
+
+    #[test]
+    fn lenrel_k_zero_proves() {
+        let def = build_u32_xy!(prover_test_len_le_read::expand);
+        let assumes = [Assume::LenPlusConstLe { a: "y", k: 0, b: "x" }];
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &assumes) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved (K=0 length relationship), got {other:?}"),
+        }
+    }
+
+    /// Infeasible-assumption guard: a SELF length-relationship `len_y + 4 <=
+    /// len_y` (K > 0) is a contradiction. Without the guard, its unsatisfiable
+    /// context vacuously discharges the offset read `x[i + 4]` — a false
+    /// `Proved`. The guard rejects the contradictory assume set as
+    /// `OutOfSubset` instead (the round-1 "infeasible context vacuously proves"
+    /// trap, at the assume layer).
+    #[test]
+    fn lenrel_self_contradiction_is_rejected_not_vacuously_proved() {
+        let def = build_u32_xy!(prover_test_offset_window::expand);
+        let assumes = [Assume::LenPlusConstLe { a: "y", k: 4, b: "y" }];
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &assumes) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(reason.contains("contradictory"), "unexpected reason: {reason}");
+            }
+            ProveResult::Proved { .. } => {
+                panic!("VACUOUS PROOF: a contradictory assume set must never yield Proved")
+            }
+            other => panic!("expected OutOfSubset (contradictory assumptions), got {other:?}"),
+        }
+    }
+
+    /// The same guard closes the pre-existing multi-clause form: two
+    /// contradictory constant-length assumes (`y.len() == 1` and `y.len() == 2`)
+    /// are unsatisfiable together and must not vacuously prove.
+    #[test]
+    fn contradictory_len_const_pair_is_rejected() {
+        let def = build_u32_xy!(prover_test_offset_window::expand);
+        let assumes =
+            [Assume::LenEqConst { a: "y", value: 1 }, Assume::LenEqConst { a: "y", value: 2 }];
+        match prove_bounds_freedom(&def, MODE_XY_BUFFERS, &assumes) {
+            ProveResult::OutOfSubset { reason } => assert!(reason.contains("contradictory")),
+            ProveResult::Proved { .. } => {
+                panic!("VACUOUS PROOF: contradictory length assumes must never yield Proved")
+            }
+            other => panic!("expected OutOfSubset (contradictory assumptions), got {other:?}"),
         }
     }
 }
