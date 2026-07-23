@@ -388,7 +388,7 @@
     {
       "kernel": "fir_pair_kernel",
       "identity": {
-        "source_hash": "sha256:d099ae669107fd2e7f56383ad104e13cb6282a0c8453453a6ccd49ef0d6c662c",
+        "source_hash": "sha256:0fc0c14ed20e0b7948be73eb1da9a412fa8731794bf952bb2ca396094d30aa78",
         "vericl_version": "0.1.0",
         "ir_hash": "sha256:bf44f0be329a4bde5321a57b9ae251dbc2f21bfb3885470eb6b02616302d7010"
       },
@@ -530,6 +530,98 @@
         "wrapping": false,
         "instantiate": [],
         "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "depends_on": {
+              "check": "smt-race-freedom",
+              "property": "intra-phase race freedom + barrier non-divergence",
+              "status": "discharged-by-proof"
+            },
+            "reference": "vericl-macros phase-split cooperative twin (derived from kernel source)",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "discharged_by": "two-thread cooperative walk (a barrier-carrying tree loop is deferred by the single-thread bounds walk and discharged here)",
+            "logic": "QF_LIA",
+            "obligations": 8,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-race-freedom",
+          "config": {
+            "barrier_uniformity": 2,
+            "intercube_single_writer": 1,
+            "logic": "QF_LIA",
+            "obligations": 11,
+            "phases": 3,
+            "read_write": 4,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit",
+            "write_write": 6
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the two-thread race-freedom obligations",
+        "vericl-ir's two-thread reduction (t1 != t2 over one cube; per-phase write-write / read-write / inter-cube single-writer disjointness in QF_LIA over the CubeCL IR)",
+        "the GPUVerify-style two-thread abstraction (a race exists iff some pair of threads conflicts, so UNSAT for a symbolic distinct pair proves race freedom for all pairs)"
+      ]
+    },
+    {
+      "kernel": "emitter_reduce",
+      "identity": {
+        "source_hash": "sha256:9fd23f32071e53674a54caddb40d6b320921857d8d9e272d6a4861c5164e9d12",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:0ed442448daa16a3d738ef5def27a22dc8c6b8b41053754fff200bf6ca9833b3"
+      },
+      "contract": {
+        "assumes": [
+          "input.iter().all(| v | v.abs() <= 100.0)"
+        ],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [
+          "n_emitters = 4"
+        ],
+        "uses": [
+          "square_sample"
+        ]
       },
       "claims": [
         {

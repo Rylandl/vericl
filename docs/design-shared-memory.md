@@ -565,6 +565,34 @@ the two provable-by-construction cases; the `emitter_powers_multi_rx` full shape
 terminate + 2-D). Each widens an axis of the same design without changing the phase model or the
 two-thread encoding.
 
+> **Status (cooperative v1.1 extensions — IMPLEMENTED).** Three of these axes
+> now land, together, on the `emitter_powers_multi_rx` shape (minus 2-D):
+> - **`#[comptime]` parameters** in a cooperative kernel — cube-uniform by
+>   construction, threaded through the phase-split twin as `let` consts and baked
+>   into the IR (the easiest uniformity case; no phase-splitter interaction).
+> - **`uses(...)` composition** — a helper runs as a **barrier-free** unit inside
+>   one segment. The soundness crux is enforced on **both lanes**: the twin lane
+>   rejects a `#[vericl::helper]` that contains `sync_cube`/`SharedMemory` with a
+>   targeted error ("barriers … must be visible at the cooperative kernel's top
+>   level"), and the prover independently compares the (helper-inlined) IR's
+>   `SyncCube` count against the twin's declared `COOP_BARRIER_COUNT` — a hidden
+>   helper barrier inflates the IR count and is rejected. (Barriers *inside*
+>   helpers themselves remain deferred: helpers must stay barrier-free.) Shared
+>   tiles cannot cross a helper boundary (twin-local `SharedTile`).
+> - **Workgroup-uniform `terminate!()`** — accepted only under a proven-uniform
+>   condition at the top level before any barrier (the "skip the whole cube"
+>   guard, un-banned in cooperative mode only). The twin models it as a cube-level
+>   `continue`; the prover as a `!cond` path condition (uniformity verified by the
+>   thread-varying taint machinery, before-any-barrier enforced), which is
+>   **load-bearing** for the single-writer store bound in `emitter_powers`
+>   (`powers[CUBE_POS]` with no explicit guard). Non-uniform or post-barrier
+>   terminate stays rejected on both lanes.
+>
+> Still deferred: **2-D dispatch padding** (the one `emitter_powers_multi_rx`
+> feature this round does not lift — the kernel body is 1-D in `CUBE_POS`, so a
+> 1-D launch annotates it; 2-D only raises the workgroup ceiling), multiple
+> shared tiles, barriers inside helpers, and wider inter-cube races.
+
 ---
 
 ## 8. Implementation plan (agent-sized milestones)

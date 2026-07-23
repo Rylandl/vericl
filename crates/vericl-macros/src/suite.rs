@@ -368,7 +368,13 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
                             }
                         })
                         .collect();
-                    match ::vericl_ir::prove_cooperative(&__def, &__buffers, &__assumes, __coop_cd) {
+                    match ::vericl_ir::prove_cooperative(
+                        &__def,
+                        &__buffers,
+                        &__assumes,
+                        __coop_cd,
+                        #kmod::COOP_BARRIER_COUNT,
+                    ) {
                         ::vericl_ir::CooperativeProof::Proved(__o) => {
                             // Strong tier: one sound two-thread walk discharges
                             // BOTH bounds and races; split into two claims.

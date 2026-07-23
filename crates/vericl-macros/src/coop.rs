@@ -60,6 +60,16 @@ pub(crate) const COOP_ALLOWED: &[&str] = &[
     "CUBE_COUNT",
     "SharedMemory",
     "sync_cube",
+    // v1.1: a workgroup-uniform `terminate!()` (the "skip the whole cube"
+    // padding-guard pattern) leaves `BANNED_IDENTS` under `cooperative(...)`.
+    // It stays banned for ordinary kernels (the round-1 finding: outside #[cube]
+    // it expands to an empty block, so a sequential twin would fall through the
+    // guard). The phase-split twin recognises `if <uniform> { terminate!() }` at
+    // the top level before any barrier and models it as a cube-level skip
+    // (`analyse` / `build_reference_body`); any other `terminate` position is
+    // rejected (see `reject_stray_terminate`), so it never survives to the twin
+    // body as a plain-Rust `terminate!()` (which would not compile).
+    "terminate",
 ];
 
 /// The cooperative topology constructs whose presence makes a kernel
@@ -72,6 +82,36 @@ const COOP_MARKERS: &[&str] =
 /// these is *thread-varying*; anything provably built only from cube-uniform
 /// leaves is uniform — exactly the split the barrier-uniformity check needs.
 const THREAD_VARYING_BUILTINS: &[&str] = &["UNIT_POS", "ABSOLUTE_POS"];
+
+/// Count the `sync_cube()` barrier calls in a kernel's source body (recursively,
+/// including the one inside the tree loop). This is the twin's declared
+/// **top-level barrier count** — every one is a phase boundary the phase-split
+/// twin can see. The prover compares it against the `SyncCube` count in the
+/// (helper-inlined) IR: a `uses(...)` helper that hid a barrier inflates the IR
+/// count, and the mismatch is rejected (cooperative-composition soundness crux,
+/// docs/design-shared-memory.md §7.4). Counting the SOURCE body (not the twin,
+/// which drops them as segment delimiters) is what makes it the *twin-declared*
+/// count: the helper's own body is not part of the kernel's source tokens, so a
+/// helper barrier is never counted here — exactly the asymmetry the check exploits.
+pub(crate) fn count_sync_cube(body: &syn::Block) -> usize {
+    #[derive(Default)]
+    struct SyncCubeCounter {
+        count: usize,
+    }
+    impl<'ast> Visit<'ast> for SyncCubeCounter {
+        fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
+            if let Expr::Path(p) = i.func.as_ref() {
+                if p.path.segments.last().map(|s| s.ident == "sync_cube").unwrap_or(false) {
+                    self.count += 1;
+                }
+            }
+            syn::visit::visit_expr_call(self, i);
+        }
+    }
+    let mut c = SyncCubeCounter::default();
+    c.visit_block(body);
+    c.count
+}
 
 /// Whether a kernel body uses any cooperative topology construct (so the
 /// `cooperative(...)` clause is required, and vice versa).
@@ -236,6 +276,36 @@ fn parse_shared_decl(local: &Local) -> Option<(Ident, Type, Expr)> {
     Some((pi.ident.clone(), elem, len))
 }
 
+/// Whether a statement is a `terminate!()` macro call (either
+/// `Stmt::Macro` for a trailing `terminate!()` or `Stmt::Expr(Expr::Macro)`
+/// for `terminate!();`).
+fn is_terminate_call(stmt: &Stmt) -> bool {
+    let path = match stmt {
+        Stmt::Macro(m) => &m.mac.path,
+        Stmt::Expr(Expr::Macro(m), _) => &m.mac.path,
+        _ => return false,
+    };
+    path.segments.last().map(|s| s.ident == "terminate").unwrap_or(false)
+}
+
+/// Recognise the workgroup-uniform terminate pattern `if <cond> { terminate!() }`
+/// (no `else`, then-branch exactly one `terminate!()` call), returning the
+/// condition. This is the only accepted `terminate` shape (docs/design-shared-
+/// memory.md §4.3/§7.4): a top-level, before-any-barrier, cube-uniform "skip the
+/// whole cube" guard. Any other `terminate` position/shape is rejected by
+/// `reject_stray_terminate`.
+fn as_terminate_if(stmt: &Stmt) -> Option<&Expr> {
+    let Stmt::Expr(Expr::If(if_expr), _) = stmt else { return None };
+    if if_expr.else_branch.is_some() {
+        return None;
+    }
+    let stmts = &if_expr.then_branch.stmts;
+    if stmts.len() != 1 || !is_terminate_call(&stmts[0]) {
+        return None;
+    }
+    Some(if_expr.cond.as_ref())
+}
+
 /// Whether a statement is exactly `sync_cube();`.
 fn is_sync_cube(stmt: &Stmt) -> bool {
     let Stmt::Expr(Expr::Call(call), _) = stmt else { return false };
@@ -342,6 +412,15 @@ struct CoopLoop {
 struct Analysis {
     shared: Vec<(Ident, Type, Expr)>,
     aliases: Vec<(Ident, Expr)>,
+    /// Aliases that are cube-uniform (do not transitively read
+    /// `UNIT_POS`/`ABSOLUTE_POS`). Recomputed at the cube level (before the
+    /// per-`unit_pos` loops) when there are terminate guards, so a uniform alias
+    /// a terminate condition references (`row = CUBE_POS`) is in scope there.
+    uniform_alias_names: HashSet<String>,
+    /// Workgroup-uniform `terminate!()` conditions (§4.3/§7.4): each is a
+    /// top-level, before-any-barrier, cube-uniform "skip the whole cube" guard,
+    /// emitted as `if <cond> { continue; }` at the top of the per-cube loop.
+    terminates: Vec<Expr>,
     phases: Vec<PhaseItem>,
 }
 
@@ -366,9 +445,15 @@ fn analyse(
     let mut aliases: Vec<(Ident, Expr)> = Vec::new();
     let mut alias_names: HashSet<String> = HashSet::new();
     let mut thread_varying_aliases: HashSet<String> = HashSet::new();
+    let mut terminates: Vec<Expr> = Vec::new();
     let mut cleaned: Vec<Stmt> = Vec::new();
+    // Whether any shared-tile declaration or segment/barrier statement has been
+    // seen. A `terminate!()` guard must precede all of them (top level, before
+    // any barrier — §4.3/§7.4), so a terminate after content is rejected.
+    let mut saw_content = false;
 
-    // Pass 1: pull out shared-tile declarations and pure topology aliases.
+    // Pass 1: pull out shared-tile declarations, pure topology aliases, and the
+    // leading workgroup-uniform `terminate!()` guards.
     for stmt in &body.stmts {
         if let Stmt::Local(local) = stmt {
             if let Some((name, elem, len)) = parse_shared_decl(local) {
@@ -382,6 +467,7 @@ fn analyse(
                 }
                 shared_names.insert(name.to_string());
                 shared.push((name, elem, len));
+                saw_content = true;
                 continue;
             }
             let mut known = builtins.clone();
@@ -403,8 +489,58 @@ fn analyse(
                 continue;
             }
         }
+        // Workgroup-uniform `terminate!()` (v1.1): `if <uniform> { terminate!() }`
+        // at the top level, before any barrier — modeled as a cube-level skip.
+        if let Some(cond) = as_terminate_if(stmt) {
+            if saw_content {
+                return Err(err(
+                    stmt,
+                    format!(
+                        "kernel `{fn_name_str}`: `terminate!()` must appear at the top level \
+                         before any barrier or shared-memory access (the workgroup-uniform \
+                         \"skip the whole cube\" guard); a post-barrier or mid-body terminate is \
+                         outside the vericl v1.1 subset (docs/design-shared-memory.md §4.3/§7.4)"
+                    ),
+                ));
+            }
+            // Uniformity (§5.4): a thread-varying terminate condition is barrier
+            // divergence (some threads skip, others reach the barrier) — rejected,
+            // exactly like a thread-varying barrier guard.
+            let refs = referenced_idents_expr(cond);
+            let varying = refs.iter().any(|r| {
+                THREAD_VARYING_BUILTINS.contains(&r.as_str())
+                    || thread_varying_aliases.contains(r)
+                    || shared_names.contains(r)
+            });
+            if varying {
+                return Err(err(
+                    cond,
+                    format!(
+                        "kernel `{fn_name_str}`: `terminate!()` condition is thread-varying \
+                         (it reads UNIT_POS/ABSOLUTE_POS or a per-thread value) — a non-uniform \
+                         terminate is barrier divergence (some threads skip the cube, others \
+                         reach the barrier) and is outside the vericl v1.1 subset (only a \
+                         workgroup-uniform terminate is accepted — docs/design-shared-memory.md \
+                         §4.3/§7.4)"
+                    ),
+                ));
+            }
+            terminates.push(cond.clone());
+            continue;
+        }
+        saw_content = true;
         cleaned.push(stmt.clone());
     }
+
+    // A stray `terminate!()` anywhere that was NOT recognised as the accepted
+    // top-level uniform guard (a bare `terminate!()`, one nested in a loop or a
+    // non-uniform/`else`-bearing `if`, …) would survive into the twin body as a
+    // plain-Rust `terminate!()` macro that does not exist — reject it with the
+    // targeted shape error rather than emit an uncompilable twin.
+    reject_stray_terminate(&cleaned, fn_name_str)?;
+
+    let uniform_alias_names: HashSet<String> =
+        alias_names.difference(&thread_varying_aliases).cloned().collect();
 
     // Compound-assignment into a shared tile (`tile[i] += x`) would go through
     // the poison model's `IndexMut` (which marks-written and hands back the
@@ -516,7 +652,32 @@ fn analyse(
         }
     }
 
-    Ok(Analysis { shared, aliases, phases })
+    Ok(Analysis { shared, aliases, uniform_alias_names, terminates, phases })
+}
+
+/// Reject any `terminate` token surviving in the segment statements — a
+/// `terminate!()` that was NOT recognised as the accepted top-level uniform
+/// guard (`if <uniform> { terminate!() }` before any barrier). Such a terminate
+/// (bare, nested in a loop/`if`-with-`else`, or after content) would be emitted
+/// verbatim into the twin, which does not compile (`terminate!()` is a cubecl
+/// macro with no host definition). Rejecting here gives the targeted shape error
+/// instead. Token scan (recursive via `quote`) — cheap and catches every nesting.
+fn reject_stray_terminate(cleaned: &[Stmt], fn_name_str: &str) -> syn::Result<()> {
+    for stmt in cleaned {
+        if quote!(#stmt).to_string().contains("terminate") {
+            return Err(err(
+                stmt,
+                format!(
+                    "kernel `{fn_name_str}`: `terminate!()` is only accepted as a top-level \
+                     `if <workgroup-uniform condition> {{ terminate!() }}` guard before any \
+                     barrier (the \"skip the whole cube\" pattern); a bare, nested, `else`-bearing, \
+                     or post-barrier terminate is outside the vericl v1.1 subset (docs/design-\
+                     shared-memory.md §4.3/§7.4)"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct UniformCtx<'a> {
@@ -702,6 +863,42 @@ pub(crate) fn build_reference_body(
         })
         .collect();
 
+    // Cube-level workgroup-uniform `terminate!()` guards (§4.3/§7.4): each is
+    // emitted as `if <cond> { continue; }` at the top of the per-cube loop —
+    // "skip the whole cube". Because the condition is cube-uniform, the whole
+    // cube skips together, faithful to the GPU (all threads terminate, so the
+    // cube produces no output). Only emitted when there are terminates; when
+    // there are none, this and the cube-level uniform aliases below are empty, so
+    // a kernel without `terminate!()` is byte-identical to before this feature.
+    let terminate_guards: Vec<TokenStream2> = analysis
+        .terminates
+        .iter()
+        .map(|cond| {
+            let cond = rewrite_coop_builtins(quote!(#cond));
+            quote! { if #cond { continue; } }
+        })
+        .collect();
+
+    // The uniform aliases a terminate condition may reference (`row = CUBE_POS`)
+    // must be in scope at the cube level (before the per-`unit_pos` loops), where
+    // the guards run. They are cube-uniform, so recomputing them here (from
+    // `CUBE_*`/params, no `UNIT_POS`) gives the same value every thread sees; the
+    // per-`unit_pos` loops re-declare (shadow) them as usual. Empty when there
+    // are no terminates, keeping non-terminate kernels unchanged.
+    let cube_alias_decls: Vec<TokenStream2> = if analysis.terminates.is_empty() {
+        Vec::new()
+    } else {
+        analysis
+            .aliases
+            .iter()
+            .filter(|(name, _)| analysis.uniform_alias_names.contains(&name.to_string()))
+            .map(|(name, expr)| {
+                let expr = rewrite_coop_builtins(quote!(#expr));
+                quote! { let #name = #expr; }
+            })
+            .collect()
+    };
+
     // Per-`unit_pos` prelude: bind the compound `ABSOLUTE_POS` alias (a
     // non-colliding internal name — `UNIT_POS`/`CUBE_*` rewrite directly to the
     // loop variables/params, `ABSOLUTE_POS` to this), then the recomputed
@@ -751,6 +948,8 @@ pub(crate) fn build_reference_body(
 
     Ok(quote! {
         for __vericl_cube in 0..cube_count {
+            #(#cube_alias_decls)*
+            #(#terminate_guards)*
             #(#shared_decls)*
             #(#phase_toks)*
         }
@@ -822,25 +1021,15 @@ pub(crate) fn build_conformance_items(
     fn_name: &Ident,
     fn_name_str: &str,
     cube_dim_expr: &Expr,
+    comptime_values: &std::collections::HashMap<String, TokenStream2>,
     generic_types: &[Type],
 ) -> syn::Result<TokenStream2> {
-    // Reject #[comptime] params in a cooperative kernel for v1 — the two
-    // clean-room reduction shapes avoid them (grid-stride uses `data.len()` and
-    // the `CUBE_COUNT` builtin instead of runtime scalars); comptime support in
-    // the cooperative twin is deferred rather than silently mis-handled.
-    for p in params {
-        if matches!(p.kind, ParamKind::Comptime(_)) {
-            return Err(syn::Error::new(
-                p.name.span(),
-                format!(
-                    "kernel `{fn_name_str}`: #[comptime] parameters in a cooperative kernel are \
-                     outside the vericl v1 subset (use `data.len()` / the `CUBE_COUNT` builtin \
-                     instead) — deferred rather than mis-handled"
-                ),
-            ));
-        }
-    }
-
+    // v1.1: #[comptime] params are supported. They are NOT drawn by `gen(...)`
+    // and never appear in the `reference`/`check_assumes`/`generate_case` call
+    // sites (the twin bakes them as `let` consts — cube-uniform, so the same
+    // value in every segment); their pinned value is spliced straight into the
+    // `launch` args at their declared position, exactly as the ordinary
+    // (non-cooperative) `build_conformance_items` does (see `launch_args` below).
     let (ranges, lens) = resolve_gen_entries(params, gen_entries, fn_name_str)?;
 
     // Draw statements: input arrays + scalars via the ordinary gen machinery
@@ -852,9 +1041,9 @@ pub(crate) fn build_conformance_items(
 
     for p in params {
         let name = &p.name;
-        field_names.push(name.clone());
         match &p.kind {
             ParamKind::Scalar(ty) => {
+                field_names.push(name.clone());
                 let field = build_gen_field(p, &ranges, &lens, fn_name_str, None)?;
                 let stmt = &field.stmt;
                 draw_stmts.push(quote! { #stmt });
@@ -862,6 +1051,7 @@ pub(crate) fn build_conformance_items(
                 check_args.push(quote!(#name));
             }
             ParamKind::ArrayRef(elem) => {
+                field_names.push(name.clone());
                 let field = build_gen_field(p, &ranges, &lens, fn_name_str, None)?;
                 let stmt = &field.stmt;
                 draw_stmts.push(quote! { #stmt });
@@ -869,6 +1059,7 @@ pub(crate) fn build_conformance_items(
                 check_args.push(quote!(&#name));
             }
             ParamKind::ArrayMut(elem) => {
+                field_names.push(name.clone());
                 // Output partials: sized `cube_count`, zero-initialised (the
                 // kernel fills them). NOT drawn by gen(...).
                 draw_stmts.push(quote! {
@@ -878,7 +1069,11 @@ pub(crate) fn build_conformance_items(
                 owned_tys.push(quote!(::std::vec::Vec<#elem>));
                 check_args.push(quote!(&#name));
             }
-            ParamKind::Comptime(_) => unreachable!("rejected above"),
+            // #[comptime] params are baked into the twin as `let` consts and
+            // spliced into `launch` as their pinned value — never drawn, never a
+            // `generate_case`/`check_assumes` argument (mirrors the ordinary
+            // `build_conformance_items`).
+            ParamKind::Comptime(_) => {}
         }
     }
 
@@ -917,6 +1112,12 @@ pub(crate) fn build_conformance_items(
     for p in params {
         let name = &p.name;
         match &p.kind {
+            ParamKind::Comptime(_) => {
+                // cubecl keeps a comptime param in its declared launch position
+                // with its plain (unwrapped) type, so splice the pinned value in
+                // there directly — no reference arg (the twin bakes it as a const).
+                launch_args.push(comptime_values[&name.to_string()].clone());
+            }
             ParamKind::Scalar(_) => {
                 reference_args.push(quote!(#name));
                 launch_args.push(quote!(#name));
@@ -985,7 +1186,6 @@ pub(crate) fn build_conformance_items(
                     __vericl_reports.push((#name_str.to_string(), #compare_call));
                 });
             }
-            ParamKind::Comptime(_) => unreachable!("rejected above"),
         }
     }
 
@@ -1117,6 +1317,77 @@ mod tests {
         assert_compound_assign_rejected(
             "{ let mut tile = SharedMemory::<f32>::new(256usize); \
                (tile[0usize]) += 1.0f32; sync_cube(); }",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Workgroup-uniform `terminate!()` (v1.1, docs/design-shared-memory.md
+    // §4.3/§7.4) — twin-lane recognition and rejection.
+    // -----------------------------------------------------------------
+
+    fn analyse_terminate(src: &str) -> syn::Result<Analysis> {
+        let block: syn::Block = syn::parse_str(src).expect("valid block");
+        analyse(&block, &[], "term_demo")
+    }
+
+    /// A top-level, before-any-barrier, cube-uniform `if CUBE_POS >= 4 {
+    /// terminate!() }` is accepted and recorded as one terminate guard.
+    #[test]
+    fn uniform_top_level_terminate_is_accepted() {
+        let a = analyse_terminate(
+            "{ if CUBE_POS >= 4usize { terminate!() } \
+               let mut tile = SharedMemory::<f32>::new(256usize); \
+               tile[0usize] = 1.0f32; sync_cube(); }",
+        )
+        .expect("a uniform top-level terminate must be accepted");
+        assert_eq!(a.terminates.len(), 1, "expected exactly one terminate guard");
+    }
+
+    /// A **thread-varying** terminate condition (`if UNIT_POS < 128 {
+    /// terminate!() }`) is barrier divergence — rejected. Matches the prover.
+    #[test]
+    fn thread_varying_terminate_is_rejected() {
+        let Err(err) = analyse_terminate(
+            "{ if UNIT_POS < 128u32 { terminate!() } \
+               let mut tile = SharedMemory::<f32>::new(256usize); sync_cube(); }",
+        ) else {
+            panic!("a thread-varying terminate must be rejected");
+        };
+        assert!(
+            err.to_string().contains("thread-varying"),
+            "expected the thread-varying rejection, got: {err}"
+        );
+    }
+
+    /// A `terminate!()` after content (here a shared-tile declaration) is not the
+    /// "skip the whole cube" guard — rejected as it must precede any barrier.
+    #[test]
+    fn post_content_terminate_is_rejected() {
+        let Err(err) = analyse_terminate(
+            "{ let mut tile = SharedMemory::<f32>::new(256usize); \
+               if CUBE_POS >= 4usize { terminate!() } sync_cube(); }",
+        ) else {
+            panic!("a post-content terminate must be rejected");
+        };
+        assert!(
+            err.to_string().contains("before any barrier"),
+            "expected the before-any-barrier rejection, got: {err}"
+        );
+    }
+
+    /// A **bare** `terminate!()` (not the recognised `if <uniform> { terminate!()
+    /// }` guard) would survive into the twin as an uncompilable macro — rejected
+    /// by `reject_stray_terminate` with the targeted shape error.
+    #[test]
+    fn bare_terminate_is_rejected() {
+        let Err(err) = analyse_terminate(
+            "{ terminate!(); let mut tile = SharedMemory::<f32>::new(256usize); sync_cube(); }",
+        ) else {
+            panic!("a bare terminate must be rejected");
+        };
+        assert!(
+            err.to_string().contains("only accepted as a top-level"),
+            "expected the stray-terminate rejection, got: {err}"
         );
     }
 }

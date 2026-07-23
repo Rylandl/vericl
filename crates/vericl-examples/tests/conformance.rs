@@ -39,6 +39,14 @@ vericl::suite! {
         // lib unit tests), just outside the multi-LANE suite so the cpu lane
         // stays green.
         block_sum_reduce,
+        // Cooperative v1.1 acceptance example — the `emitter_powers_multi_rx`
+        // shape (minus 2-D dispatch): a #[comptime] `n_emitters`, a `uses(...)`
+        // helper in phase 0 (`square_sample`), and a workgroup-uniform
+        // `terminate!()` padding guard, all at once. Carries the full triple
+        // (tested + proved smt-oob-freedom + proved smt-race-freedom) on both
+        // lanes — the cooperative v1.1 extensions landing together on the real
+        // reduction shape (docs/design-shared-memory.md §7.4).
+        emitter_reduce,
     ],
     evidence: "evidence/vericl.json",
     extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime),

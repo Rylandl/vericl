@@ -630,7 +630,12 @@ pub fn prove_race_freedom(
     assumes: &[Assume],
     cube_dim: u32,
 ) -> ProveResult {
-    match prove_race_freedom_detailed(def, buffers, assumes, cube_dim) {
+    // `None` expected-barrier count: `prove_race_freedom` is the standalone
+    // race verdict used by the prover's own unit tests, which build IR directly
+    // and do not carry a twin-declared count. The composition barrier check
+    // (§7.4) runs on the suite path (`prove_cooperative`), which threads the
+    // macro's `COOP_BARRIER_COUNT`.
+    match prove_race_freedom_detailed(def, buffers, assumes, cube_dim, None) {
         CooperativeProof::Proved(o) => ProveResult::Proved { obligations: o.bounds + o.race() },
         CooperativeProof::Refuted { obligation, counterexample } => {
             ProveResult::Refuted { obligation, counterexample }
@@ -650,13 +655,20 @@ pub fn prove_race_freedom(
 /// `Proved` claims — `smt-oob-freedom` (bounds) and `smt-race-freedom` (races)
 /// — from one walk. `prove_race_freedom` is this collapsed to a single combined
 /// count (for callers that only need the race verdict).
+///
+/// `expected_barriers` is the twin's declared top-level `sync_cube()` count
+/// (the macro's `COOP_BARRIER_COUNT`). The walk first checks that the inlined IR
+/// contains exactly that many `SyncCube` instructions — a `uses(...)` helper
+/// that hid a barrier would inflate the IR count and is rejected `OutOfSubset`
+/// (cooperative-composition soundness crux, docs/design-shared-memory.md §7.4).
 pub fn prove_cooperative(
     def: &KernelDefinition,
     buffers: &[BufferParam],
     assumes: &[Assume],
     cube_dim: u32,
+    expected_barriers: usize,
 ) -> CooperativeProof {
-    prove_race_freedom_detailed(def, buffers, assumes, cube_dim)
+    prove_race_freedom_detailed(def, buffers, assumes, cube_dim, Some(expected_barriers))
 }
 
 fn prove_bounds_freedom_impl(
@@ -688,6 +700,16 @@ fn prove_bounds_freedom_impl(
         race: None,
         elem_bounds: HashMap::new(),
         elem_invalidated: HashSet::new(),
+        coop_barrier_seen: false,
+        // A cooperative bounds walk may hit a `terminate!()` before deferring at
+        // the tree loop; compute the thread-varying set so its uniformity can be
+        // checked. Empty for a non-cooperative walk (no terminate reachable).
+        coop_varying: if coop.is_some() {
+            collect_thread_varying(&def.body)
+        } else {
+            HashSet::new()
+        },
+        walk_depth: 0,
     };
 
     if let Err(e) = prover.assert_structured_assumes(assumes) {
@@ -713,7 +735,29 @@ fn prove_race_freedom_detailed(
     buffers: &[BufferParam],
     assumes: &[Assume],
     cube_dim: u32,
+    expected_barriers: Option<usize>,
 ) -> CooperativeProof {
+    // Cooperative-composition barrier check (§7.4): the phase-split twin only
+    // segments at the kernel's *top-level* `sync_cube()` calls, and cube inlines
+    // a `uses(...)` helper's IR into this scope — so if the inlined IR carries
+    // more `SyncCube` instructions than the twin declared, a helper hid a barrier
+    // and the twin's phase structure silently disagrees with the real execution.
+    // Reject before any SMT work (the twin lane also rejects a helper containing
+    // `sync_cube`, so the two lanes agree; this is the independent proof-lane
+    // half). A `None` count (the `prove_race_freedom` unit-test path) skips it.
+    if let Some(expected) = expected_barriers {
+        let actual = count_sync_cube_ir(&def.body);
+        if actual != expected {
+            return CooperativeProof::OutOfSubset {
+                reason: format!(
+                    "cooperative kernel's IR contains {actual} `sync_cube()` barrier(s) but the \
+                     phase-split twin declares {expected} top-level barrier(s): a `uses(...)` \
+                     helper hid a barrier the twin cannot see — barriers must be visible at the \
+                     kernel's top level (docs/design-shared-memory.md §7.4)"
+                ),
+            };
+        }
+    }
     let mut smt = match ContextBuilder::new().solver("z3").solver_args(["-smt2", "-in"]).build() {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -754,7 +798,7 @@ fn prove_race_freedom_detailed(
             phases_t1: Vec::new(),
             phases_t2: Vec::new(),
             uniform_loop: HashMap::new(),
-            varying,
+            varying: varying.clone(),
             ww: 0,
             rw: 0,
             global_checks: 0,
@@ -762,6 +806,9 @@ fn prove_race_freedom_detailed(
         }),
         elem_bounds: HashMap::new(),
         elem_invalidated: HashSet::new(),
+        coop_barrier_seen: false,
+        coop_varying: varying,
+        walk_depth: 0,
     };
 
     if let Err(e) = prover.assert_structured_assumes(assumes) {
@@ -895,6 +942,24 @@ struct Prover<'a, 'b> {
     /// is tainted rather than modeled, regardless of the assume. Conservative
     /// (only ever removes modeling), hence sound.
     elem_invalidated: HashSet<Id>,
+    /// Whether a `sync_cube()` barrier (or a barrier-carrying cooperative loop)
+    /// has been reached yet in this walk. A workgroup-uniform `terminate!()`
+    /// (§4.3/§7.4) is only accepted *before* any barrier — the "skip the whole
+    /// cube" guard — so a terminate encountered with this `true` is rejected.
+    /// Set by the `Synchronization` arm of `process_instruction` and at the top
+    /// of `process_cooperative_loop`. Always `false` for a non-cooperative walk
+    /// (which has no `terminate!()`, so it is never read).
+    coop_barrier_seen: bool,
+    /// Static thread-varying taint set (`collect_thread_varying`) for a
+    /// cooperative walk — the same set the race walk uses to gate barrier
+    /// uniformity, additionally consulted to verify a `terminate!()` condition is
+    /// cube-uniform (a thread-varying terminate is barrier divergence). Empty for
+    /// a non-cooperative walk.
+    coop_varying: HashSet<VariableKind>,
+    /// Recursion depth of `process_scope`. `0` is the outermost (body) scope —
+    /// the only one that recognises a `terminate!()` (§4.3/§7.4: the guard is
+    /// top-level). Incremented on entry, decremented on exit.
+    walk_depth: u32,
 }
 
 /// Which of the two symbolic threads a race walk is currently resolving
@@ -1248,8 +1313,106 @@ impl<'a, 'b> Prover<'a, 'b> {
     // -- control-flow walk ---------------------------------------------
 
     fn process_scope(&mut self, scope: &Scope) -> Result<(), Stop> {
+        // Only the outermost (body) scope handles `terminate!()` (§4.3/§7.4: the
+        // guard is top-level). `walk_depth` is 0 exactly for that call.
+        let top_level = self.walk_depth == 0;
+        self.walk_depth += 1;
+        let result = self.process_scope_inner(scope, top_level);
+        self.walk_depth -= 1;
+        result
+    }
+
+    fn process_scope_inner(&mut self, scope: &Scope, top_level: bool) -> Result<(), Stop> {
         for inst in &scope.instructions {
+            // Recognise a cooperative `terminate!()` — `if <cond> { return }` at
+            // the top level — and model it as a `!cond` path condition for the
+            // rest of the walk (the threads that continue are exactly those where
+            // the terminate condition was false). See `enter_coop_terminate`.
+            if top_level {
+                if let Some(cond_var) = self.as_coop_terminate(inst) {
+                    self.enter_coop_terminate(&cond_var)?;
+                    continue;
+                }
+            }
             self.process_instruction(inst)?;
+        }
+        Ok(())
+    }
+
+    /// Recognise a cooperative `terminate!()`: an `if <cond> { return }` whose
+    /// then-scope is exactly a single `Branch::Return` (the IR §2.5 lowers
+    /// `terminate!()` to a `Branch::Return` nested in a structured `if`).
+    /// Returns the condition `Variable`. Only recognised in cooperative mode
+    /// (`terminate` is banned outside a cooperative kernel, so no such shape
+    /// reaches a non-cooperative walk from vericl); a `None` return leaves the
+    /// `if` to ordinary `process_branch` handling (where `Branch::Return` is a
+    /// no-op), which is sound but adds no `!cond`.
+    fn as_coop_terminate(&self, inst: &Instruction) -> Option<Variable> {
+        self.coop?; // cooperative mode only
+        let Operation::Branch(Branch::If(if_)) = &inst.operation else { return None };
+        let insts = &if_.scope.instructions;
+        if insts.len() != 1 {
+            return None;
+        }
+        match &insts[0].operation {
+            Operation::Branch(Branch::Return) => Some(if_.cond),
+            _ => None,
+        }
+    }
+
+    /// Enter a recognised cooperative `terminate!()`: verify it is workgroup-
+    /// uniform and before any barrier (§4.3/§7.4), then assert `!cond` as a path
+    /// condition for the rest of the walk. It is asserted at the **outermost SMT
+    /// scope without a `push`** (never popped) — soundness-critical: the body
+    /// walk must stay at the outermost scope so a cooperative tree loop's control
+    /// leaf (`half`) declared during it survives to `emit_race_obligations`; a
+    /// scoping `push` here would drop that declaration on its matching `pop`,
+    /// leaving a deferred cross-thread obligation referencing an undeclared
+    /// symbol (the same hazard `predeclare_coop_leaves` avoids). Because the
+    /// terminate is top-level and applies to the entire remaining body, never
+    /// popping is exactly right — there is no later code where `!cond` should not
+    /// hold. A non-uniform or post-barrier terminate is `OutOfSubset` — the same
+    /// shape the twin lane rejects, so the two lanes agree.
+    fn enter_coop_terminate(&mut self, cond_var: &Variable) -> Result<(), Stop> {
+        // Before any barrier: a terminate after a `sync_cube()` would leave the
+        // twin's "skip the whole cube" model (which the twin only recognises at
+        // the top level before any barrier) — rejected on both lanes.
+        if self.coop_barrier_seen {
+            return Err(Stop::OutOfSubset(
+                "terminate!() after a barrier is outside the vericl v1.1 subset — a \
+                 workgroup-uniform terminate must precede every sync_cube() (the \"skip the whole \
+                 cube\" guard, docs/design-shared-memory.md §4.3/§7.4)"
+                    .into(),
+            ));
+        }
+        // Uniformity (§5.4): a thread-varying terminate condition is barrier
+        // divergence (some threads skip the cube, others reach the barrier) —
+        // rejected exactly like a thread-varying barrier guard, never a silent
+        // `Proved`. Uses the same static thread-varying taint set.
+        if var_is_thread_varying(cond_var, &self.coop_varying) {
+            return Err(Stop::OutOfSubset(
+                "terminate!() under a thread-varying condition (barrier divergence) is outside the \
+                 vericl v1.1 subset — only a workgroup-uniform terminate is accepted \
+                 (docs/design-shared-memory.md §4.3/§7.4)"
+                    .into(),
+            ));
+        }
+        let Some(cond) = self.value_of(cond_var) else {
+            return Err(Stop::OutOfSubset(
+                "terminate!() condition depends on a construct outside the vericl v0 subset".into(),
+            ));
+        };
+        let not_cond = self.smt.not(cond);
+        self.smt.assert(not_cond).map_err(smt_err)?;
+        // In a race walk, `!cond` is also a live fact conjoined into every
+        // subsequent access's recorded guard (so the deferred cross-thread
+        // obligations see it), exactly like an `if`/loop guard. `race_reset_for_
+        // t2` clears the fact stack, and the thread-2 walk re-encounters the same
+        // top-level terminate and re-adds it — so both threads' recorded guards
+        // carry `!cond`, and both walks re-assert it (a harmless duplicate on the
+        // shared, cube-uniform `CubePos`).
+        if let Some(r) = self.race.as_mut() {
+            r.fact_stack.push(not_cond);
         }
         Ok(())
     }
@@ -1269,6 +1432,10 @@ impl<'a, 'b> Prover<'a, 'b> {
             // bounds walk it is a no-op (it has no `out`, so this matches the
             // pre-existing `_ => taint_out` behavior exactly).
             Operation::Synchronization(s) => {
+                // A barrier: no `terminate!()` may follow (§4.3/§7.4). Recorded
+                // in both walks (the bounds walk may see a top-level barrier
+                // before deferring at the tree loop).
+                self.coop_barrier_seen = true;
                 if self.race.is_some() {
                     self.process_sync(s)?;
                 }
@@ -1925,6 +2092,10 @@ impl<'a, 'b> Prover<'a, 'b> {
         // clear for defensiveness.
         self.carried_stack.clear();
         self.write_log_stack.clear();
+        // Reset the barrier-seen flag so the thread-2 walk re-evaluates the
+        // terminate/barrier ordering from scratch (else it would think a barrier
+        // was already seen from the thread-1 walk and reject a valid terminate).
+        self.coop_barrier_seen = false;
         let r = self.race.as_mut().expect("race mode");
         r.fact_stack.clear();
         r.guard_stack.clear();
@@ -2016,6 +2187,9 @@ impl<'a, 'b> Prover<'a, 'b> {
     /// halving recurrence is non-increasing), and walks the body once so the
     /// internal barrier segments the per-iteration phase.
     fn process_cooperative_loop(&mut self, l: &Loop) -> Result<(), Stop> {
+        // A barrier-carrying loop is a barrier region: no `terminate!()` may
+        // follow (§4.3/§7.4).
+        self.coop_barrier_seen = true;
         let bg = recognize_break_guard(&l.scope).ok_or_else(|| {
             Stop::OutOfSubset(
                 "cooperative loop is not the recognized `while <uniform> { …; sync_cube(); … }` \
@@ -3058,6 +3232,40 @@ fn scope_contains_sync_cube(scope: &Scope) -> bool {
         },
         _ => false,
     })
+}
+
+/// Count every `SyncCube` instruction in a scope, recursively (the IR analog of
+/// the macro's source-level `sync_cube()` count). Used by the cooperative
+/// composition barrier check: cube **inlines** a `uses(...)` helper's IR into the
+/// composing kernel's own scope, so if a helper contained a barrier it would
+/// show up here as an *extra* `SyncCube` beyond the top-level ones the phase-
+/// split twin declared — a silent phase-structure disagreement between the twin
+/// and proof lanes. Comparing this count to the twin's declared count
+/// (`expected_barriers`, the macro's `COOP_BARRIER_COUNT`) catches exactly that,
+/// independently of the macro's own helper gate (docs/design-shared-memory.md
+/// §7.4). See `prove_race_freedom_detailed`.
+fn count_sync_cube_ir(scope: &Scope) -> usize {
+    scope
+        .instructions
+        .iter()
+        .map(|inst| match &inst.operation {
+            Operation::Synchronization(Synchronization::SyncCube) => 1,
+            Operation::Branch(b) => match b {
+                Branch::If(if_) => count_sync_cube_ir(&if_.scope),
+                Branch::IfElse(ie) => {
+                    count_sync_cube_ir(&ie.scope_if) + count_sync_cube_ir(&ie.scope_else)
+                }
+                Branch::Switch(sw) => {
+                    count_sync_cube_ir(&sw.scope_default)
+                        + sw.cases.iter().map(|(_, s)| count_sync_cube_ir(s)).sum::<usize>()
+                }
+                Branch::RangeLoop(rl) => count_sync_cube_ir(&rl.scope),
+                Branch::Loop(l) => count_sync_cube_ir(&l.scope),
+                Branch::Return | Branch::Break | Branch::Unreachable => 0,
+            },
+            _ => 0,
+        })
+        .sum()
 }
 
 // -- thread-varying taint + cooperative-loop recognition (M3 + M4) -------
@@ -5008,6 +5216,228 @@ mod tests {
         match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
             ProveResult::Proved { obligations } => assert_eq!(obligations, 19),
             other => panic!("expected Proved (race-free), got {other:?}"),
+        }
+    }
+
+    /// Cooperative-composition barrier check (§7.4, v1.1): `prove_cooperative`
+    /// compares the (helper-inlined) IR's `SyncCube` count against the twin's
+    /// declared `COOP_BARRIER_COUNT`. `prover_test_race_block_sum_reduce` has
+    /// exactly 2 `sync_cube()` barriers.
+    ///
+    /// - Correct count (2) proves, matching the un-checked `prove_race_freedom`.
+    /// - A count of 1 — simulating a `uses(...)` helper that hid a barrier the
+    ///   phase-split twin could not see (the twin declared 1, the inlined IR
+    ///   carries 2) — is rejected `OutOfSubset` with the barrier-visibility
+    ///   reason, BEFORE any SMT work. This is the independent proof-lane half of
+    ///   the crux; the twin lane rejects a helper containing `sync_cube` directly.
+    #[test]
+    fn cooperative_barrier_count_mismatch_is_rejected() {
+        let def = build_shared!(prover_test_race_block_sum_reduce::expand);
+        assert_eq!(count_sync_cube_ir(&def.body), 2, "the probe kernel has 2 barriers");
+
+        // Correct count: proves (same 19 obligations as the un-checked path).
+        match prove_cooperative(&def, SHARED_BUFFERS, &[], 256, 2) {
+            CooperativeProof::Proved(o) => assert_eq!(o.bounds + o.race(), 19),
+            other => panic!("expected Proved with the correct barrier count, got {other:?}"),
+        }
+
+        // Under-declared count: a hidden helper barrier — rejected before SMT.
+        match prove_cooperative(&def, SHARED_BUFFERS, &[], 256, 1) {
+            CooperativeProof::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("sync_cube")
+                        && reason.contains("visible at the kernel's top level"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (barrier-count mismatch), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Workgroup-uniform `terminate!()` (v1.1, docs/design-shared-memory.md
+    // §4.3/§7.4). The prover models `if <uniform cond> { terminate!() }` at
+    // the top level before any barrier as a `!cond` path condition; a
+    // non-uniform or post-barrier terminate is rejected on both lanes.
+    // -----------------------------------------------------------------
+
+    /// A cooperative kernel whose single-writer store `output[CUBE_POS]` has NO
+    /// explicit `CUBE_POS < output.len()` guard — it is bounded ONLY by the
+    /// workgroup-uniform `terminate!()` padding guard (`CUBE_POS >= 4`) plus the
+    /// contract assume `output.len() == 4`.
+    #[cube(launch)]
+    fn prover_test_terminate_store(input: &Array<f32>, output: &mut Array<f32>) {
+        if CUBE_POS >= 4usize {
+            terminate!();
+        }
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        sync_cube();
+        if tid == 0usize {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    /// The same kernel WITHOUT the terminate guard — the store is then genuinely
+    /// unbounded (`CUBE_POS` is a free `u32` leaf), so it must `Refute`.
+    #[cube(launch)]
+    fn prover_test_no_terminate_store(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        sync_cube();
+        if tid == 0usize {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    /// The terminate is **load-bearing**: with the `terminate!()` guard the store
+    /// `output[CUBE_POS]` proves in bounds (the modeled `!(CUBE_POS >= 4)` path
+    /// condition plus `output.len() == 4` bound it), and the SAME kernel WITHOUT
+    /// the terminate `Refutes` on that store (the store index is then unbounded).
+    /// Pins that the prover genuinely models the terminate as a path condition,
+    /// not merely accepts it. `output.len() == 4` matches `CUBE_POS < 4`.
+    #[test]
+    fn terminate_is_load_bearing_for_the_store_bound() {
+        let assume = &[Assume::LenEqConst { a: "output", value: 4 }];
+
+        let def = build_shared!(prover_test_terminate_store::expand);
+        // 1 barrier (the pre-tree sync); the terminate adds none.
+        assert_eq!(count_sync_cube_ir(&def.body), 1);
+        match prove_cooperative(&def, SHARED_BUFFERS, assume, 256, 1) {
+            CooperativeProof::Proved(_) => {}
+            other => panic!("expected Proved with the terminate guard, got {other:?}"),
+        }
+
+        let def_no = build_shared!(prover_test_no_terminate_store::expand);
+        match prove_race_freedom(&def_no, SHARED_BUFFERS, assume, 256) {
+            ProveResult::Refuted { obligation, .. } => {
+                assert!(obligation.contains("output"), "unexpected obligation: {obligation}");
+            }
+            other => panic!("expected Refuted without the terminate guard, got {other:?}"),
+        }
+    }
+
+    /// A **thread-varying** terminate condition (`if UNIT_POS < 128 { terminate!()
+    /// }`) is barrier divergence — some threads skip the cube, others reach the
+    /// barrier. Rejected `OutOfSubset`, never a silent `Proved` (§4.3/§7.4). The
+    /// twin lane rejects the identical shape.
+    #[cube(launch)]
+    fn prover_test_terminate_nonuniform(input: &Array<f32>, output: &mut Array<f32>) {
+        if UNIT_POS < 128u32 {
+            terminate!();
+        }
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        sync_cube();
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn nonuniform_terminate_is_out_of_subset() {
+        let def = build_shared!(prover_test_terminate_nonuniform::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::OutOfSubset { reason } => assert!(
+                reason.contains("thread-varying") && reason.contains("terminate"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected OutOfSubset (non-uniform terminate), got {other:?}"),
+        }
+    }
+
+    /// A **post-barrier** terminate (`terminate!()` after a `sync_cube()`) leaves
+    /// the twin's "skip the whole cube" model — rejected `OutOfSubset` (§4.3/§7.4).
+    #[cube(launch)]
+    fn prover_test_terminate_post_barrier(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        sync_cube();
+        if CUBE_POS >= 4usize {
+            terminate!();
+        }
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn post_barrier_terminate_is_out_of_subset() {
+        let def = build_shared!(prover_test_terminate_post_barrier::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::OutOfSubset { reason } => assert!(
+                reason.contains("after a barrier") && reason.contains("terminate"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected OutOfSubset (post-barrier terminate), got {other:?}"),
+        }
+    }
+
+    /// A device fn that indexes a `SharedMemory` tile passed as a parameter.
+    /// vericl **rejects** this shape at the twin lane (a #[vericl::helper] taking
+    /// a `SharedMemory` param is a compile error — `SharedTile` is twin-local, so
+    /// it cannot cross a helper boundary in v1.1), so this shape never reaches the
+    /// prover through the vericl pipeline. This kernel exists only to *verify what
+    /// the inlined IR looks like* and confirm the prover handles it **soundly**
+    /// (docs/design-shared-memory.md §7.4): cube inlines the helper body into the
+    /// caller's scope, so the shared read appears as an ordinary `SharedMemory`
+    /// access the two-thread walk models against the tile's compile-time length —
+    /// no false `Proved`.
+    #[cube]
+    fn prover_test_helper_reads_tile(tile: &SharedMemory<f32>, i: usize) -> f32 {
+        tile[i]
+    }
+
+    #[cube(launch)]
+    fn prover_test_shared_into_helper(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        sync_cube();
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = prover_test_helper_reads_tile(&tile, tid);
+        }
+    }
+
+    /// Verifies the prover soundly handles an inlined shared-tile-into-helper
+    /// access. cube inlines `prover_test_helper_reads_tile`, so the shared read
+    /// `tile[tid]` (with `tid < cube_dim == 256` and the tile length 256) is
+    /// modeled as an ordinary shared access and **proves** — no false `Proved`,
+    /// the shared length bound still applies through inlining. (In the vericl
+    /// pipeline the shape is unreachable — the twin lane rejects the helper — so
+    /// this is a defense-in-depth verification, not a supported path.)
+    #[test]
+    fn shared_tile_into_helper_is_soundly_modeled() {
+        let def = build_shared!(prover_test_shared_into_helper::expand);
+        // 1 barrier in this kernel; the inlined helper adds none.
+        assert_eq!(count_sync_cube_ir(&def.body), 1);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::Proved { .. } => {}
+            other => panic!("expected the inlined shared read to be soundly Proved, got {other:?}"),
         }
     }
 

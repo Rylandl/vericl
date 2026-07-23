@@ -75,6 +75,9 @@ const BANNED_IDENTS: &[&str] = &[
     // terminate!() is a per-lane early exit; outside #[cube] it expands to an
     // empty block, so a derived twin would silently fall through the guard
     // instead of ending the lane (latent soundness gap found in dogfooding).
+    // Stays banned for ordinary kernels; a *cooperative* kernel lifts it via
+    // `COOP_ALLOWED` for the recognised workgroup-uniform "skip the whole cube"
+    // guard, which `coop::analyse` models explicitly (v1.1, §4.3/§7.4).
     "terminate",
 ];
 
@@ -92,7 +95,17 @@ const BANNED_PREFIXES: &[&str] = &["plane_", "Atomic"];
 /// see `UsesRewriteFold`'s doc), this is the explicit, demand-driven
 /// allowlist for the latter category. Grow it as real kernels need more
 /// entries — never by removing the ambiguity check itself.
-const KNOWN_HOST_SAFE_FREE_FNS: &[&str] = &["range_stepped"];
+///
+/// `sync_cube` is included for a different reason: in a **cooperative** twin the
+/// body still contains bare `sync_cube()` calls when `UsesRewriteFold` runs (the
+/// phase splitter in `coop::build_reference_body`, which drops them as segment
+/// delimiters, runs *after* the uses rewrite). It must not be flagged as an
+/// unlisted helper call. It can only ever reach the fold inside a valid
+/// cooperative kernel — a non-cooperative kernel's `transform_body` rejects
+/// `sync_cube` outright, and a helper's `reject_cooperative_constructs_in_helper`
+/// rejects it — so allowing it here is sound (it is never actually called
+/// host-side; the phase splitter removes it).
+const KNOWN_HOST_SAFE_FREE_FNS: &[&str] = &["range_stepped", "sync_cube"];
 
 /// `cubecl::prelude::Float`/`Numeric` trait method names empirically
 /// verified as host-callable on `f32` — safe to appear in a reference
@@ -644,6 +657,77 @@ fn transform_body(
 /// `cooperative(...)` clause specifically lifts.
 const COOP_CONSTRUCTS: &[&str] =
     &["UNIT_POS", "CUBE_POS", "CUBE_DIM", "CUBE_COUNT", "SharedMemory", "sync_cube"];
+
+/// Recursively find the span of the first token whose identifier is in
+/// `targets`, descending into groups (so a construct nested in an `if`/`for`
+/// body is still found). Used by the helper cooperative-construct rejection.
+fn find_ident_span(ts: TokenStream2, targets: &[&str]) -> Option<(String, proc_macro2::Span)> {
+    for tt in ts {
+        match tt {
+            TokenTree::Ident(id) => {
+                let s = id.to_string();
+                if targets.contains(&s.as_str()) {
+                    return Some((s, id.span()));
+                }
+            }
+            TokenTree::Group(g) => {
+                if let Some(r) = find_ident_span(g.stream(), targets) {
+                    return Some(r);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reject a `#[vericl::helper]` that uses a workgroup-cooperative construct
+/// (`sync_cube()` barrier or `SharedMemory` tile) — the twin-lane half of the
+/// cooperative-composition soundness crux (docs/design-shared-memory.md §7.4).
+///
+/// A helper is *inlined into the middle of a phase-split segment* of a composing
+/// cooperative kernel's twin (the helper call sits inside one segment, run
+/// per-`unit_pos` to completion). A barrier inside the helper would therefore be
+/// invisible to the top-level phase split, making it non-local — so barriers
+/// must be visible at the kernel's top level. A `SharedMemory` tile is a
+/// twin-local type (`vericl::SharedTile`) that the phase-split twin owns per
+/// cube; it cannot cross a helper boundary in v1.1. The prover independently
+/// re-checks the inlined IR's barrier count against the twin's (see
+/// `verify_no_helper_barrier`), so this is one of two agreeing lanes, not the
+/// sole gate.
+fn reject_cooperative_constructs_in_helper(
+    sig: &syn::Signature,
+    body: &syn::Block,
+    fn_name_str: &str,
+) -> syn::Result<()> {
+    // Scan the signature (parameter + return types) first: a helper *taking* or
+    // *returning* a shared tile (`SharedMemory<T>` / `&mut SharedMemory<T>`)
+    // names `SharedMemory` in its types, not its body. `SharedTile` is the
+    // twin-local type the phase-split twin owns per cube, so it cannot cross a
+    // helper boundary in v1.1.
+    let sig_toks: TokenStream2 = sig
+        .inputs
+        .iter()
+        .map(|a| a.to_token_stream())
+        .chain(std::iter::once(sig.output.to_token_stream()))
+        .collect();
+    let hit = find_ident_span(sig_toks, &["SharedMemory"])
+        .or_else(|| find_ident_span(body.to_token_stream(), &["sync_cube", "SharedMemory"]));
+    if let Some((name, span)) = hit {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "#[vericl::helper] `{fn_name_str}` uses `{name}`, but barriers and shared memory \
+                 must be visible at the cooperative kernel's top level, not hidden inside a helper: \
+                 a helper is inlined into the middle of a phase-split segment, so a `sync_cube()` \
+                 there would make the phase split non-local, and a `SharedMemory` tile is a \
+                 twin-local type that cannot cross a helper boundary (docs/design-shared-memory.md \
+                 §7.4)"
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// Token-wise generic substitution only (no ABSOLUTE_POS rewrite, no
 /// banned-construct check) — used on parameter *types*, which never contain
@@ -1754,30 +1838,25 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 ),
             ));
         }
-        // cooperative kernels are v1-restricted: no #[comptime] params (use
-        // data.len()/the CUBE_COUNT builtin), no uses(...)/wrapping composition
-        // (untested with the phase-split twin — rejected rather than mishandled).
-        if let Some(p) = params.iter().find(|p| matches!(p.kind, ParamKind::Comptime(_))) {
-            return Err(syn::Error::new(
-                p.name.span(),
-                format!(
-                    "kernel `{fn_name_str}`: #[comptime] parameters in a cooperative kernel are \
-                     outside the vericl v1 subset (use `data.len()` / the `CUBE_COUNT` builtin \
-                     instead) — deferred rather than mis-handled (docs/design-shared-memory.md \
-                     §7.4)"
-                ),
-            ));
-        }
-        if !spec.uses.is_empty() {
-            return Err(syn::Error::new(
-                *clause_span,
-                format!(
-                    "kernel `{fn_name_str}`: uses(...) helper composition combined with \
-                     cooperative(...) is outside the vericl v1 subset (composition inside the \
-                     phase-split twin is deferred — docs/design-shared-memory.md §7.4)"
-                ),
-            ));
-        }
+        // cooperative(...) v1.1: #[comptime] parameters are now supported. A
+        // #[comptime] value is cube-uniform by construction (the same compile-
+        // time constant for every thread — arguably the easiest uniformity case),
+        // so it threads through the phase-split twin as a `let` const exactly like
+        // an ordinary kernel's, and the pinned value is baked into the IR
+        // (`kd_call_args`) the same way — nothing in the phase splitter, the
+        // uniform-trip-count check, or the two-thread walk observes a comptime
+        // param differently from any other cube-uniform value.
+        //
+        // v1.1: uses(...) helper composition is also supported in a cooperative
+        // kernel. The phase-split twin rewrites each helper call to its
+        // `_vericl_ref` (the same UsesRewriteFold every non-cooperative kernel
+        // uses, now run for coop too — see below), and the helper runs as a
+        // barrier-free unit *inside* one segment. That is sound iff the helper
+        // contains no `sync_cube()` (a barrier inside a helper would make the
+        // phase split non-local): a #[vericl::helper] cannot contain one (its
+        // own macro gate rejects sync_cube/SharedMemory with a targeted error),
+        // and the prover independently verifies the inlined IR's barrier count
+        // matches the twin's top-level count (docs/design-shared-memory.md §7.4).
         // Best-effort: pin a power-of-two cube_dim when it is an integer literal
         // (the tree reduction `half /= 2` only covers the block cleanly for a
         // power of two — §7.1). A non-literal expr is left to the runtime launch.
@@ -1866,25 +1945,30 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         return Err(combined);
     }
 
-    if !is_coop {
-        // uses(...): rewrite calls to declared helpers to their `_vericl_ref`
-        // twin, and reject any other call this macro invocation can't account
-        // for — see `UsesRewriteFold`'s doc for exactly what "can't account
-        // for" means. (Cooperative kernels reject uses(...) above.)
-        let uses_set: HashSet<String> = used_names.iter().cloned().collect();
-        let locals = collect_locals(&ref_block, &params);
-        let mut uses_rewrite =
-            UsesRewriteFold { uses: &uses_set, locals: &locals, errors: Vec::new() };
-        ref_block = uses_rewrite.fold_block(ref_block);
-        if let Some(combined) = uses_rewrite.errors.into_iter().reduce(|mut a, b| {
-            a.combine(b);
-            a
-        }) {
-            return Err(combined);
-        }
+    // uses(...): rewrite calls to declared helpers to their `_vericl_ref`
+    // twin, and reject any other call this macro invocation can't account
+    // for — see `UsesRewriteFold`'s doc for exactly what "can't account
+    // for" means. Runs for cooperative kernels too (v1.1 composition): the
+    // helper runs as a barrier-free unit inside the segment the call sits in
+    // (the phase splitter in `coop::build_reference_body` then sees the
+    // rewritten `_vericl_ref` call in that segment).
+    let uses_set: HashSet<String> = used_names.iter().cloned().collect();
+    let locals = collect_locals(&ref_block, &params);
+    let mut uses_rewrite =
+        UsesRewriteFold { uses: &uses_set, locals: &locals, errors: Vec::new() };
+    ref_block = uses_rewrite.fold_block(ref_block);
+    if let Some(combined) = uses_rewrite.errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
 
+    if !is_coop {
         // `wrapping`: fold the already-ABSOLUTE_POS-rewritten twin body, and
         // ONLY the twin — the `#[cube]` kernel re-emitted above is untouched.
+        // (Cooperative kernels do not support `wrapping` — integer wrap-on-
+        // overflow is unrelated to the float reduction shapes.)
         if spec.wrapping.is_some() {
             ref_block = WrappingFold.fold_block(ref_block);
         }
@@ -2169,8 +2253,11 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 /// tile and `CUBE_*`/`UNIT_POS`/`ABSOLUTE_POS` bound to the loop
                 /// variables/constants. `cube_count` is derived by the caller
                 /// (`conformance_case`) from the case size; `cube_dim` is the
-                /// `cooperative(cube_dim = …)` pinned block size.
+                /// `cooperative(cube_dim = …)` pinned block size. Any #[comptime]
+                /// param is bound as a `let` const here (cube-uniform, so the same
+                /// value in every segment — v1.1 comptime support).
                 pub fn reference(#(#ref_params,)* cube_count: usize, cube_dim: usize) {
+                    #(#comptime_bindings)*
                     #coop_body
                 }
             }
@@ -2181,6 +2268,7 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             fn_name,
             &fn_name_str,
             cube_dim_expr,
+            &plan.comptime_values,
             generic_types,
         )?;
         (reference_fn, conformance)
@@ -2230,6 +2318,14 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         Some((_, cd)) => quote!(::core::option::Option::Some((#cd) as u32)),
         None => quote!(::core::option::Option::None),
     };
+    // The twin's declared top-level barrier count, for the prover's
+    // cooperative-composition barrier check (§7.4). 0 for a non-cooperative
+    // kernel (unused). Counted on the ORIGINAL source body (helper bodies are
+    // not part of it), so a `uses(...)` helper's own barrier — if it somehow had
+    // one — is never counted, which is exactly what makes the count vs. the
+    // helper-inlined IR count a barrier-in-helper detector.
+    let coop_barrier_count: usize =
+        if is_coop { coop::count_sync_cube(&func.block) } else { 0 };
     let declared_reference_const = spec.reference.is_some();
 
     Ok(quote! {
@@ -2255,6 +2351,14 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             /// the differential/race-freedom coupling of §6); `None` selects
             /// the ordinary bounds-only pipeline.
             pub const COOPERATIVE_CUBE_DIM: ::core::option::Option<u32> = #coop_cube_dim_const;
+
+            /// The phase-split twin's top-level `sync_cube()` barrier count —
+            /// the prover checks the (helper-inlined) IR contains exactly this
+            /// many `SyncCube` instructions, so a `uses(...)` helper that hid a
+            /// barrier is rejected (cooperative-composition soundness crux,
+            /// docs/design-shared-memory.md §7.4). `0` for a non-cooperative
+            /// kernel. `vericl::suite!` passes it to `prove_cooperative`.
+            pub const COOP_BARRIER_COUNT: usize = #coop_barrier_count;
 
             /// `true` iff this cooperative kernel declares `reference = fn`
             /// (candidate #3, docs/design-shared-memory.md §4.4): its reference
@@ -2564,6 +2668,13 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
             ));
         }
     }
+
+    // A helper cannot contain workgroup-cooperative constructs (barriers /
+    // shared memory) — the twin-lane half of the cooperative-composition
+    // soundness crux. Checked here (with a targeted error) rather than left to
+    // `transform_body`'s generic "add cooperative(...)" message, which is
+    // misleading for a helper (a helper can never be cooperative).
+    reject_cooperative_constructs_in_helper(&func.sig, &func.block, &fn_name_str)?;
 
     let generic_param_names: Vec<Ident> = func
         .sig
@@ -3786,6 +3897,72 @@ mod tests {
                 "`{name}` is both whitelisted and rejected"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Cooperative composition (v1.1): a #[vericl::helper] must be
+    // barrier-free and shared-memory-free — the twin-lane half of the
+    // soundness crux (docs/design-shared-memory.md §7.4). White-box tests
+    // over `reject_cooperative_constructs_in_helper`.
+    // -----------------------------------------------------------------
+
+    /// A helper containing a `sync_cube()` barrier is rejected with the targeted
+    /// "barriers … must be visible at the cooperative kernel's top level" error —
+    /// a barrier inlined into the middle of a phase-split segment would make the
+    /// split non-local.
+    #[test]
+    fn helper_with_barrier_is_rejected() {
+        let f: ItemFn =
+            syn::parse_str("fn bad(a: f32, b: f32) -> f32 { let x = a + b; sync_cube(); x }")
+                .expect("valid fn");
+        let err = reject_cooperative_constructs_in_helper(&f.sig, &f.block, "bad_helper")
+            .expect_err("a helper with sync_cube must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sync_cube")
+                && msg.contains("visible at the cooperative kernel's top level"),
+            "expected the targeted barrier-visibility error, got: {msg}"
+        );
+    }
+
+    /// A helper declaring a `SharedMemory` tile *in its body* is rejected.
+    #[test]
+    fn helper_with_shared_memory_is_rejected() {
+        let f: ItemFn = syn::parse_str(
+            "fn bad(i: usize) -> f32 { let t = SharedMemory::<f32>::new(256usize); t[i] }",
+        )
+        .expect("valid fn");
+        let err = reject_cooperative_constructs_in_helper(&f.sig, &f.block, "bad_helper")
+            .expect_err("a helper with SharedMemory must be rejected");
+        assert!(
+            err.to_string().contains("SharedMemory"),
+            "expected the SharedMemory rejection, got: {err}"
+        );
+    }
+
+    /// A helper *taking a shared tile as a parameter* is rejected — the shared
+    /// tile is named in the signature, not the body. `SharedTile` is twin-local
+    /// and cannot cross a helper boundary in v1.1.
+    #[test]
+    fn helper_with_shared_memory_param_is_rejected() {
+        let f: ItemFn =
+            syn::parse_str("fn bad(tile: &mut SharedMemory<f32>, i: usize) { tile[i] = 1.0; }")
+                .expect("valid fn");
+        let err = reject_cooperative_constructs_in_helper(&f.sig, &f.block, "bad_helper")
+            .expect_err("a helper taking a SharedMemory param must be rejected");
+        assert!(
+            err.to_string().contains("SharedMemory"),
+            "expected the SharedMemory rejection, got: {err}"
+        );
+    }
+
+    /// A plain arithmetic helper (no cooperative constructs in signature or body)
+    /// is accepted — the positive control, so the check isn't rejecting all.
+    #[test]
+    fn barrier_free_helper_body_is_accepted() {
+        let f: ItemFn =
+            syn::parse_str("fn ok(a: f32, b: f32, c: f32) -> f32 { (a + b) * c }").expect("valid fn");
+        assert!(reject_cooperative_constructs_in_helper(&f.sig, &f.block, "ok_helper").is_ok());
     }
 
     // -----------------------------------------------------------------

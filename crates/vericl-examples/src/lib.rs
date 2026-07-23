@@ -381,11 +381,20 @@ pub fn fir_pair<F: Float>(a: F, b: F) -> (F, F) {
 /// `uses(...)` rewrite mechanism a kernel gets (no special-casing). Its
 /// twin's identity recursively folds in both `fir_pair`'s and
 /// `single_tap`'s (see `fir_pair_scaled_vericl::identity_hash`).
+///
+/// Uses the natural **tuple-`let` destructuring** of the composed call's return
+/// (`let (sum, diff) = fir_pair::<F>(a, b)`) — the residual noted in
+/// docs/dogfood-2026-07.md (the `.0`/`.1` workaround) is closed: the *untyped*
+/// tuple pattern is desugared by cube's own `Desugar` pass and preserved by the
+/// twin's `uses(...)` rewrite, in a device-fn-calling-device-fn body. (A *typed*
+/// tuple `let (a, b): (F, F) = …` remains a cubecl desugar limitation — its
+/// `Desugar` matches a bare `Pat::Tuple` but not one wrapped in `Pat::Type` — and
+/// is out of vericl's scope, since vericl re-emits the `#[cube]` body untouched.)
 #[vericl::helper(instantiate(F = f32), uses(fir_pair, single_tap))]
 #[cube]
 pub fn fir_pair_scaled<F: Float>(a: F, b: F, gain: F) -> (F, F) {
-    let sum_diff: (F, F) = fir_pair::<F>(a, b);
-    (single_tap::<F>(sum_diff.0, gain), single_tap::<F>(sum_diff.1, gain))
+    let (sum, diff) = fir_pair::<F>(a, b);
+    (single_tap::<F>(sum, gain), single_tap::<F>(diff, gain))
 }
 
 /// Reads a value AND its right neighbor — unlike the helpers above, the
@@ -647,6 +656,174 @@ pub fn block_sum_reduce(input: &Array<f32>, output: &mut Array<f32>) {
     let mut tile = SharedMemory::<f32>::new(256usize);
     if ABSOLUTE_POS < input.len() {
         tile[tid] = input[ABSOLUTE_POS];
+    } else {
+        tile[tid] = 0.0f32;
+    }
+    sync_cube();
+
+    let mut half = CUBE_DIM as usize / 2;
+    while half > 0usize {
+        if tid < half {
+            let a = tile[tid];
+            let b = tile[tid + half];
+            tile[tid] = a + b;
+        }
+        sync_cube();
+        half /= 2usize;
+    }
+
+    if tid == 0usize && CUBE_POS < output.len() {
+        output[CUBE_POS] = tile[0usize];
+    }
+}
+
+/// `comptime_window_reduce` — the cooperative **#[comptime] parameter** example
+/// (docs/design-shared-memory.md §7.4, lifted to v1.1). Each thread sums up to
+/// `taps` (a `#[comptime]` value, pinned to 3 by `instantiate(taps = 3)`)
+/// consecutive input samples starting at `ABSOLUTE_POS`, then feeds the usual
+/// tree reduction. The `#[comptime] taps` drives the **accumulation loop bound**
+/// — the exact deferral concern (a comptime value in a loop bound). It is
+/// **cube-uniform by construction** (the same compile-time constant for every
+/// thread — the easiest uniformity case), so the phase-split twin treats it as
+/// an ordinary uniform value (bound as a `let` const) and the two-thread walk /
+/// uniform-trip-count check see nothing thread-varying. Bounds prove (the `idx <
+/// input.len()` guard bounds each read) and the shape is race-free (each
+/// `tile[tid]` written once before the tree combine). Bit-exact vs wgpu (the
+/// per-thread sum is a plain add loop in the identical order — no fma).
+#[vericl::kernel(
+    assumes(input.iter().all(|v| v.abs() <= 100.0)),
+    compare(max_ulp = 0),
+    gen(input in -100.0..=100.0),
+    instantiate(taps = 3),
+    cooperative(cube_dim = 256)
+)]
+#[cube(launch)]
+pub fn comptime_window_reduce(input: &Array<f32>, output: &mut Array<f32>, #[comptime] taps: u32) {
+    let tid = UNIT_POS as usize;
+    let mut local = 0.0f32;
+    for j in 0..taps {
+        let idx = ABSOLUTE_POS + j as usize;
+        if idx < input.len() {
+            local += input[idx];
+        }
+    }
+
+    let mut tile = SharedMemory::<f32>::new(256usize);
+    tile[tid] = local;
+    sync_cube();
+
+    let mut half = CUBE_DIM as usize / 2;
+    while half > 0usize {
+        if tid < half {
+            let a = tile[tid];
+            let b = tile[tid + half];
+            tile[tid] = a + b;
+        }
+        sync_cube();
+        half /= 2usize;
+    }
+
+    if tid == 0usize && CUBE_POS < output.len() {
+        output[CUBE_POS] = tile[0usize];
+    }
+}
+
+/// A barrier-free device-fn helper used inside a cooperative kernel's phase 0
+/// (`composed_sq_reduce` below) — the cooperative-**composition** example
+/// (docs/design-shared-memory.md §7.4, lifted to v1.1). It contains no
+/// `sync_cube()` and no `SharedMemory` (both rejected in a helper with a
+/// targeted error), so it is a pure barrier-free unit the phase splitter can run
+/// inside a single segment. Cube inlines its IR into the composing kernel's
+/// scope, so the two-thread walk sees the squared value directly.
+#[vericl::helper(instantiate(F = f32))]
+#[cube]
+pub fn square_sample<F: Float>(v: F) -> F {
+    v * v
+}
+
+/// `composed_sq_reduce` — a cooperative reduction whose phase-0 per-thread load
+/// is computed by a `#[vericl::helper]` (`square_sample`), the cooperative
+/// **composition** example. Identical reduction skeleton to `block_sum_reduce`;
+/// the only difference is the tile is loaded with `square_sample(input[pos])`
+/// (a helper call) instead of a bare read. The helper is barrier-free, so the
+/// phase split stays local — the twin runs the (rewritten `_vericl_ref`) call
+/// inside phase 0, and the prover proves bounds + race-freedom over the inlined
+/// IR exactly as for `block_sum_reduce`, with the extra barrier-count check
+/// confirming the helper introduced no `sync_cube()`.
+#[vericl::kernel(
+    assumes(input.iter().all(|v| v.abs() <= 100.0)),
+    compare(max_ulp = 0),
+    gen(input in -100.0..=100.0),
+    cooperative(cube_dim = 256),
+    uses(square_sample)
+)]
+#[cube(launch)]
+pub fn composed_sq_reduce(input: &Array<f32>, output: &mut Array<f32>) {
+    let tid = UNIT_POS as usize;
+    let mut tile = SharedMemory::<f32>::new(256usize);
+    if ABSOLUTE_POS < input.len() {
+        tile[tid] = square_sample::<f32>(input[ABSOLUTE_POS]);
+    } else {
+        tile[tid] = 0.0f32;
+    }
+    sync_cube();
+
+    let mut half = CUBE_DIM as usize / 2;
+    while half > 0usize {
+        if tid < half {
+            let a = tile[tid];
+            let b = tile[tid + half];
+            tile[tid] = a + b;
+        }
+        sync_cube();
+        half /= 2usize;
+    }
+
+    if tid == 0usize && CUBE_POS < output.len() {
+        output[CUBE_POS] = tile[0usize];
+    }
+}
+
+/// `emitter_reduce` — the acceptance example for the cooperative v1.1
+/// extensions, the `emitter_powers_multi_rx` shape (docs/design-shared-memory.md
+/// §3, minus its 2-D dispatch) reduced to 1-D: it exercises **all three v1.1
+/// cooperative extensions at once**, plus shared memory.
+///
+/// - **`#[comptime]` parameter** (`n_emitters`, pinned to 4): the number of
+///   active workgroups, driving the padding guard.
+/// - **workgroup-uniform `terminate!()`**: `if CUBE_POS >= n_emitters {
+///   terminate!() }` at the top level before any barrier — the "skip the whole
+///   cube" padding guard. `CUBE_POS` is cube-uniform, so the whole workgroup
+///   terminates together (barrier-safe). Padding cubes (launched beyond
+///   `n_emitters`) produce no output; the phase-split twin models this as a
+///   cube-level `continue`, and the prover as a `!(CUBE_POS >= n_emitters)` path
+///   condition (uniformity verified by the thread-varying taint machinery).
+/// - **`uses(...)` composition**: phase 0 loads via the barrier-free
+///   `square_sample` helper.
+///
+/// Bit-exact vs wgpu: `square_sample` is a single product (no fma) and the tree
+/// sums in the identical order; padding cubes leave the zero-initialised output
+/// untouched on both lanes. Bounds prove (the store keeps its explicit
+/// `CUBE_POS < output.len()` guard) and the shape is race-free. The only
+/// `emitter_powers` feature left out is 2-D dispatch (per the milestone scope).
+#[vericl::kernel(
+    assumes(input.iter().all(|v| v.abs() <= 100.0)),
+    compare(max_ulp = 0),
+    gen(input in -100.0..=100.0),
+    instantiate(n_emitters = 4),
+    cooperative(cube_dim = 256),
+    uses(square_sample)
+)]
+#[cube(launch)]
+pub fn emitter_reduce(input: &Array<f32>, output: &mut Array<f32>, #[comptime] n_emitters: u32) {
+    if CUBE_POS >= n_emitters as usize {
+        terminate!();
+    }
+
+    let tid = UNIT_POS as usize;
+    let mut tile = SharedMemory::<f32>::new(256usize);
+    if ABSOLUTE_POS < input.len() {
+        tile[tid] = square_sample::<f32>(input[ABSOLUTE_POS]);
     } else {
         tile[tid] = 0.0f32;
     }
@@ -1488,6 +1665,11 @@ mod tests {
     /// does — the latter is only a meaningful check because it's the exact
     /// call chain `uses(fir_pair, single_tap)`'s rewrite is supposed to
     /// produce.
+    ///
+    /// Also pins the tuple-destructuring residual (docs/dogfood-2026-07.md) as
+    /// closed: `fir_pair_scaled`'s body now uses `let (sum, diff) = fir_pair(a,
+    /// b)` (device-fn-calling-device-fn), and this passing test confirms the twin
+    /// derives correctly from that natural form — no `.0`/`.1` workaround.
     #[test]
     fn fir_pair_scaled_twin_composes_its_own_helpers() {
         let (a, b, gain) = (5.0f32, 2.0f32, 10.0f32);
@@ -1819,6 +2001,236 @@ mod tests {
             *slot = tile[0];
         }
         out
+    }
+
+    /// Independently-written windowed (comptime-`taps`) block reduction — the
+    /// cross-check reference for `comptime_window_reduce`'s twin. `taps` is
+    /// baked into the kernel's twin as a `let` const (cube-uniform), so it is a
+    /// plain parameter here.
+    fn handwritten_comptime_window(
+        input: &[f32],
+        cube_count: usize,
+        cube_dim: usize,
+        taps: u32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; cube_count];
+        for (c, slot) in out.iter_mut().enumerate() {
+            let mut tile = vec![0.0f32; cube_dim];
+            for (tid, cell) in tile.iter_mut().enumerate() {
+                let abs = c * cube_dim + tid;
+                let mut local = 0.0f32;
+                for j in 0..taps {
+                    let idx = abs + j as usize;
+                    if idx < input.len() {
+                        local += input[idx];
+                    }
+                }
+                *cell = local;
+            }
+            let mut half = cube_dim / 2;
+            while half > 0 {
+                for tid in 0..half {
+                    tile[tid] += tile[tid + half];
+                }
+                half /= 2;
+            }
+            *slot = tile[0];
+        }
+        out
+    }
+
+    /// The comptime-parameter cooperative twin reproduces the independent
+    /// handwritten windowed reduction bit-for-bit (`taps = 3` pinned by
+    /// `instantiate(...)`). Pins that a `#[comptime]` value threads through the
+    /// phase-split twin as a `let` const with no per-thread divergence.
+    #[test]
+    fn comptime_window_reduce_twin_matches_handwritten() {
+        let cube_dim = 256usize;
+        for &n in &[1usize, 3, 200, 256, 257, 512, 1000, 4096] {
+            let input: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.5 - 1.0).collect();
+            let cube_count = n.div_ceil(cube_dim).max(1);
+            let mut got = vec![0.0f32; cube_count];
+            comptime_window_reduce_vericl::reference(&input, &mut got, cube_count, cube_dim);
+            let want = handwritten_comptime_window(&input, cube_count, cube_dim, 3);
+            for c in 0..cube_count {
+                assert_eq!(
+                    got[c].to_bits(),
+                    want[c].to_bits(),
+                    "n={n} cube {c}: twin={} handwritten={}",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
+    }
+
+    /// The comptime-parameter cooperative kernel proves data-race free AND
+    /// in-bounds: the `#[comptime] taps` accumulation loop bound is cube-uniform
+    /// by construction, and each `input[idx]` read is bounded by its own `idx <
+    /// input.len()` guard. Verifies the deferral's stated fact (a comptime loop
+    /// bound is the easiest uniformity case) rather than assuming it.
+    #[test]
+    fn comptime_window_reduce_definition_is_race_free_and_in_bounds() {
+        let def = comptime_window_reduce_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = comptime_window_reduce_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        match vericl_ir::prove_race_freedom(&def, &buffers, &[], 256) {
+            vericl_ir::ProveResult::Proved { .. } => {}
+            other => panic!("expected race-free Proved, got {other:?}"),
+        }
+    }
+
+    /// Independently-written squared-sum block reduction — the cross-check
+    /// reference for `composed_sq_reduce`'s twin (which calls the `square_sample`
+    /// helper in phase 0). Written by hand from the algorithm, not the tokens.
+    fn handwritten_composed_sq(input: &[f32], cube_count: usize, cube_dim: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; cube_count];
+        for (c, slot) in out.iter_mut().enumerate() {
+            let mut tile = vec![0.0f32; cube_dim];
+            for (tid, cell) in tile.iter_mut().enumerate() {
+                let abs = c * cube_dim + tid;
+                *cell = if abs < input.len() { input[abs] * input[abs] } else { 0.0 };
+            }
+            let mut half = cube_dim / 2;
+            while half > 0 {
+                for tid in 0..half {
+                    tile[tid] += tile[tid + half];
+                }
+                half /= 2;
+            }
+            *slot = tile[0];
+        }
+        out
+    }
+
+    /// The composed cooperative twin (calling the rewritten `square_sample_
+    /// vericl_ref` inside phase 0) reproduces the independent handwritten
+    /// squared-sum reduction bit-for-bit. Pins that helper composition threads
+    /// through the phase-split twin.
+    #[test]
+    fn composed_sq_reduce_twin_matches_handwritten() {
+        let cube_dim = 256usize;
+        for &n in &[1usize, 3, 200, 256, 257, 512, 1000, 4096] {
+            let input: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.5 - 1.0).collect();
+            let cube_count = n.div_ceil(cube_dim).max(1);
+            let mut got = vec![0.0f32; cube_count];
+            composed_sq_reduce_vericl::reference(&input, &mut got, cube_count, cube_dim);
+            let want = handwritten_composed_sq(&input, cube_count, cube_dim);
+            for c in 0..cube_count {
+                assert_eq!(
+                    got[c].to_bits(),
+                    want[c].to_bits(),
+                    "n={n} cube {c}: twin={} handwritten={}",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
+    }
+
+    /// The composed cooperative kernel proves data-race free AND in-bounds: cube
+    /// inlines the barrier-free `square_sample` helper's IR into the kernel's
+    /// scope, so the two-thread walk sees the squared load directly and the
+    /// barrier structure is identical to `block_sum_reduce` (the helper adds no
+    /// `sync_cube()`). Pins the prover lane of cooperative composition.
+    #[test]
+    fn composed_sq_reduce_definition_is_race_free_and_in_bounds() {
+        let def = composed_sq_reduce_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = composed_sq_reduce_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        match vericl_ir::prove_race_freedom(&def, &buffers, &[], 256) {
+            vericl_ir::ProveResult::Proved { .. } => {}
+            other => panic!("expected race-free Proved, got {other:?}"),
+        }
+    }
+
+    /// Independently-written reference for `emitter_reduce` (the acceptance
+    /// example: comptime + composition + terminate + shared). Padding cubes
+    /// (`c >= n_emitters`) are skipped — the workgroup-uniform terminate — and
+    /// leave the zero-initialised output; active cubes reduce a squared block.
+    fn handwritten_emitter_reduce(
+        input: &[f32],
+        cube_count: usize,
+        cube_dim: usize,
+        n_emitters: u32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; cube_count];
+        for (c, slot) in out.iter_mut().enumerate() {
+            if c >= n_emitters as usize {
+                continue; // terminate!() — skip the whole cube
+            }
+            let mut tile = vec![0.0f32; cube_dim];
+            for (tid, cell) in tile.iter_mut().enumerate() {
+                let abs = c * cube_dim + tid;
+                *cell = if abs < input.len() { input[abs] * input[abs] } else { 0.0 };
+            }
+            let mut half = cube_dim / 2;
+            while half > 0 {
+                for tid in 0..half {
+                    tile[tid] += tile[tid + half];
+                }
+                half /= 2;
+            }
+            *slot = tile[0];
+        }
+        out
+    }
+
+    /// The `emitter_reduce` twin (comptime `n_emitters = 4` + `square_sample`
+    /// composition + workgroup-uniform `terminate!()`) reproduces the independent
+    /// handwritten reference bit-for-bit. The sizes include `cube_count > 4`, so
+    /// the terminate actually skips padding cubes (both twin and reference leave
+    /// them zero) — pinning that the twin's cube-level `continue` models the
+    /// "skip the whole cube" semantics.
+    #[test]
+    fn emitter_reduce_twin_matches_handwritten() {
+        let cube_dim = 256usize;
+        // n = 4096 gives cube_count = 16 > n_emitters = 4 (12 cubes skipped).
+        for &n in &[1usize, 3, 256, 512, 1000, 4096] {
+            let input: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.5 - 1.0).collect();
+            let cube_count = n.div_ceil(cube_dim).max(1);
+            let mut got = vec![0.0f32; cube_count];
+            emitter_reduce_vericl::reference(&input, &mut got, cube_count, cube_dim);
+            let want = handwritten_emitter_reduce(&input, cube_count, cube_dim, 4);
+            for c in 0..cube_count {
+                assert_eq!(
+                    got[c].to_bits(),
+                    want[c].to_bits(),
+                    "n={n} cube {c}: twin={} handwritten={}",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
+    }
+
+    /// `emitter_reduce` proves data-race free AND in-bounds. The prover models
+    /// the workgroup-uniform `terminate!()` as a `!(CUBE_POS >= n_emitters)` path
+    /// condition (uniformity verified, before any barrier), the `square_sample`
+    /// helper inlines with no extra barrier (the barrier-count check passes), and
+    /// the store's explicit guard bounds it. Pins the combined v1.1 shape on the
+    /// proof lane.
+    #[test]
+    fn emitter_reduce_definition_is_race_free_and_in_bounds() {
+        let def = emitter_reduce_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = emitter_reduce_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        match vericl_ir::prove_cooperative(
+            &def,
+            &buffers,
+            &[],
+            256,
+            emitter_reduce_vericl::COOP_BARRIER_COUNT,
+        ) {
+            vericl_ir::CooperativeProof::Proved(_) => {}
+            other => panic!("expected Proved (race-free + in-bounds), got {other:?}"),
+        }
     }
 
     /// The macro-derived phase-split twin of `block_sum_reduce` reproduces the
