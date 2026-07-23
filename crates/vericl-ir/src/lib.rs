@@ -14,6 +14,6 @@ mod prover;
 
 pub use hash::kernel_ir_hash;
 pub use prover::{
-    Assume, BufferParam, ProveResult, prove_bounds_freedom, prove_bounds_freedom_cooperative,
-    z3_version,
+    Assume, BufferParam, ProveResult, SMT_RACE_FREEDOM_CHECK, prove_bounds_freedom,
+    prove_bounds_freedom_cooperative, prove_race_freedom, z3_version,
 };

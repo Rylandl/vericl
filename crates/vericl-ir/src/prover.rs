@@ -226,6 +226,78 @@
 //!     depends on unmodeled state (does not resolve), the loop is rejected
 //!     `OutOfSubset` rather than walked with an unconstrained induction symbol
 //!     (which could manufacture a false `Refuted`).
+//! - **Two-thread race walk (M3) + barrier uniformity (M4).** A second entry
+//!   point `prove_race_freedom(def, buffers, assumes, cube_dim)` proves
+//!   data-race freedom via the GPUVerify-style two-thread reduction
+//!   (docs/design-shared-memory.md §5). It reuses this whole walker — branch
+//!   write-taint, loop-carry taint, div/mod modeling, bounds obligations — with
+//!   a `race: Some(RaceState)` layer on top; a bounds walk (`race == None`) is
+//!   byte-for-byte unchanged.
+//!   * **Two arbitrary distinct threads `t1 ≠ t2` of one cube.** The body is
+//!     walked *twice*, once with `UnitPos → t1`, once with `→ t2`, both sharing
+//!     one SMT context and the cube-uniform leaves (`CubePos`/`CubeCount`,
+//!     integer `GlobalScalar`s, buffer `Length`s — declared once, kept across
+//!     the two walks; only the per-thread locals are reset). `t1 ≠ t2` is
+//!     asserted *per race obligation* (in `check_race`), never globally, so it
+//!     cannot make the context vacuously infeasible for a degenerate
+//!     `cube_dim == 1` and thereby fake-discharge the *bounds* obligations (the
+//!     round-1 "infeasible context vacuously proves" trap).
+//!   * **Phase segmentation at `sync_cube()` (§5.3).** Each thread's walk
+//!     records its shared/global accesses (index term + a snapshot of all live
+//!     path facts as its `guard`) into the current phase; a `SyncCube` closes
+//!     the phase. After both walks, for each phase and each array, every
+//!     write-write and read-write cross-thread pair is checked
+//!     `guard1 ∧ guard2 ∧ idx1 = idx2` — SAT ⟹ a race (`Refuted` with a
+//!     two-thread counterexample), UNSAT ⟹ race-free. No cross-*phase*
+//!     obligations: the barrier orders phase-`p` writes before phase-`p+1`
+//!     reads (sound only because the barrier is uniform — M4). The walk also
+//!     discharges the ordinary *bounds* obligation of every access it resolves
+//!     (once, on the `t1` pass), which is how the tree-reduction
+//!     `tile[tid+half] < len` obligation the single-thread bounds walk defers
+//!     finally discharges here. Recorded guards conjoin *all* live facts
+//!     (including the cooperative loop's scoped `1 ≤ half ≤ init` bounds), so a
+//!     deferred obligation is self-contained and a scoped fact never leaks into
+//!     an unrelated phase's query.
+//!   * **Cooperative loop, race walk (§5.5 interpretation).** §5.5 pins the
+//!     per-obligation SMT encodings but does not spell out the loop-phase
+//!     treatment; the conservative reading taken here (documented per the task):
+//!     the recognized `while half > 0 { …; sync_cube(); half /= c }` tree loop's
+//!     single carried control variable `half` is modeled as *one shared*
+//!     symbolic value `H` with `1 ≤ H ≤ init` (`init` = its resolved pre-loop
+//!     value), the loop body is walked *once*, and the internal `SyncCube`
+//!     segments the generic per-iteration phase. This is sound because: `H` is
+//!     shared between the two threads (a uniform trip count means both share the
+//!     same `half` at every level — exactly what makes the reduction race-free);
+//!     `H ≤ init` over-approximates every level because the halving recurrence
+//!     (structurally required — `half /= constant`) is non-increasing; and the
+//!     barrier between iterations means iteration-`i` writes never race
+//!     iteration-`i+1` reads, so one symbolic per-iteration phase covers every
+//!     iteration. A differently-shaped tree loop (a `RangeLoop`, a decrement, a
+//!     manual recurrence) is *not* recognized and yields `OutOfSubset`, never a
+//!     wrong `Proved` (§9 risk 1).
+//!   * **Barrier uniformity (M4, §5.4).** A static thread-varying taint pass
+//!     (`collect_thread_varying`, a fixpoint forward dataflow: `UnitPos`/
+//!     `AbsolutePos` and array-loaded values are varying, an unmodeled op's out
+//!     is conservatively varying, uniform-preserving ops over all-uniform
+//!     operands stay uniform) classifies every barrier-enclosing condition and
+//!     cooperative-loop trip count. A `sync_cube()` under a thread-varying `if`
+//!     (or inside a loop with a thread-varying trip count) is barrier divergence
+//!     — `OutOfSubset` with the §7.3 wording, never a silent `Proved`. Uniform
+//!     conditional barriers (the `if CUBE_POS < n` case) are also rejected —
+//!     deferred to v1.1 (§4.3) — so the only accepted barrier positions are
+//!     top-level and the top level of the uniform halving loop. This is the
+//!     conservative direction: the taint only ever marks a value *uniform* when
+//!     it is provably built from cube-uniform leaves, so a divergent barrier is
+//!     never accepted (the round-2 branch-scoping analog the design flags for
+//!     adversarial probing).
+//!   * **Inter-cube global writes (§5.3).** Two threads in different cubes are
+//!     never barrier-separated, so a global-output write must be disjoint across
+//!     cubes by construction. v1 recognizes exactly the two provable cases
+//!     (`out[ABSOLUTE_POS]`, globally unique; single-writer `out[CUBE_POS]` when
+//!     the write's guard implies `unit_pos == 0`, checked by SMT); any other
+//!     global-write index, or a global-output array that is also *read*
+//!     (inter-cube read-write), is `OutOfSubset` (§7.4), never a silent
+//!     `Proved`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -325,6 +397,44 @@ pub fn prove_bounds_freedom_cooperative(
     prove_bounds_freedom_impl(def, buffers, assumes, Some(cube_dim))
 }
 
+/// The `check` string of the race-freedom `Proved` claim (sibling to
+/// `"smt-oob-freedom"`), per docs/design-shared-memory.md §5.6. Defined here
+/// so the (future, milestone M6) evidence wiring has a single source of truth;
+/// M3 is prover-only and does not itself touch `suite!`/evidence.
+pub const SMT_RACE_FREEDOM_CHECK: &str = "smt-race-freedom";
+
+/// Prove **data-race freedom** for a workgroup-cooperative `def`, via the
+/// two-thread symbolic reduction (docs/design-shared-memory.md §5, milestones
+/// M3+M4). `cube_dim` pins `CUBE_DIM` exactly as `prove_bounds_freedom_
+/// cooperative` does (§7.1 / §9 risk 5).
+///
+/// Two arbitrary distinct symbolic threads `t1 ≠ t2` of one cube are walked
+/// (§5.1): the body is partitioned into phases at every `sync_cube()` (§5.3),
+/// and within each phase every shared/global write is proved not to collide
+/// (same index) with another thread's write (write-write) or read (read-write)
+/// — the negation checked SAT, UNSAT meaning race-free. The walk also
+/// discharges the ordinary bounds obligations of every access it resolves —
+/// including the tree-reduction `tile[tid+half] < len` obligation that the
+/// single-thread bounds walk defers to here (it cannot model the barrier-
+/// carrying loop). Barrier uniformity (§5.4, M4) is enforced by thread-varying
+/// dataflow taint: a `sync_cube()` under a thread-varying condition, or inside
+/// a loop with a thread-varying trip count, is `OutOfSubset` (§7.3), never a
+/// silent `Proved`.
+///
+/// `Proved { obligations }` counts every discharged SMT query (bounds +
+/// write-write + read-write + inter-cube single-writer). A `Refuted` carries a
+/// two-thread counterexample (values of `t1`/`t2` that collide). Anything
+/// outside the recognized reduction subset is `OutOfSubset` with a targeted
+/// reason rather than an unsound verdict.
+pub fn prove_race_freedom(
+    def: &KernelDefinition,
+    buffers: &[BufferParam],
+    assumes: &[Assume],
+    cube_dim: u32,
+) -> ProveResult {
+    prove_race_freedom_impl(def, buffers, assumes, cube_dim)
+}
+
 fn prove_bounds_freedom_impl(
     def: &KernelDefinition,
     buffers: &[BufferParam],
@@ -351,6 +461,7 @@ fn prove_bounds_freedom_impl(
         carried_stack: Vec::new(),
         write_log_stack: Vec::new(),
         coop,
+        race: None,
     };
 
     if let Err(e) = prover.assert_structured_assumes(assumes) {
@@ -368,6 +479,82 @@ fn prove_bounds_freedom_impl(
             obligations: prover.obligations,
         },
         Err(stop) => stop.into_result(),
+    }
+}
+
+fn prove_race_freedom_impl(
+    def: &KernelDefinition,
+    buffers: &[BufferParam],
+    assumes: &[Assume],
+    cube_dim: u32,
+) -> ProveResult {
+    let mut smt = match ContextBuilder::new().solver("z3").solver_args(["-smt2", "-in"]).build() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            return ProveResult::SolverError { detail: format!("failed to start z3: {e}") };
+        }
+    };
+
+    // Static thread-varying taint (§5.4): a pure pass over the IR, used to
+    // classify barrier-enclosing conditions and cooperative-loop trip counts.
+    let varying = collect_thread_varying(&def.body);
+
+    // A valid-but-never-read placeholder for the two thread-id slots before
+    // `race_setup` declares them (SExpr has no `Default` and private fields).
+    let placeholder = smt.true_();
+
+    let mut prover = Prover {
+        smt: &mut smt,
+        buffers,
+        memo: HashMap::new(),
+        buffer_len: HashMap::new(),
+        declared: Vec::new(),
+        fresh: 0,
+        obligations: 0,
+        carried_stack: Vec::new(),
+        write_log_stack: Vec::new(),
+        // Race mode is a cooperative walk: the leaf modeling (`UnitPos` etc.)
+        // and shared-array bounds are all needed.
+        coop: Some(cube_dim),
+        race: Some(RaceState {
+            cube_dim,
+            thread: Thread::T1,
+            // placeholders, overwritten by `race_setup`
+            t1: placeholder,
+            t2: placeholder,
+            fact_stack: Vec::new(),
+            guard_stack: Vec::new(),
+            current_phase: Vec::new(),
+            phases_t1: Vec::new(),
+            phases_t2: Vec::new(),
+            uniform_loop: HashMap::new(),
+            varying,
+            ww: 0,
+            rw: 0,
+            global_checks: 0,
+            uniformity_checks: 0,
+        }),
+    };
+
+    if let Err(e) = prover.assert_structured_assumes(assumes) {
+        return e.into_result();
+    }
+    if let Err(e) = prover.race_setup() {
+        return e.into_result();
+    }
+    if let Err(e) = prover.race_walk(&def.body, Thread::T1) {
+        return e.into_result();
+    }
+    prover.race_reset_for_t2();
+    if let Err(e) = prover.race_walk(&def.body, Thread::T2) {
+        return e.into_result();
+    }
+    if let Err(e) = prover.emit_race_obligations() {
+        return e.into_result();
+    }
+    let r = prover.race.as_ref().expect("race mode");
+    ProveResult::Proved {
+        obligations: prover.obligations + r.ww + r.rw + r.global_checks,
     }
 }
 
@@ -438,6 +625,108 @@ struct Prover<'a, 'b> {
     /// mode"); when `None`, `UnitPos`/`CubePos`/`CubeDim`/`CubeCount` stay
     /// tainted exactly as before this milestone.
     coop: Option<u32>,
+    /// `Some(..)` only for the two-thread race walk (`prove_race_freedom`,
+    /// milestones M3+M4); `None` for every bounds walk. When set, `UnitPos`
+    /// resolves to whichever of the two thread symbols is currently active,
+    /// shared/global accesses are recorded per phase for cross-thread
+    /// obligation emission, and `sync_cube()` is a phase boundary rather than
+    /// the no-op it is for a bounds walk. All race logic is gated on this being
+    /// `Some`, so the bounds walk stays byte-for-byte unchanged.
+    race: Option<RaceState>,
+}
+
+/// Which of the two symbolic threads a race walk is currently resolving
+/// `UnitPos` to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Thread {
+    T1,
+    T2,
+}
+
+/// The array a race obligation reasons about. A `SharedMemory` tile and a
+/// global buffer never alias, and two shared tiles are distinct iff their ids
+/// differ (§2.2), so `(variant, id)` is a sound identity for "same array".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RaceArray {
+    Shared(Id),
+    Global(Id),
+}
+
+/// One shared/global memory access recorded during a thread's phase walk.
+/// `index`/`guard` are already thread-instantiated (built with the active
+/// thread's `UnitPos` symbol); the cross-thread obligation combines a
+/// thread-1 access with a thread-2 access (§5.3).
+#[derive(Clone)]
+struct Access {
+    array: RaceArray,
+    is_write: bool,
+    /// The symbolic index term at this access.
+    index: SExpr,
+    /// Conjunction of every fact live at the access site (branch conditions,
+    /// loop guards, and cooperative-loop `1 ≤ half ≤ init` bounds) — recorded
+    /// so the deferred cross-thread obligation is self-contained and does not
+    /// depend on any SMT scope still being open, and so a scoped fact (e.g. the
+    /// tree loop's `half` bounds) never leaks into an unrelated phase's
+    /// obligation (the round-1 "infeasible context vacuously proves" trap).
+    guard: SExpr,
+    /// Display name (`shared_array(id)` / a buffer name) for descriptions.
+    name: String,
+    /// The IR index variable's kind, used by the inter-cube global-write gate
+    /// to recognize the two provable-by-construction disjoint patterns (§5.3).
+    index_kind: VariableKind,
+}
+
+/// One enclosing branch/loop guard, tracked while it is open so a `sync_cube()`
+/// reached under it can be classified for barrier uniformity (§5.4, M4).
+#[derive(Clone, Copy)]
+struct GuardEntry {
+    /// Whether the guard condition is thread-varying (depends on
+    /// `UnitPos`/`AbsolutePos` or array contents). A varying guard enclosing a
+    /// barrier is barrier divergence.
+    varying: bool,
+    /// `true` for a loop guard (trip-count divergence wording), `false` for an
+    /// `if`/`else` guard (condition-divergence wording).
+    is_loop: bool,
+}
+
+/// Per-thread + phase bookkeeping for the two-thread race walk.
+struct RaceState {
+    cube_dim: u32,
+    thread: Thread,
+    /// The two distinct symbolic thread ids (`0 ≤ t < cube_dim`, `t1 ≠ t2`).
+    t1: SExpr,
+    t2: SExpr,
+    /// Facts live at the current point, conjoined into each recorded access's
+    /// `guard`. Mirrors — but is never popped by z3's `pop`, so it survives
+    /// into the deferred obligation phase — the path conditions asserted on the
+    /// SMT stack.
+    fact_stack: Vec<SExpr>,
+    /// Enclosing guards, for the barrier-uniformity check at each `sync_cube`.
+    guard_stack: Vec<GuardEntry>,
+    /// Accesses recorded in the currently-open phase for the active thread.
+    current_phase: Vec<Access>,
+    /// Completed phases, index-aligned between the two threads (both walks
+    /// traverse identical control flow, so phase `i` denotes the same barrier
+    /// interval for both).
+    phases_t1: Vec<Vec<Access>>,
+    phases_t2: Vec<Vec<Access>>,
+    /// The shared symbolic `half` per cooperative-loop control variable —
+    /// created in the thread-1 walk and reused in the thread-2 walk, because a
+    /// uniform trip count means both threads share the *same* `half` at each
+    /// tree level (that shared value is exactly what makes the reduction
+    /// race-free).
+    uniform_loop: HashMap<VariableKind, SExpr>,
+    /// Thread-varying variable kinds (a static pre-pass over the IR), consulted
+    /// for barrier uniformity.
+    varying: HashSet<VariableKind>,
+    /// Discharged write-write / read-write / inter-cube-single-writer counts
+    /// (bounds obligations are counted by the shared `Prover::obligations`).
+    ww: usize,
+    rw: usize,
+    global_checks: usize,
+    /// Barriers verified uniform (counted once per barrier, on the thread-1
+    /// walk), for the report.
+    uniformity_checks: usize,
 }
 
 impl<'a, 'b> Prover<'a, 'b> {
@@ -613,12 +902,20 @@ impl<'a, 'b> Prover<'a, 'b> {
             Operation::Operator(op) => self.process_operator(inst, op)?,
             Operation::Metadata(m) => self.process_metadata(inst, m)?,
             Operation::Branch(b) => self.process_branch(b)?,
-            // Everything else (Bitwise, Atomic, Plane, CoopMma, Synchronization,
-            // Barrier, Tma, NonSemantic, Marker, ...) is outside the modeled
-            // subset. It is not fatal on its own: leave its `out` (if any)
-            // unbound so any later obligation that actually depends on it
-            // fails explicitly at that use site instead of here, where it
-            // may be entirely irrelevant to array bounds (see module docs).
+            // A barrier is a phase boundary in the race walk (§5.3); in a
+            // bounds walk it is a no-op (it has no `out`, so this matches the
+            // pre-existing `_ => taint_out` behavior exactly).
+            Operation::Synchronization(s) => {
+                if self.race.is_some() {
+                    self.process_sync(s)?;
+                }
+            }
+            // Everything else (Bitwise, Atomic, Plane, CoopMma, Barrier, Tma,
+            // NonSemantic, Marker, ...) is outside the modeled subset. It is
+            // not fatal on its own: leave its `out` (if any) unbound so any
+            // later obligation that actually depends on it fails explicitly at
+            // that use site instead of here, where it may be entirely
+            // irrelevant to array bounds (see module docs).
             _ => self.taint_out(inst),
         }
         Ok(())
@@ -909,7 +1206,7 @@ impl<'a, 'b> Prover<'a, 'b> {
                 "read index for `{name}[...]` depends on a construct outside the vericl v0 subset"
             ))
         })?;
-        self.emit_obligation(len, &name, idx, "read")?;
+        self.access(&aref, false, idx, &name, io.index.kind, len)?;
         // The value *read* from the array is unknown (this checker has no
         // model of array contents) — taint, don't bind.
         self.taint_out(inst);
@@ -931,7 +1228,7 @@ impl<'a, 'b> Prover<'a, 'b> {
                  subset"
             ))
         })?;
-        self.emit_obligation(len, &name, idx, "write")?;
+        self.access(&aref, true, idx, &name, io.index.kind, len)?;
         self.taint_out(inst);
         Ok(())
     }
@@ -949,6 +1246,568 @@ impl<'a, 'b> Prover<'a, 'b> {
         let in_bounds = self.smt.and(ge0, lt_len);
         let description = format!("0 <= index < {name}.len() ({kind} access to `{name}`)");
         self.check_obligation(description, in_bounds)
+    }
+
+    // -- two-thread race walk (shared-memory milestones M3 + M4) ---------
+    //
+    // See the module docs' "Two-thread race walk" bullet. Everything here is
+    // gated on `self.race.is_some()`; a bounds walk never enters it.
+
+    /// One shared/global access. In a bounds walk this is exactly the old
+    /// `emit_obligation`; in a race walk it discharges the bounds obligation
+    /// once (on the thread-1 pass — the thread-2 index is symmetric) and
+    /// records the access into the current phase for the cross-thread
+    /// obligations emitted after both walks (§5.3).
+    fn access(
+        &mut self,
+        aref: &ArrayRef,
+        is_write: bool,
+        idx: SExpr,
+        name: &str,
+        index_kind: VariableKind,
+        len: SExpr,
+    ) -> Result<(), Stop> {
+        let kind_str = if is_write { "write" } else { "read" };
+        match self.race.as_ref().map(|r| r.thread) {
+            None => self.emit_obligation(len, name, idx, kind_str),
+            Some(thread) => {
+                if thread == Thread::T1 {
+                    self.emit_obligation(len, name, idx, kind_str)?;
+                }
+                let array = match *aref {
+                    ArrayRef::Shared { id, .. } => RaceArray::Shared(id),
+                    ArrayRef::Global { id } => RaceArray::Global(id),
+                };
+                let facts = self.race.as_ref().expect("race mode").fact_stack.clone();
+                let guard = self.and_fold(&facts);
+                let access = Access {
+                    array,
+                    is_write,
+                    index: idx,
+                    guard,
+                    name: name.to_string(),
+                    index_kind,
+                };
+                self.race.as_mut().expect("race mode").current_phase.push(access);
+                Ok(())
+            }
+        }
+    }
+
+    /// Conjunction of `facts` (`true` when empty). Used to snapshot the live
+    /// path condition into each recorded access's `guard`.
+    fn and_fold(&mut self, facts: &[SExpr]) -> SExpr {
+        match facts.split_first() {
+            None => self.smt.true_(),
+            Some((first, rest)) => {
+                let mut acc = *first;
+                for f in rest {
+                    acc = self.smt.and(acc, *f);
+                }
+                acc
+            }
+        }
+    }
+
+    /// Declare the two distinct thread ids and the shared cube-uniform leaves.
+    /// `t1`/`t2` are `[0, cube_dim)` and asserted distinct (§5.1–5.2); the
+    /// cube-uniform leaves (`CubePos`, `CubeCount`) are declared once and shared
+    /// by both threads.
+    fn race_setup(&mut self) -> Result<(), Stop> {
+        let cube_dim = self.race.as_ref().expect("race mode").cube_dim;
+        let bound = self.smt.numeral(cube_dim as u64);
+        let t1 = self.declare_int("t", true)?;
+        let lt1 = self.smt.lt(t1, bound);
+        self.smt.assert(lt1).map_err(smt_err)?;
+        let t2 = self.declare_int("t", true)?;
+        let lt2 = self.smt.lt(t2, bound);
+        self.smt.assert(lt2).map_err(smt_err)?;
+        // NB: `t1 != t2` is deliberately NOT asserted globally — it is part of
+        // each *race* obligation (asserted per-query in `check_race`), not a
+        // fact the *bounds* obligations may lean on. Asserting it globally would
+        // make the whole context infeasible for a degenerate `cube_dim == 1`
+        // (no two distinct threads exist), which would vacuously discharge every
+        // bounds obligation — the round-1 "infeasible context vacuously proves"
+        // trap. Kept local, the bounds obligations stay a genuine per-thread
+        // proof at any `cube_dim`.
+        // Shared cube-uniform leaves (predeclared so their range facts are in
+        // force for the whole walk — same reasoning as `predeclare_coop_leaves`,
+        // but NOT `unit_pos_sym`, which would clash with the per-thread `t`).
+        self.cube_pos_sym()?;
+        self.cube_count_sym()?;
+        // Predeclare every buffer length at the outermost scope. A length can
+        // appear in a recorded access guard (e.g. `CUBE_POS < output.len()`)
+        // that a *deferred* cross-thread obligation re-asserts long after the
+        // branch it was first resolved under has been popped — and SMT-LIB
+        // `pop` discards declarations, so a lazily-declared length would be an
+        // "unknown constant" there. Declaring them all up front (like the coop
+        // leaves) keeps every recorded guard/index self-contained. An unused
+        // length is a harmless free nonnegative symbol.
+        for id in 0..self.buffers.len() {
+            self.length_of(id as Id)?;
+        }
+        let r = self.race.as_mut().expect("race mode");
+        r.t1 = t1;
+        r.t2 = t2;
+        Ok(())
+    }
+
+    /// Walk `body` once for `thread`, binding `UnitPos` to that thread's id and
+    /// closing the final (post-last-barrier) phase.
+    fn race_walk(&mut self, body: &Scope, thread: Thread) -> Result<(), Stop> {
+        let t = {
+            let r = self.race.as_mut().expect("race mode");
+            r.thread = thread;
+            match thread {
+                Thread::T1 => r.t1,
+                Thread::T2 => r.t2,
+            }
+        };
+        // `UnitPos` -> this thread; force `AbsolutePos` to recompute as
+        // `CubePos*cube_dim + UnitPos` with the new `UnitPos`.
+        self.memo.insert(VariableKind::Builtin(Builtin::UnitPos), Some(t));
+        self.memo.remove(&VariableKind::Builtin(Builtin::AbsolutePos));
+        self.process_scope(body)?;
+        let phase = std::mem::take(&mut self.race.as_mut().expect("race mode").current_phase);
+        let r = self.race.as_mut().expect("race mode");
+        match thread {
+            Thread::T1 => r.phases_t1.push(phase),
+            Thread::T2 => r.phases_t2.push(phase),
+        }
+        Ok(())
+    }
+
+    /// Reset the per-thread value state between the two walks, keeping the
+    /// cube-uniform leaves (`CubePos`/`CubeCount`/integer `GlobalScalar`s) and
+    /// buffer lengths (all thread-invariant), plus the `uniform_loop`/thread-id
+    /// state on `RaceState`. Per-thread locals (`UnitPos`, `AbsolutePos`, every
+    /// `LocalConst`/`LocalMut`) are dropped so the thread-2 walk recomputes them
+    /// against `t2`.
+    fn race_reset_for_t2(&mut self) {
+        self.memo.retain(|k, _| {
+            matches!(
+                k,
+                VariableKind::Builtin(Builtin::CubePos)
+                    | VariableKind::Builtin(Builtin::CubeCount)
+                    | VariableKind::GlobalScalar(_)
+            )
+        });
+        // These stacks are balanced (empty) after a successful walk; assert-ish
+        // clear for defensiveness.
+        self.carried_stack.clear();
+        self.write_log_stack.clear();
+        let r = self.race.as_mut().expect("race mode");
+        r.fact_stack.clear();
+        r.guard_stack.clear();
+        r.current_phase.clear();
+    }
+
+    /// A `sync_cube()` in the race walk: verify barrier uniformity (§5.4) and
+    /// close the current phase for the active thread.
+    fn process_sync(&mut self, s: &Synchronization) -> Result<(), Stop> {
+        match s {
+            Synchronization::SyncCube => {
+                self.check_barrier_uniformity()?;
+                let r = self.race.as_mut().expect("race mode");
+                let phase = std::mem::take(&mut r.current_phase);
+                match r.thread {
+                    Thread::T1 => r.phases_t1.push(phase),
+                    Thread::T2 => r.phases_t2.push(phase),
+                }
+                Ok(())
+            }
+            // SyncPlane/SyncStorage/SyncAsyncProxyShared are out of the v1
+            // subset (§2.3) — rejected, never silently treated as a barrier.
+            other => Err(Stop::OutOfSubset(format!(
+                "`{other}` is outside the vericl v0 subset (only `sync_cube()` is modeled)"
+            ))),
+        }
+    }
+
+    /// Barrier-uniformity gate (§5.4, M4): every guard enclosing a `sync_cube()`
+    /// must be thread-invariant, and the barrier must not sit under an `if`
+    /// (even a uniform one — deferred to v1.1, §4.3). A thread-varying enclosing
+    /// guard is barrier divergence (§7.3): rejected, never a silent `Proved`.
+    fn check_barrier_uniformity(&mut self) -> Result<(), Stop> {
+        let r = self.race.as_ref().expect("race mode");
+        for g in &r.guard_stack {
+            if g.is_loop {
+                if g.varying {
+                    return Err(Stop::OutOfSubset(
+                        "sync_cube() inside a loop with a thread-varying trip count (barrier \
+                         divergence) is outside the vericl v0 subset"
+                            .into(),
+                    ));
+                }
+            } else if g.varying {
+                return Err(Stop::OutOfSubset(
+                    "sync_cube() under a non-uniform condition (barrier divergence) is outside the \
+                     vericl v0 subset"
+                        .into(),
+                ));
+            } else {
+                return Err(Stop::OutOfSubset(
+                    "sync_cube() inside a conditional (cube-uniform conditional barriers are \
+                     deferred to vericl v1.1) is outside the vericl v0 subset"
+                        .into(),
+                ));
+            }
+        }
+        // Count each barrier once (thread-1 walk) for the report.
+        if r.thread == Thread::T1 {
+            self.race.as_mut().expect("race mode").uniformity_checks += 1;
+        }
+        Ok(())
+    }
+
+    /// Push an enclosing guard onto the race stacks: `cond` becomes a live fact
+    /// (conjoined into recorded access guards) and a `GuardEntry` (for the
+    /// barrier-uniformity check). No-op in a bounds walk.
+    fn race_push_guard(&mut self, cond_var: &Variable, cond: SExpr, is_loop: bool) {
+        if let Some(r) = self.race.as_mut() {
+            let varying = var_is_thread_varying(cond_var, &r.varying);
+            r.fact_stack.push(cond);
+            r.guard_stack.push(GuardEntry { varying, is_loop });
+        }
+    }
+
+    fn race_pop_guard(&mut self) {
+        if let Some(r) = self.race.as_mut() {
+            r.fact_stack.pop();
+            r.guard_stack.pop();
+        }
+    }
+
+    /// The cooperative tree-reduction loop (a `Branch::Loop` carrying a
+    /// `sync_cube`), modeled for the race walk (§5.5 interpretation — see the
+    /// module docs' "Cooperative loop, race walk"). Recognizes the canonical
+    /// `while half > 0 { …; sync_cube(); half /= c }` shape, requires a
+    /// cube-uniform trip count (M4), models `half` as one shared symbol
+    /// `1 ≤ H ≤ init` (`init` = its resolved pre-loop value, sound because the
+    /// halving recurrence is non-increasing), and walks the body once so the
+    /// internal barrier segments the per-iteration phase.
+    fn process_cooperative_loop(&mut self, l: &Loop) -> Result<(), Stop> {
+        let bg = recognize_break_guard(&l.scope).ok_or_else(|| {
+            Stop::OutOfSubset(
+                "cooperative loop is not the recognized `while <uniform> { …; sync_cube(); … }` \
+                 tree shape (no leading break-guard) — outside the vericl v1 subset"
+                    .into(),
+            )
+        })?;
+        // Control variable: the operand of a downward-counter guard `half > 0`.
+        let Operation::Comparison(cmp) = &l.scope.instructions[bg.guard_idx].operation else {
+            return Err(Stop::OutOfSubset(
+                "cooperative loop guard is not a comparison — outside the vericl v1 subset".into(),
+            ));
+        };
+        let ctrl = downcounter_ctrl(cmp).ok_or_else(|| {
+            Stop::OutOfSubset(
+                "cooperative loop guard is not the recognized `half > 0` downward-counter shape \
+                 (a thread-uniform tree level) — outside the vericl v1 subset"
+                    .into(),
+            )
+        })?;
+        // Trip-count uniformity (M4): the control variable must be
+        // cube-uniform, else the barrier inside diverges (§7.3).
+        if var_is_thread_varying(&ctrl, &self.race.as_ref().expect("race mode").varying) {
+            return Err(Stop::OutOfSubset(
+                "sync_cube() inside a loop with a thread-varying trip count (barrier divergence) \
+                 is outside the vericl v0 subset"
+                    .into(),
+            ));
+        }
+        // Recurrence must be a uniform halving (`half /= constant`, constant
+        // >= 1) so the fresh symbol's `H <= init` upper bound is a sound
+        // non-increasing over-approximation. A differently-shaped tree loop
+        // (a decrement, a manual recurrence, a RangeLoop) is *not* recognized
+        // and yields `OutOfSubset`, never a wrong `Proved` (§9 risk 1).
+        verify_halving_update(&l.scope, ctrl.kind)?;
+        // Pre-loop value of the control variable (the `init` upper bound).
+        let init = self.value_of(&ctrl).ok_or_else(|| {
+            Stop::OutOfSubset(
+                "cooperative loop control variable's initial value depends on a construct outside \
+                 the vericl v0 subset"
+                    .into(),
+            )
+        })?;
+        // Shared symbolic `half`: created on the thread-1 walk, reused on the
+        // thread-2 walk (uniform trip count => both threads share this value).
+        let h = match self.race.as_ref().expect("race mode").uniform_loop.get(&ctrl.kind) {
+            Some(h) => *h,
+            None => {
+                let h = self.declare_int("half", true)?;
+                self.race.as_mut().expect("race mode").uniform_loop.insert(ctrl.kind, h);
+                h
+            }
+        };
+
+        // Carried variables: taint every accumulator, bind the control var to
+        // the shared `H` (mirrors `process_noncoop_loop`).
+        let outer: HashSet<VariableKind> = self.memo.keys().copied().collect();
+        let carried = scope_reassigned_vars(&l.scope, &outer);
+        for &k in &carried {
+            if k == ctrl.kind {
+                self.set_var(k, Some(h));
+            } else {
+                self.set_var(k, None);
+            }
+        }
+        self.carried_stack.push(carried.clone());
+
+        let r = self.process_cooperative_loop_body(l, &bg, h, init);
+
+        self.carried_stack.pop();
+        for &k in &carried {
+            self.set_var(k, None);
+        }
+        r
+    }
+
+    /// Body-walk portion of `process_cooperative_loop`, factored so the caller
+    /// unconditionally pops `carried_stack`. Asserts `1 <= H <= init` in a
+    /// *scoped* push (never global — a scoped-only fact keeps the round-1
+    /// "infeasible context vacuously proves" trap out of unrelated phases) and
+    /// on the `fact_stack` (so the deferred race obligations carry it), pushes
+    /// the uniform loop guard, then walks the body past the break-guard.
+    fn process_cooperative_loop_body(
+        &mut self,
+        l: &Loop,
+        bg: &BreakGuard,
+        h: SExpr,
+        init: SExpr,
+    ) -> Result<(), Stop> {
+        self.smt.push().map_err(smt_err)?;
+        let one = self.smt.numeral(1);
+        let ge1 = self.smt.gte(h, one);
+        self.smt.assert(ge1).map_err(smt_err)?;
+        let le_init = self.smt.lte(h, init);
+        self.smt.assert(le_init).map_err(smt_err)?;
+        {
+            let r = self.race.as_mut().expect("race mode");
+            r.fact_stack.push(ge1);
+            r.fact_stack.push(le_init);
+            // The loop guard (`half > 0`) is uniform (checked above).
+            r.guard_stack.push(GuardEntry { varying: false, is_loop: true });
+        }
+
+        let mut result = Ok(());
+        for inst in &l.scope.instructions[bg.body_start..] {
+            if let Err(e) = self.process_instruction(inst) {
+                result = Err(e);
+                break;
+            }
+        }
+
+        {
+            let r = self.race.as_mut().expect("race mode");
+            r.guard_stack.pop();
+            r.fact_stack.pop();
+            r.fact_stack.pop();
+        }
+        self.smt.pop().map_err(smt_err)?;
+        result
+    }
+
+    /// After both thread walks, emit the cross-thread obligations (§5.3): within
+    /// each barrier interval, no write collides with another thread's write
+    /// (write-write) or read (read-write) on the same array; plus the inter-cube
+    /// single-writer gate for global-output writes (§5.3, the two
+    /// provable-by-construction cases). Reads never race with reads.
+    fn emit_race_obligations(&mut self) -> Result<(), Stop> {
+        let (phases_t1, phases_t2) = {
+            let r = self.race.as_mut().expect("race mode");
+            (std::mem::take(&mut r.phases_t1), std::mem::take(&mut r.phases_t2))
+        };
+        if phases_t1.len() != phases_t2.len() {
+            return Err(Stop::SolverError(format!(
+                "race walk produced mismatched phase counts ({} vs {}) — non-deterministic control \
+                 flow between the two thread walks",
+                phases_t1.len(),
+                phases_t2.len()
+            )));
+        }
+
+        for (p, (a1, a2)) in phases_t1.iter().zip(phases_t2.iter()).enumerate() {
+            // Distinct arrays touched in this phase (both threads see the same
+            // set, since they walk identical control flow).
+            let mut arrays: Vec<RaceArray> = Vec::new();
+            for acc in a1.iter().chain(a2.iter()) {
+                if !arrays.contains(&acc.array) {
+                    arrays.push(acc.array);
+                }
+            }
+            for array in arrays {
+                let w1: Vec<&Access> =
+                    a1.iter().filter(|x| x.array == array && x.is_write).collect();
+                let r1: Vec<&Access> =
+                    a1.iter().filter(|x| x.array == array && !x.is_write).collect();
+                let w2: Vec<&Access> =
+                    a2.iter().filter(|x| x.array == array && x.is_write).collect();
+                let r2: Vec<&Access> =
+                    a2.iter().filter(|x| x.array == array && !x.is_write).collect();
+                // write-write
+                for x in &w1 {
+                    for y in &w2 {
+                        self.check_race(x, y, "write-write", p)?;
+                        self.race.as_mut().expect("race mode").ww += 1;
+                    }
+                }
+                // read-write (t1 writes vs t2 reads, and t2 writes vs t1 reads)
+                for x in &w1 {
+                    for y in &r2 {
+                        self.check_race(x, y, "read-write", p)?;
+                        self.race.as_mut().expect("race mode").rw += 1;
+                    }
+                }
+                for x in &w2 {
+                    for y in &r1 {
+                        self.check_race(x, y, "read-write", p)?;
+                        self.race.as_mut().expect("race mode").rw += 1;
+                    }
+                }
+            }
+        }
+
+        // Inter-cube global-output disjointness (§5.3): every global-output
+        // write across the whole kernel must be one of the two
+        // provable-by-construction disjoint patterns.
+        self.check_intercube_global(&phases_t1)?;
+        Ok(())
+    }
+
+    /// A single cross-thread conflict query: `guard1 ∧ guard2 ∧ index1 = index2`
+    /// (with `t1 ≠ t2` and the thread ranges already global). UNSAT ⟹ the pair
+    /// cannot collide (race-free); SAT ⟹ a real two-thread race, `Refuted` with
+    /// the offending model.
+    fn check_race(
+        &mut self,
+        a: &Access,
+        b: &Access,
+        kind: &str,
+        phase: usize,
+    ) -> Result<(), Stop> {
+        self.smt.push().map_err(smt_err)?;
+        // The two threads are distinct — asserted here, per race obligation,
+        // rather than globally (see `race_setup`).
+        let (t1, t2) = {
+            let r = self.race.as_ref().expect("race mode");
+            (r.t1, r.t2)
+        };
+        let eq_threads = self.smt.eq(t1, t2);
+        let distinct = self.smt.not(eq_threads);
+        self.smt.assert(distinct).map_err(smt_err)?;
+        self.smt.assert(a.guard).map_err(smt_err)?;
+        self.smt.assert(b.guard).map_err(smt_err)?;
+        let same = self.smt.eq(a.index, b.index);
+        self.smt.assert(same).map_err(smt_err)?;
+        let response = self.smt.check();
+        let outcome = match response {
+            Ok(Response::Unsat) => Ok(()),
+            Ok(Response::Sat) => {
+                let counterexample = self.render_counterexample();
+                Err(Stop::Refuted {
+                    obligation: format!(
+                        "no {kind} race on `{}` between two threads (phase {phase})",
+                        a.name
+                    ),
+                    counterexample,
+                })
+            }
+            Ok(Response::Unknown) => Err(Stop::SolverError(format!(
+                "z3 returned `unknown` for a {kind} race obligation on `{}`",
+                a.name
+            ))),
+            Err(e) => Err(smt_err(e)),
+        };
+        self.smt.pop().map_err(smt_err)?;
+        outcome
+    }
+
+    /// The inter-cube global-output gate (§5.3). Two threads in *different*
+    /// cubes are never separated by a barrier, so a global-output write must be
+    /// disjoint across cubes by construction. v1 recognizes exactly the two
+    /// provable cases: an `out[ABSOLUTE_POS]` write (globally unique id) and a
+    /// single-writer `out[CUBE_POS]` write guarded by `tid == 0` (distinct
+    /// cubes ⟹ distinct `CUBE_POS`). Anything else — and any global-output
+    /// array that is *also read* (inter-cube read-write, unproved in v1) — is
+    /// `OutOfSubset` (§7.4), never a silent `Proved`.
+    fn check_intercube_global(&mut self, phases: &[Vec<Access>]) -> Result<(), Stop> {
+        let t1 = self.race.as_ref().expect("race mode").t1;
+        let mut read_globals: HashSet<Id> = HashSet::new();
+        let mut written_globals: HashSet<Id> = HashSet::new();
+        for phase in phases {
+            for acc in phase {
+                if let RaceArray::Global(id) = acc.array {
+                    if acc.is_write {
+                        written_globals.insert(id);
+                    } else {
+                        read_globals.insert(id);
+                    }
+                }
+            }
+        }
+        for phase in phases {
+            for acc in phase {
+                let RaceArray::Global(id) = acc.array else { continue };
+                if !acc.is_write {
+                    continue;
+                }
+                if read_globals.contains(&id) {
+                    return Err(Stop::OutOfSubset(format!(
+                        "global array `{}` is both read and written — inter-cube read-write \
+                         disjointness is deferred to vericl v1.1 (outside the v0 subset)",
+                        acc.name
+                    )));
+                }
+                match acc.index_kind {
+                    // out[ABSOLUTE_POS]: globally unique across all threads.
+                    VariableKind::Builtin(Builtin::AbsolutePos) => {}
+                    // out[CUBE_POS]: single-writer iff guarded by `tid == 0`
+                    // (distinct cubes => distinct CUBE_POS).
+                    VariableKind::Builtin(Builtin::CubePos) => {
+                        // guard ∧ t1 != 0 must be UNSAT (guard implies tid == 0).
+                        let zero = self.smt.numeral(0);
+                        let t1_ne_0 = {
+                            let eq = self.smt.eq(t1, zero);
+                            self.smt.not(eq)
+                        };
+                        let implies_tid0 = self.smt.and(acc.guard, t1_ne_0);
+                        self.smt.push().map_err(smt_err)?;
+                        self.smt.assert(implies_tid0).map_err(smt_err)?;
+                        let response = self.smt.check();
+                        self.smt.pop().map_err(smt_err)?;
+                        match response {
+                            Ok(Response::Unsat) => {
+                                self.race.as_mut().expect("race mode").global_checks += 1;
+                            }
+                            Ok(Response::Sat) => {
+                                return Err(Stop::OutOfSubset(format!(
+                                    "global write `{}[CUBE_POS]` is not provably a single-writer \
+                                     (not guarded by `unit_pos == 0`) — inter-cube disjointness \
+                                     unproved (outside the vericl v0 subset)",
+                                    acc.name
+                                )));
+                            }
+                            Ok(Response::Unknown) => {
+                                return Err(Stop::SolverError(
+                                    "z3 returned `unknown` for the single-writer gate".into(),
+                                ));
+                            }
+                            Err(e) => return Err(smt_err(e)),
+                        }
+                    }
+                    _ => {
+                        return Err(Stop::OutOfSubset(format!(
+                            "global write `{}[...]` index is not a provable inter-cube-disjoint \
+                             pattern (only `out[ABSOLUTE_POS]` and single-writer `out[CUBE_POS]` \
+                             are recognized in v1) — outside the vericl v0 subset",
+                            acc.name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn process_metadata(&mut self, inst: &Instruction, m: &Metadata) -> Result<(), Stop> {
@@ -983,10 +1842,12 @@ impl<'a, 'b> Prover<'a, 'b> {
                 let cond = self.cond_of(&if_.cond, "if")?;
                 let snapshot = self.memo.clone();
                 self.write_log_stack.push(HashSet::new());
+                self.race_push_guard(&if_.cond, cond, false);
                 self.smt.push().map_err(smt_err)?;
                 self.smt.assert(cond).map_err(smt_err)?;
                 let r = self.process_scope(&if_.scope);
                 self.smt.pop().map_err(smt_err)?;
+                self.race_pop_guard();
                 let written =
                     self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
                 r?;
@@ -1005,10 +1866,12 @@ impl<'a, 'b> Prover<'a, 'b> {
                 let snapshot = self.memo.clone();
 
                 self.write_log_stack.push(HashSet::new());
+                self.race_push_guard(&ie.cond, cond, false);
                 self.smt.push().map_err(smt_err)?;
                 self.smt.assert(cond).map_err(smt_err)?;
                 let r1 = self.process_scope(&ie.scope_if);
                 self.smt.pop().map_err(smt_err)?;
+                self.race_pop_guard();
                 let written_if =
                     self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
                 r1?;
@@ -1020,10 +1883,12 @@ impl<'a, 'b> Prover<'a, 'b> {
 
                 self.write_log_stack.push(HashSet::new());
                 let not_cond = self.smt.not(cond);
+                self.race_push_guard(&ie.cond, not_cond, false);
                 self.smt.push().map_err(smt_err)?;
                 self.smt.assert(not_cond).map_err(smt_err)?;
                 let r2 = self.process_scope(&ie.scope_else);
                 self.smt.pop().map_err(smt_err)?;
+                self.race_pop_guard();
                 let written_else =
                     self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
                 r2?;
@@ -1054,6 +1919,19 @@ impl<'a, 'b> Prover<'a, 'b> {
     }
 
     fn process_range_loop(&mut self, rl: &cubecl::ir::RangeLoop) -> Result<(), Stop> {
+        // Race walk: a barrier inside a range-`for` is a cooperative loop shape
+        // v1's structural recognizer does not cover (it keys on the `while`-
+        // halving `Branch::Loop`). Rejected `OutOfSubset` rather than
+        // mismodeled — the honest answer for an unrecognized-but-valid tree
+        // loop (§9 risk 1), never a wrong `Proved`.
+        if self.race.is_some() && scope_contains_sync_cube(&rl.scope) {
+            return Err(Stop::OutOfSubset(
+                "cooperative `Branch::RangeLoop` (a `sync_cube()` inside a range-`for`) is not the \
+                 recognized `while`-halving tree loop — outside the vericl v1 subset (rejected \
+                 rather than mismodeled)"
+                    .into(),
+            ));
+        }
         // Soundness guard (see module docs), MUST run before the bounds
         // assertions below: `start <= i (<)= end` only models a unit-stride
         // *ascending* range. `range_stepped` (CubeCL's stepped-range
@@ -1140,11 +2018,16 @@ impl<'a, 'b> Prover<'a, 'b> {
     /// A `Branch::Loop` (CubeCL's `while`/`loop` desugaring). See the module
     /// docs' "`Branch::Loop` recognition (M2)" bullet.
     fn process_loop(&mut self, l: &Loop) -> Result<(), Stop> {
-        // Cooperative loop (barrier inside the body): defer to the two-thread
-        // race walker (milestone M3), which does not exist yet. Rejected
-        // rather than modeled by a single-thread pass — checked FIRST, so any
-        // barrier-carrying loop defers regardless of its guard shape.
+        // Cooperative loop (barrier inside the body). In the two-thread race
+        // walk it routes into the phase walker (milestone M3); in a plain
+        // single-thread bounds walk it cannot be modeled without race analysis
+        // and stays `OutOfSubset` (unchanged — the `..._defers_to_m3` tests).
+        // Checked FIRST, so any barrier-carrying loop takes this path
+        // regardless of its guard shape.
         if scope_contains_sync_cube(&l.scope) {
+            if self.race.is_some() {
+                return self.process_cooperative_loop(l);
+            }
             return Err(Stop::OutOfSubset(
                 "cooperative loop (a `Branch::Loop` containing `sync_cube()`) — race walker not \
                  yet implemented (milestone M3); rejected rather than modeled without race \
@@ -1226,6 +2109,11 @@ impl<'a, 'b> Prover<'a, 'b> {
 
         self.smt.push().map_err(smt_err)?;
         self.smt.assert(guard).map_err(smt_err)?;
+        // In a race walk, the loop guard is a live fact (recorded into accesses
+        // inside the loop) and an enclosing loop guard (barrier uniformity — a
+        // non-cooperative loop has no barrier, so a thread-varying guard here is
+        // harmless, but a barrier that somehow appeared would be checked).
+        self.race_push_guard(&bg.guard_var, guard, true);
         // Walk the real body under the asserted guard. The `nc = Not c` and
         // the `if nc { break }` scaffolding are skipped: `nc` feeds only the
         // break, and the break arm carries no obligation.
@@ -1236,6 +2124,7 @@ impl<'a, 'b> Prover<'a, 'b> {
                 break;
             }
         }
+        self.race_pop_guard();
         self.smt.pop().map_err(smt_err)?;
         result
     }
@@ -1491,6 +2380,211 @@ fn scope_contains_sync_cube(scope: &Scope) -> bool {
         },
         _ => false,
     })
+}
+
+// -- thread-varying taint + cooperative-loop recognition (M3 + M4) -------
+
+/// Static thread-varying taint (§5.4): the set of `VariableKind`s whose value
+/// depends (transitively) on `UnitPos`/`AbsolutePos` or on array contents. A
+/// kind NOT in this set (and not a `UnitPos`/`AbsolutePos` leaf) is provably
+/// cube-uniform — identical on every thread — which is exactly what a barrier's
+/// enclosing conditions and a cooperative loop's trip count must be. Computed
+/// to a fixpoint (a loop-carried variable can turn varying via a later in-body
+/// update), forward over the IR; conservative — an unmodeled op's `out` is
+/// treated as varying, so a barrier gated by it is rejected, never wrongly
+/// accepted.
+fn collect_thread_varying(scope: &Scope) -> HashSet<VariableKind> {
+    let mut varying = HashSet::new();
+    loop {
+        let before = varying.len();
+        propagate_thread_varying(scope, &mut varying);
+        if varying.len() == before {
+            return varying;
+        }
+    }
+}
+
+fn propagate_thread_varying(scope: &Scope, varying: &mut HashSet<VariableKind>) {
+    for inst in &scope.instructions {
+        if let Some(out) = inst.out {
+            if inst_out_thread_varying(inst, varying) {
+                varying.insert(out.kind);
+            }
+        }
+        if let Operation::Branch(b) = &inst.operation {
+            match b {
+                Branch::If(if_) => propagate_thread_varying(&if_.scope, varying),
+                Branch::IfElse(ie) => {
+                    propagate_thread_varying(&ie.scope_if, varying);
+                    propagate_thread_varying(&ie.scope_else, varying);
+                }
+                Branch::Switch(sw) => {
+                    propagate_thread_varying(&sw.scope_default, varying);
+                    for (_, s) in &sw.cases {
+                        propagate_thread_varying(s, varying);
+                    }
+                }
+                Branch::RangeLoop(rl) => propagate_thread_varying(&rl.scope, varying),
+                Branch::Loop(l) => propagate_thread_varying(&l.scope, varying),
+                Branch::Return | Branch::Break | Branch::Unreachable => {}
+            }
+        }
+    }
+}
+
+/// Whether `var` is thread-varying: `UnitPos`/`AbsolutePos` (and the 1-D-subset-
+/// external `UnitPosX/Y/Z` variants, seeded for safety) are the leaves;
+/// everything else is looked up in `varying`.
+fn var_is_thread_varying(var: &Variable, varying: &HashSet<VariableKind>) -> bool {
+    matches!(
+        var.kind,
+        VariableKind::Builtin(
+            Builtin::UnitPos
+                | Builtin::UnitPosX
+                | Builtin::UnitPosY
+                | Builtin::UnitPosZ
+                | Builtin::AbsolutePos
+        )
+    ) || varying.contains(&var.kind)
+}
+
+/// Whether an instruction's `out` is thread-varying given the current set.
+/// Uniform-preserving ops with all-uniform operands stay uniform; an array load
+/// is always varying (data-dependent); an unmodeled op is conservatively
+/// varying.
+fn inst_out_thread_varying(inst: &Instruction, varying: &HashSet<VariableKind>) -> bool {
+    match &inst.operation {
+        Operation::Copy(v) => var_is_thread_varying(v, varying),
+        Operation::Arithmetic(a) => arith_any_varying(a, varying),
+        Operation::Comparison(c) => cmp_any_varying(c, varying),
+        Operation::Operator(op) => match op {
+            // array load -> data-dependent value
+            Operator::Index(_) | Operator::UncheckedIndex(_) => true,
+            Operator::Cast(u) => var_is_thread_varying(&u.input, varying),
+            Operator::And(b) | Operator::Or(b) => {
+                var_is_thread_varying(&b.lhs, varying) || var_is_thread_varying(&b.rhs, varying)
+            }
+            Operator::Not(u) => var_is_thread_varying(&u.input, varying),
+            // an IndexAssign's `out` is the array, not a scalar value.
+            Operator::IndexAssign(_) | Operator::UncheckedIndexAssign(_) => false,
+            _ => true,
+        },
+        // Buffer metadata (`Length`, ...) is cube-uniform.
+        Operation::Metadata(_) => false,
+        // Branch/Sync have no scalar `out`; everything else is unmodeled ->
+        // conservatively varying.
+        _ => true,
+    }
+}
+
+fn arith_any_varying(a: &Arithmetic, v: &HashSet<VariableKind>) -> bool {
+    use Arithmetic::*;
+    match a {
+        Add(b) | Sub(b) | Mul(b) | Div(b) | Modulo(b) | Max(b) | Min(b) | Remainder(b)
+        | Powf(b) | Powi(b) => {
+            var_is_thread_varying(&b.lhs, v) || var_is_thread_varying(&b.rhs, v)
+        }
+        Abs(u) | Neg(u) => var_is_thread_varying(&u.input, v),
+        // Fma/Clamp/other shapes: conservatively varying.
+        _ => true,
+    }
+}
+
+fn cmp_any_varying(c: &Comparison, v: &HashSet<VariableKind>) -> bool {
+    use Comparison::*;
+    match c {
+        Lower(b) | LowerEqual(b) | Equal(b) | NotEqual(b) | GreaterEqual(b) | Greater(b) => {
+            var_is_thread_varying(&b.lhs, v) || var_is_thread_varying(&b.rhs, v)
+        }
+        // IsNan/IsInf: float predicate, conservatively varying.
+        _ => true,
+    }
+}
+
+/// The control variable of a downward-counter loop guard `half > 0` (or the
+/// symmetric `0 < half`): the non-constant operand the guard lower-bounds. Only
+/// the constant-zero-bounded shape is recognized, so `H >= 1` is a sound loop
+/// invariant; any other comparison yields `None` (→ `OutOfSubset`).
+fn downcounter_ctrl(cmp: &Comparison) -> Option<Variable> {
+    match cmp {
+        Comparison::Greater(b) if is_zero_const(&b.rhs) => Some(b.lhs),
+        Comparison::Lower(b) if is_zero_const(&b.lhs) => Some(b.rhs),
+        _ => None,
+    }
+}
+
+fn is_zero_const(v: &Variable) -> bool {
+    matches!(
+        v.kind,
+        VariableKind::Constant(ConstantValue::UInt(0)) | VariableKind::Constant(ConstantValue::Int(0))
+    )
+}
+
+/// Verify the cooperative loop's control variable is updated only by a uniform
+/// halving `ctrl = ctrl / c` with a constant `c >= 1`, so a fresh symbol
+/// bounded `H <= init` soundly over-approximates every tree level (the
+/// recurrence is non-increasing). Any other update — a decrement, a manual
+/// recurrence, a data-dependent step — is rejected (§9 risk 1: honest
+/// `OutOfSubset`, never a wrong `Proved`).
+fn verify_halving_update(scope: &Scope, ctrl: VariableKind) -> Result<(), Stop> {
+    let mut found = false;
+    let all_halving = check_halving_writes(scope, ctrl, &mut found);
+    if !all_halving || !found {
+        return Err(Stop::OutOfSubset(
+            "cooperative loop control variable is not updated by a uniform halving \
+             (`half /= <constant>`), the recognized tree-reduction recurrence — outside the \
+             vericl v1 subset (rejected rather than mismodeled)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Returns whether every write to `ctrl` (recursively) is a halving; sets
+/// `found` when at least one halving write exists.
+fn check_halving_writes(scope: &Scope, ctrl: VariableKind, found: &mut bool) -> bool {
+    for inst in &scope.instructions {
+        if inst.out.map(|o| o.kind) == Some(ctrl) {
+            match &inst.operation {
+                Operation::Arithmetic(Arithmetic::Div(b))
+                    if b.lhs.kind == ctrl && is_positive_const(&b.rhs) =>
+                {
+                    *found = true;
+                }
+                // any other write to the control variable breaks the
+                // non-increasing guarantee.
+                _ => return false,
+            }
+        }
+        if let Operation::Branch(br) = &inst.operation {
+            let sub_ok = match br {
+                Branch::If(if_) => check_halving_writes(&if_.scope, ctrl, found),
+                Branch::IfElse(ie) => {
+                    check_halving_writes(&ie.scope_if, ctrl, found)
+                        & check_halving_writes(&ie.scope_else, ctrl, found)
+                }
+                Branch::RangeLoop(rl) => check_halving_writes(&rl.scope, ctrl, found),
+                Branch::Loop(l) => check_halving_writes(&l.scope, ctrl, found),
+                Branch::Switch(sw) => {
+                    let mut ok = check_halving_writes(&sw.scope_default, ctrl, found);
+                    for (_, s) in &sw.cases {
+                        ok &= check_halving_writes(s, ctrl, found);
+                    }
+                    ok
+                }
+                _ => true,
+            };
+            if !sub_ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_positive_const(v: &Variable) -> bool {
+    matches!(v.kind, VariableKind::Constant(ConstantValue::UInt(n)) if n >= 1)
+        || matches!(v.kind, VariableKind::Constant(ConstantValue::Int(n)) if n >= 1)
 }
 
 #[cfg(test)]
@@ -2793,6 +3887,500 @@ mod tests {
                 );
             }
             other => panic!("expected OutOfSubset (tree loop deferred to M3), got {other:?}"),
+        }
+    }
+
+    // =================================================================
+    // Shared-memory milestones M3 (two-thread race walker) + M4 (barrier
+    // uniformity). docs/design-shared-memory.md §5, §8 M3/M4.
+    //
+    // These kernels use a store guarded by `CUBE_POS < output.len()` (the M1
+    // `shared_load_guarded` posture): the phase walker discharges the *bounds*
+    // of every access it resolves — including the store — so the store must be
+    // bounds-safe on its own, exactly like the M1 positive control. The whole-
+    // kernel `..._defers_to_m3` kernels above leave the store unguarded because
+    // the single-thread bounds walk stops at the barrier-carrying loop before
+    // ever reaching it.
+    // =================================================================
+
+    /// `block_sum_reduce` (guarded store) — the v1 reduction shape.
+    #[cube(launch)]
+    fn prover_test_race_block_sum_reduce(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        sync_cube();
+
+        let mut half = CUBE_DIM as usize / 2;
+        while half > 0usize {
+            if tid < half {
+                let a = tile[tid];
+                let b = tile[tid + half];
+                tile[tid] = a + b;
+            }
+            sync_cube();
+            half /= 2usize;
+        }
+
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    /// Builds a `KernelDefinition` for a race-test kernel with the standard
+    /// `(input: &Array<f32>, output: &mut Array<f32>)` signature.
+    macro_rules! build_shared {
+        ($kernel:path) => {{
+            let mut builder = KernelBuilder::default();
+            builder.runtime_properties(Default::default());
+            cubecl::ir::AddressType::U32.register(&mut builder.scope);
+            let input = <Array<f32> as LaunchArg>::expand(
+                &ArrayCompilationArg { inplace: None },
+                &mut builder,
+            );
+            let output = <Array<f32> as LaunchArg>::expand_output(
+                &ArrayCompilationArg { inplace: None },
+                &mut builder,
+            );
+            $kernel(&mut builder.scope, input, output);
+            builder.build(KernelSettings::default())
+        }};
+    }
+
+    /// §8 M3 positive control: `block_sum_reduce` `Proved` data-race free by the
+    /// two-thread walk, with the previously-deferred bounds obligations (the
+    /// tree-reduction `tile[tid+half] < 256`, §8 M1) now discharging through the
+    /// phase walker. Reproduces the `tree_ww`/`tree_rw`/`tree_bounds`/`uniform_
+    /// ok` probe verdicts through the real walker. Obligations (19):
+    ///   bounds (8): phase 0 — `tile[tid]` write (if-arm), `input[ABS]` read
+    ///     (if-arm), `tile[tid]` write (else-arm); phase 1 — `tile[tid]` read,
+    ///     `tile[tid+half]` read, `tile[tid]` write; phase 2 — `tile[0]` read,
+    ///     `output[CUBE_POS]` write.
+    ///   write-write (6): phase 0 tile 2×2=4 (both if/else writes, all UNSAT via
+    ///     `t1≠t2`); phase 1 tile 1×1=1; phase 2 output 1×1=1 (single-writer via
+    ///     `tid==0`).
+    ///   read-write (4): phase 1 tile `w1×r2` + `w2×r1` = 1×2 + 1×2.
+    ///   inter-cube single-writer gate (1): `output[CUBE_POS]` under `tid==0`.
+    #[test]
+    fn block_sum_reduce_is_race_free() {
+        let def = build_shared!(prover_test_race_block_sum_reduce::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 19),
+            other => panic!("expected Proved (race-free), got {other:?}"),
+        }
+    }
+
+    /// `grid_stride_reduce` (guarded store) — the reduce_rssi-shaped reduction:
+    /// a non-cooperative accumulation loop feeding the same tree reduction.
+    #[cube(launch)]
+    fn prover_test_race_grid_stride_reduce(
+        data: &Array<f32>,
+        partials: &mut Array<f32>,
+        num_cubes: u32,
+        #[comptime] n: usize,
+    ) {
+        let tid = UNIT_POS as usize;
+        let stride = CUBE_DIM as usize * num_cubes as usize;
+        let mut k = ABSOLUTE_POS;
+        let mut local = 0.0f32;
+        while k < n {
+            local += data[k] * data[k];
+            k += stride;
+        }
+
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        tile[tid] = local;
+        sync_cube();
+
+        let mut half = CUBE_DIM as usize / 2;
+        while half > 0usize {
+            if tid < half {
+                let a = tile[tid];
+                let b = tile[tid + half];
+                tile[tid] = a + b;
+            }
+            sync_cube();
+            half /= 2usize;
+        }
+
+        if tid == 0usize && CUBE_POS < partials.len() {
+            partials[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    fn build_grid_stride_race() -> KernelDefinition {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let data =
+            <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let partials = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        let num_cubes = <u32 as LaunchArg>::expand(&Default::default(), &mut builder);
+        prover_test_race_grid_stride_reduce::expand(&mut builder.scope, data, partials, num_cubes, 4096);
+        builder.build(KernelSettings::default())
+    }
+
+    const GRID_BUFFERS: &[BufferParam] = &[
+        BufferParam { name: "data", is_output: false },
+        BufferParam { name: "partials", is_output: true },
+    ];
+
+    /// §8 M3 positive control: `grid_stride_reduce` `Proved` race-free. The
+    /// non-cooperative accumulation loop's `data[k]` reads (read-only, no race)
+    /// discharge their bounds under `data.len() == 4096` (M2), the tree
+    /// reduction proves race-free exactly as `block_sum_reduce`. Obligations
+    /// (16): bounds (8) = phase 0 `data[k]` read ×2 + `tile[tid]` write; phase 1
+    /// tree ×3; phase 2 `tile[0]` read + `partials[CUBE_POS]` write. write-write
+    /// (3) = phase 0 tile 1×1 (unconditional store) + phase 1 tile 1 + phase 2
+    /// partials 1. read-write (4) = phase 1. inter-cube gate (1).
+    #[test]
+    fn grid_stride_reduce_is_race_free() {
+        let def = build_grid_stride_race();
+        match prove_race_freedom(
+            &def,
+            GRID_BUFFERS,
+            &[Assume::LenEqConst { a: "data", value: 4096 }],
+            256,
+        ) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 16),
+            other => panic!("expected Proved (race-free), got {other:?}"),
+        }
+    }
+
+    /// §8 M3 negative control (the `racy_rw` probe, through the real walker): a
+    /// neighbor combine `tile[tid] += tile[tid+1]` with **no barrier** before it
+    /// — a read-write race between adjacent threads (thread `t1`'s write of
+    /// `tile[t1]` collides with thread `t2`'s read of `tile[t2+1]` when
+    /// `t1 == t2+1`). All accesses are bounds-safe (the `tid < 255` guard keeps
+    /// the neighbor read in range), so the walker refutes on the **race**, not
+    /// on bounds, with a two-thread counterexample.
+    #[cube(launch)]
+    fn prover_test_racy_neighbor(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        // BUG: the correct kernel has a `sync_cube()` here.
+        if tid < 255usize {
+            let n = tile[tid + 1usize];
+            tile[tid] = tile[tid] + n;
+        }
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn racy_neighbor_read_write_refutes() {
+        let def = build_shared!(prover_test_racy_neighbor::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(
+                    obligation.contains("read-write race") && obligation.contains("shared_array"),
+                    "unexpected obligation: {obligation}"
+                );
+                assert!(
+                    counterexample.contains("t1") && counterexample.contains("t2"),
+                    "expected a two-thread counterexample: {counterexample}"
+                );
+            }
+            other => panic!("expected Refuted (neighbor RW race), got {other:?}"),
+        }
+    }
+
+    /// Write-write race: every thread writes `tile[0]` (a fixed index), so any
+    /// two threads collide there — `Refuted` with a two-thread counterexample.
+    #[cube(launch)]
+    fn prover_test_racy_ww(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[0usize] = input[ABSOLUTE_POS];
+        }
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn racy_write_write_refutes() {
+        let def = build_shared!(prover_test_racy_ww::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(
+                    obligation.contains("write-write race"),
+                    "unexpected obligation: {obligation}"
+                );
+                assert!(!counterexample.is_empty());
+            }
+            other => panic!("expected Refuted (WW race on tile[0]), got {other:?}"),
+        }
+    }
+
+    /// §8 M4 negative control (the `uniform_bad` probe, through the real
+    /// walker): a `sync_cube()` under the thread-varying condition `tid < half`
+    /// is barrier divergence — `OutOfSubset` with the §7.3 reason, never a
+    /// silent `Proved`. This is the analog of the round-2 branch-scoping bug the
+    /// design flags as adversarially probed (§9 risk 2).
+    #[cube(launch)]
+    fn prover_test_barrier_divergence(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        let half = CUBE_DIM as usize / 2;
+        if tid < half {
+            sync_cube();
+        }
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn barrier_under_thread_varying_condition_is_out_of_subset() {
+        let def = build_shared!(prover_test_barrier_divergence::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("non-uniform condition")
+                        && reason.contains("barrier divergence"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (barrier divergence), got {other:?}"),
+        }
+    }
+
+    /// §8 M4 positive control (the `uniform_ok` probe, through the real walker):
+    /// a `sync_cube()` at the top level of a `while half > 0` loop — a uniform
+    /// (`half`-halving) trip count — is accepted. The barrier body is otherwise
+    /// empty, isolating the uniformity check from any race obligation.
+    #[cube(launch)]
+    fn prover_test_uniform_barrier_loop(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        let mut half = CUBE_DIM as usize / 2;
+        while half > 0usize {
+            sync_cube();
+            half /= 2usize;
+        }
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn uniform_tree_guard_barrier_is_accepted() {
+        let def = build_shared!(prover_test_uniform_barrier_loop::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::Proved { .. } => {}
+            other => panic!("expected Proved (uniform barrier loop accepted), got {other:?}"),
+        }
+    }
+
+    /// §9 risk 1 (cooperative-loop recognition brittleness), demonstrated: a
+    /// barrier inside a range-`for` is a valid-but-unrecognized tree-loop shape.
+    /// The honest answer is `OutOfSubset`, never a wrong `Proved`.
+    #[cube(launch)]
+    fn prover_test_barrier_in_range_loop(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        for _i in 0..8usize {
+            sync_cube();
+        }
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn barrier_in_range_loop_is_out_of_subset() {
+        let def = build_shared!(prover_test_barrier_in_range_loop::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("RangeLoop") || reason.contains("range-`for`"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (barrier in RangeLoop), got {other:?}"),
+        }
+    }
+
+    /// §9 risk 1, second demonstration: the tree loop written with a *decrement*
+    /// (`half -= 1`) rather than a halving. Semantically it is still a uniform,
+    /// race-free, in-bounds barrier loop, but v1's structural recognizer keys on
+    /// the halving recurrence — so the honest answer is `OutOfSubset`, never a
+    /// wrong `Proved`.
+    #[cube(launch)]
+    fn prover_test_decrement_tree(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        let mut half = CUBE_DIM as usize / 2;
+        while half > 0usize {
+            if tid < half {
+                let a = tile[tid];
+                let b = tile[tid + half];
+                tile[tid] = a + b;
+            }
+            sync_cube();
+            half -= 1usize;
+        }
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn non_halving_tree_update_is_out_of_subset() {
+        let def = build_shared!(prover_test_decrement_tree::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(reason.contains("halving"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected OutOfSubset (non-halving update), got {other:?}"),
+        }
+    }
+
+    /// §8 M1 bounds discharge through the phase walker, negative: an undersized
+    /// tile (`SharedMemory::new(128)` at `CUBE_DIM = 256`) makes the very first
+    /// `tile[tid]` store out of bounds — the race walker's bounds obligation
+    /// refutes with a counterexample exhibiting the offending `unit_pos`, rather
+    /// than vacuously proving race freedom over an OOB kernel.
+    #[cube(launch)]
+    fn prover_test_race_undersized(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(128usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        }
+        sync_cube();
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn race_walker_undersized_tile_refutes_on_bounds() {
+        let def = build_shared!(prover_test_race_undersized::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(
+                    obligation.contains("shared_array") && obligation.contains("index"),
+                    "unexpected obligation: {obligation}"
+                );
+                assert!(
+                    counterexample.contains("unit_pos") || counterexample.contains('t'),
+                    "unexpected counterexample: {counterexample}"
+                );
+            }
+            other => panic!("expected Refuted (undersized tile bounds), got {other:?}"),
+        }
+    }
+
+    /// §9 risk 2 (barrier-uniformity taint looseness), the subtle case: a
+    /// `sync_cube()` under the divergent inner `if tid < half` *inside* the
+    /// otherwise-recognized halving tree loop. The loop trip count is uniform,
+    /// so the loop itself is fine — but the barrier now sits under a
+    /// thread-varying `if`, which is divergence. The walker must catch the
+    /// *inner* guard (not just the outer loop guard) and reject. This is the
+    /// analog of the round-2 branch-scoping bug the design promises will be
+    /// adversarially probed.
+    #[cube(launch)]
+    fn prover_test_barrier_under_inner_if(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        let mut tile = SharedMemory::<f32>::new(256usize);
+        if ABSOLUTE_POS < input.len() {
+            tile[tid] = input[ABSOLUTE_POS];
+        } else {
+            tile[tid] = 0.0f32;
+        }
+        let mut half = CUBE_DIM as usize / 2;
+        while half > 0usize {
+            if tid < half {
+                let a = tile[tid];
+                let b = tile[tid + half];
+                tile[tid] = a + b;
+                sync_cube();
+            }
+            half /= 2usize;
+        }
+        if tid == 0usize && CUBE_POS < output.len() {
+            output[CUBE_POS] = tile[0usize];
+        }
+    }
+
+    #[test]
+    fn barrier_under_inner_if_in_coop_loop_is_out_of_subset() {
+        let def = build_shared!(prover_test_barrier_under_inner_if::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("non-uniform condition")
+                        && reason.contains("barrier divergence"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (barrier under inner varying if), got {other:?}"),
+        }
+    }
+
+    /// Inter-cube gate (§5.3): a global store `output[tid]` collides across
+    /// cubes (cube A's `tid==5` and cube B's `tid==5` both write index 5). The
+    /// same-cube pair sees no intra-cube race (distinct `tid`), so the walker
+    /// must NOT silently `Proved` — the inter-cube gate rejects the pattern
+    /// (`OutOfSubset`), since it is neither `out[ABSOLUTE_POS]` nor a
+    /// single-writer `out[CUBE_POS]`. The store is `tid`-guarded against
+    /// `output.len()` so it is bounds-safe and the gate (not bounds) is what
+    /// fires.
+    #[cube(launch)]
+    fn prover_test_global_write_bad_pattern(input: &Array<f32>, output: &mut Array<f32>) {
+        let tid = UNIT_POS as usize;
+        if ABSOLUTE_POS < input.len() && tid < output.len() {
+            output[tid] = input[ABSOLUTE_POS];
+        }
+    }
+
+    #[test]
+    fn intercube_global_write_bad_pattern_is_out_of_subset() {
+        let def = build_shared!(prover_test_global_write_bad_pattern::expand);
+        match prove_race_freedom(&def, SHARED_BUFFERS, &[], 256) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("inter-cube") && reason.contains("global write"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (inter-cube global pattern), got {other:?}"),
         }
     }
 }
