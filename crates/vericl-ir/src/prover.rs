@@ -145,6 +145,42 @@
 //!   `Index`/`IndexAssign` bounds obligations `ProveResult::Proved` reports):
 //!   it's an internal precondition for soundly *modeling* div/mod, not a
 //!   bounds check the caller asked for.
+//! - **Element-range assumptions (array-value-dependent indices).** This is
+//!   the ONLY case array element *contents* get a model; every other read stays
+//!   tainted, exactly as before. An `Assume::ElemsBelowLen { arr, len_of }` /
+//!   `ElemsBelowConst { arr, bound }` (the `arr.iter().all(|v| (*v as usize) <
+//!   len_of.len())` / `… < N` contract shapes) records a bound for the global
+//!   array `arr`. A read `arr[i]` — whose OWN index obligation `0 <= i <
+//!   arr.len()` is still emitted and must discharge exactly as today —
+//!   additionally binds its result to a *fresh* symbol `v` constrained
+//!   `v < bound` (and `0 <= v` when `arr`'s element type is unsigned, a sound
+//!   type fact; a signed element array models `v < bound` alone, so the
+//!   `0 <= index` half of a later obligation is a real proof, never assumed).
+//!   This lets a gather `x[offsets[i]]` discharge the inner `offsets[i] <
+//!   x.len()` obligation, and nested gathers `a[b[i]]` compose automatically:
+//!   `b[i]`'s fresh symbol (bounded `< a.len()` by `b`'s own assume) is exactly
+//!   what the `a[...]` obligation needs, and the fresh symbol flows through any
+//!   modeled arithmetic in between unchanged. **Soundness:** the assumption is
+//!   an *assumed* claim recorded in evidence (the proof is conditional on it,
+//!   precisely like a length assume), and the executable `check_assumes`
+//!   predicate tests it at generation time, so the differential lane only ever
+//!   runs inputs satisfying it. A *wrong* bound (looser than the indexed
+//!   array's length) does not hide a bug: z3 picks a `v` in `[?, bound)` that
+//!   the indexed array's length does not cover and `Refuted`s, with the fresh
+//!   `elem…` symbol in the counterexample at the offending boundary.
+//! - **Write invalidation.** A write `arr[j] = …` (`IndexAssign`) invalidates
+//!   `arr`'s element assumption for every *subsequent* read of `arr` in the
+//!   walk — the written value need not satisfy the assume, so a later `arr[k]`
+//!   read is tainted rather than modeled (`elem_invalidated`, monotonic). This
+//!   covers an assume array the kernel also mutates (an in-place scatter) and
+//!   an assume array that is itself an output. A read that *precedes* the write
+//!   in program order keeps its model (the write hasn't happened yet), so both
+//!   directions are honored. For a **loop**, a body that writes `arr` anywhere
+//!   invalidates `arr` for the whole body *before* it is walked
+//!   (`invalidate_loop_element_writes`), because a later iteration's write
+//!   happens-before an earlier iteration's read — the in-order rule alone would
+//!   unsoundly model a read that textually precedes the write. Every case is
+//!   conservative (invalidation only ever *removes* a model), hence sound.
 //! - **Cooperative mode (shared-memory milestone M1):** a second entry point
 //!   `prove_bounds_freedom_cooperative(def, buffers, assumes, cube_dim)` opts
 //!   the walk into *workgroup-cooperative* modeling by pinning `CUBE_DIM` to a
@@ -330,6 +366,19 @@ pub struct BufferParam<'a> {
 pub enum Assume<'a> {
     LenEq { a: &'a str, b: &'a str },
     LenEqConst { a: &'a str, value: u64 },
+    /// `arr.iter().all(|v| (*v as usize) < len_of.len())` — every element of
+    /// the integer array `arr` is a valid index into `len_of` (a *content*
+    /// assumption, unlike the length assumptions above). Lets a read
+    /// `arr[i]` (still itself in-bounds) produce a value modeled as a fresh
+    /// symbol bounded `< len_of.len()` instead of tainted — the only case
+    /// array element contents get a model (see the module docs'
+    /// "Element-range assumptions" bullet). Invalidated for `arr` by any
+    /// write to `arr`'s elements.
+    ElemsBelowLen { arr: &'a str, len_of: &'a str },
+    /// `arr.iter().all(|v| *v < bound)` — every element of the integer array
+    /// `arr` is below the constant `bound` (the constant-bound sibling of
+    /// `ElemsBelowLen`).
+    ElemsBelowConst { arr: &'a str, bound: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -542,6 +591,8 @@ fn prove_bounds_freedom_impl(
         write_log_stack: Vec::new(),
         coop,
         race: None,
+        elem_bounds: HashMap::new(),
+        elem_invalidated: HashSet::new(),
     };
 
     if let Err(e) = prover.assert_structured_assumes(assumes) {
@@ -614,6 +665,8 @@ fn prove_race_freedom_detailed(
             global_checks: 0,
             uniformity_checks: 0,
         }),
+        elem_bounds: HashMap::new(),
+        elem_invalidated: HashSet::new(),
     };
 
     if let Err(e) = prover.assert_structured_assumes(assumes) {
@@ -730,6 +783,23 @@ struct Prover<'a, 'b> {
     /// the no-op it is for a bounds walk. All race logic is gated on this being
     /// `Some`, so the bounds walk stays byte-for-byte unchanged.
     race: Option<RaceState>,
+    /// Per-global-array element-range bounds, from `Assume::ElemsBelowLen`/
+    /// `ElemsBelowConst` (module docs' "Element-range assumptions"). A read
+    /// `arr[i]` of a global array whose id is a key here — and NOT in
+    /// `elem_invalidated` — produces a value modeled as a fresh symbol
+    /// `0 <= v < b` for every recorded bound `b` (multiple assumes on one
+    /// array conjoin), instead of the usual taint. Empty unless an
+    /// element-range assume is declared, so a kernel with none is
+    /// byte-for-byte unchanged.
+    elem_bounds: HashMap<Id, Vec<SExpr>>,
+    /// Global-array ids whose element assumption has been invalidated by a
+    /// write to that array's elements (an `IndexAssign`), for the remainder of
+    /// the walk (module docs' "Write invalidation"). Monotonic: once a write
+    /// to `arr` is seen — in program order, or anywhere in an enclosing loop
+    /// body via the loop pre-scan — every subsequent read of `arr`'s elements
+    /// is tainted rather than modeled, regardless of the assume. Conservative
+    /// (only ever removes modeling), hence sound.
+    elem_invalidated: HashSet<Id>,
 }
 
 /// Which of the two symbolic threads a race walk is currently resolving
@@ -875,6 +945,22 @@ impl<'a, 'b> Prover<'a, 'b> {
                     let v = self.smt.numeral(value);
                     let eq = self.smt.eq(la, v);
                     self.smt.assert(eq).map_err(smt_err)?;
+                }
+                // Element-range assumes assert NO global fact (they constrain
+                // array *contents*, not lengths); instead they record a bound
+                // consulted by `model_element_read` at each read of `arr`
+                // (module docs' "Element-range assumptions"). Multiple assumes
+                // on one array conjoin (each pushes its own bound).
+                Assume::ElemsBelowLen { arr, len_of } => {
+                    let arr_id = self.buffer_id_by_name(arr)?;
+                    let len_id = self.buffer_id_by_name(len_of)?;
+                    let bound = self.length_of(len_id)?;
+                    self.elem_bounds.entry(arr_id).or_default().push(bound);
+                }
+                Assume::ElemsBelowConst { arr, bound } => {
+                    let arr_id = self.buffer_id_by_name(arr)?;
+                    let b = self.smt.numeral(bound);
+                    self.elem_bounds.entry(arr_id).or_default().push(b);
                 }
             }
         }
@@ -1304,10 +1390,53 @@ impl<'a, 'b> Prover<'a, 'b> {
             ))
         })?;
         self.access(&aref, false, idx, &name, io.index.kind, len)?;
-        // The value *read* from the array is unknown (this checker has no
-        // model of array contents) — taint, don't bind.
-        self.taint_out(inst);
+        // The value *read* from the array is normally unknown (this checker has
+        // no model of array contents) — taint, don't bind. The one exception:
+        // a global array covered by an in-force element-range assumption yields
+        // a value modeled as a fresh symbol bounded by the assumption, so a
+        // gather `x[offsets[i]]` (or a nested `a[b[i]]`) can discharge its inner
+        // index obligation (module docs' "Element-range assumptions").
+        if !self.model_element_read(inst, &aref)? {
+            self.taint_out(inst);
+        }
         Ok(())
+    }
+
+    /// If the array read by `inst` is a global array with an in-force
+    /// element-range assumption (a key in `elem_bounds`, not in
+    /// `elem_invalidated`) and an integer element type, bind `inst`'s output to
+    /// a fresh symbol constrained `0 <= v` (for an unsigned element type — a
+    /// sound type fact) and `v < b` for every recorded bound `b`, and return
+    /// `true`. Otherwise bind nothing and return `false` (the caller taints).
+    ///
+    /// Soundness: the assumption is an *assumed* claim recorded in evidence
+    /// (like a length assume), and the executable `check_assumes` predicate
+    /// tests it at generation time, so the differential lane only ever runs
+    /// inputs that satisfy it. Non-negativity is asserted only from the element
+    /// *type* (an unsigned value is non-negative unconditionally); a signed
+    /// element array therefore models `v < b` alone, leaving the `0 <= index`
+    /// half of a later index obligation to fail honestly rather than be assumed.
+    fn model_element_read(
+        &mut self,
+        inst: &Instruction,
+        aref: &ArrayRef,
+    ) -> Result<bool, Stop> {
+        let ArrayRef::Global { id } = *aref else { return Ok(false) };
+        if self.elem_invalidated.contains(&id) {
+            return Ok(false);
+        }
+        let Some(out) = inst.out else { return Ok(false) };
+        if !is_modeled_int(&out.ty) {
+            return Ok(false);
+        }
+        let Some(bounds) = self.elem_bounds.get(&id).cloned() else { return Ok(false) };
+        let v = self.declare_int("elem", is_unsigned(&out.ty))?;
+        for b in bounds {
+            let lt = self.smt.lt(v, b);
+            self.smt.assert(lt).map_err(smt_err)?;
+        }
+        self.bind_out(inst, Some(v));
+        Ok(true)
     }
 
     fn process_index_assign(
@@ -1326,6 +1455,17 @@ impl<'a, 'b> Prover<'a, 'b> {
             ))
         })?;
         self.access(&aref, true, idx, &name, io.index.kind, len)?;
+        // Write invalidation (module docs): a write to a global array's
+        // elements invalidates that array's element-range assumption for every
+        // subsequent read, since the written value need not satisfy it. Covers
+        // the assume array being an output the kernel also reads, and the same
+        // array mutated by the kernel itself. Monotonic and conservative (only
+        // ever removes modeling), hence sound.
+        if !self.elem_bounds.is_empty() {
+            if let ArrayRef::Global { id } = aref {
+                self.elem_invalidated.insert(id);
+            }
+        }
         self.taint_out(inst);
         Ok(())
     }
@@ -2015,7 +2155,25 @@ impl<'a, 'b> Prover<'a, 'b> {
         })
     }
 
+    /// Pre-scan a loop body for element-assumption invalidation (module docs'
+    /// "Write invalidation"): any global array whose elements the body writes
+    /// (recursively) is invalidated for the whole rest of the walk *before* the
+    /// body is walked. A later iteration's write happens-before an earlier
+    /// iteration's read at runtime, so a read that precedes the write in body
+    /// order still cannot be soundly modeled — the in-program-order invalidation
+    /// alone would miss it. Conservative (over-invalidates a loop that runs zero
+    /// times), hence sound.
+    fn invalidate_loop_element_writes(&mut self, scope: &Scope) {
+        if self.elem_bounds.is_empty() {
+            return; // nothing modelable to invalidate — free for every kernel
+        }
+        let mut writes = HashSet::new();
+        collect_index_assigned_globals(scope, &mut writes);
+        self.elem_invalidated.extend(writes);
+    }
+
     fn process_range_loop(&mut self, rl: &cubecl::ir::RangeLoop) -> Result<(), Stop> {
+        self.invalidate_loop_element_writes(&rl.scope);
         // Race walk: a barrier inside a range-`for` is a cooperative loop shape
         // v1's structural recognizer does not cover (it keys on the `while`-
         // halving `Branch::Loop`). Rejected `OutOfSubset` rather than
@@ -2115,6 +2273,7 @@ impl<'a, 'b> Prover<'a, 'b> {
     /// A `Branch::Loop` (CubeCL's `while`/`loop` desugaring). See the module
     /// docs' "`Branch::Loop` recognition (M2)" bullet.
     fn process_loop(&mut self, l: &Loop) -> Result<(), Stop> {
+        self.invalidate_loop_element_writes(&l.scope);
         // Cooperative loop (barrier inside the body). In the two-thread race
         // walk it routes into the phase walker (milestone M3); in a plain
         // single-thread bounds walk it cannot be modeled without race analysis
@@ -2370,6 +2529,48 @@ fn collect_reassigned_vars(
                 }
                 Branch::RangeLoop(rl) => collect_reassigned_vars(&rl.scope, outer, found),
                 Branch::Loop(l) => collect_reassigned_vars(&l.scope, outer, found),
+                Branch::Return | Branch::Break | Branch::Unreachable => {}
+            }
+        }
+    }
+}
+
+/// Every global-array id whose elements `scope` (recursively, through nested
+/// branches and loops) writes via an `IndexAssign`/`UncheckedIndexAssign` —
+/// used by the loop element-assumption pre-scan
+/// (`invalidate_loop_element_writes`). Matches both global output and input
+/// arrays by id (element-range assumes are keyed by id regardless of the
+/// array's input/output role).
+fn collect_index_assigned_globals(scope: &Scope, found: &mut HashSet<Id>) {
+    for inst in &scope.instructions {
+        if let Operation::Operator(
+            Operator::IndexAssign(_) | Operator::UncheckedIndexAssign(_),
+        ) = &inst.operation
+        {
+            if let Some(out) = inst.out {
+                match out.kind {
+                    VariableKind::GlobalOutputArray(id) | VariableKind::GlobalInputArray(id) => {
+                        found.insert(id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Operation::Branch(b) = &inst.operation {
+            match b {
+                Branch::If(if_) => collect_index_assigned_globals(&if_.scope, found),
+                Branch::IfElse(ie) => {
+                    collect_index_assigned_globals(&ie.scope_if, found);
+                    collect_index_assigned_globals(&ie.scope_else, found);
+                }
+                Branch::Switch(sw) => {
+                    collect_index_assigned_globals(&sw.scope_default, found);
+                    for (_, s) in &sw.cases {
+                        collect_index_assigned_globals(s, found);
+                    }
+                }
+                Branch::RangeLoop(rl) => collect_index_assigned_globals(&rl.scope, found),
+                Branch::Loop(l) => collect_index_assigned_globals(&l.scope, found),
                 Branch::Return | Branch::Break | Branch::Unreachable => {}
             }
         }
@@ -4478,6 +4679,277 @@ mod tests {
                 );
             }
             other => panic!("expected OutOfSubset (inter-cube global pattern), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Element-range assumptions (array-value-dependent indices / gather).
+    // See the module docs' "Element-range assumptions" and "Write
+    // invalidation" bullets.
+    // -----------------------------------------------------------------
+
+    /// A gather: `y[i] = x[offsets[i]]`. The inner `x[offsets[i]]` read is only
+    /// provable if the value `offsets[i]` is modeled `< x.len()` — the whole
+    /// point of an element-range assume.
+    #[cube(launch)]
+    fn prover_test_gather(x: &Array<f32>, offsets: &Array<u32>, y: &mut Array<f32>) {
+        if ABSOLUTE_POS < y.len() {
+            y[ABSOLUTE_POS] = x[offsets[ABSOLUTE_POS] as usize];
+        }
+    }
+
+    fn build_gather() -> KernelDefinition {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let x = <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let offsets =
+            <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_gather::expand(&mut builder.scope, x, offsets, y);
+        builder.build(KernelSettings::default())
+    }
+
+    const GATHER_BUFFERS: &[BufferParam] = &[
+        BufferParam { name: "x", is_output: false },
+        BufferParam { name: "offsets", is_output: false },
+        BufferParam { name: "y", is_output: true },
+    ];
+
+    /// Positive: with `offsets.len() == y.len()` (the inner-read guard cover)
+    /// and `offsets[·] < x.len()`, all three obligations discharge — the
+    /// value-dependent index the checker never used to model.
+    #[test]
+    fn gather_with_element_assume_proves() {
+        let def = build_gather();
+        let assumes = [
+            Assume::LenEq { a: "offsets", b: "y" },
+            Assume::ElemsBelowLen { arr: "offsets", len_of: "x" },
+        ];
+        match prove_bounds_freedom(&def, GATHER_BUFFERS, &assumes) {
+            // offsets[pos] read, x[elem] read, y[pos] write.
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    /// Without the element assume, the loaded `offsets[i]` is tainted (contents
+    /// are opaque), so `x[offsets[i]]`'s index depends on a construct outside
+    /// the subset — honest `OutOfSubset` at that read, never a guess.
+    #[test]
+    fn gather_without_element_assume_is_out_of_subset() {
+        let def = build_gather();
+        let assumes = [Assume::LenEq { a: "offsets", b: "y" }];
+        match prove_bounds_freedom(&def, GATHER_BUFFERS, &assumes) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("read index") && reason.contains('x'),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (offsets[i] tainted), got {other:?}"),
+        }
+    }
+
+    /// A *wrong* (too-loose) element bound does not hide the bug: nothing ties
+    /// the bound to `x.len()`, so z3 picks an in-assume `elem` that overruns `x`
+    /// and refutes, with the fresh element symbol in the counterexample.
+    #[test]
+    fn gather_with_wrong_bound_refutes_with_element_symbol() {
+        let def = build_gather();
+        let assumes = [
+            Assume::LenEq { a: "offsets", b: "y" },
+            Assume::ElemsBelowConst { arr: "offsets", bound: 1_000_000 },
+        ];
+        match prove_bounds_freedom(&def, GATHER_BUFFERS, &assumes) {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains('x'), "unexpected obligation: {obligation}");
+                assert!(
+                    counterexample.contains("elem") && counterexample.contains("len_x"),
+                    "counterexample should exhibit the element symbol at the x boundary: \
+                     {counterexample}"
+                );
+            }
+            other => panic!("expected Refuted (element overruns x), got {other:?}"),
+        }
+    }
+
+    /// Nested gather `y[i] = data[inner[outer[i]]]` with an element assume on
+    /// each index layer: the fresh symbol from `outer[i]` (bounded `< inner`)
+    /// is exactly the index `inner[·]` needs, whose own fresh symbol (bounded
+    /// `< data`) is what `data[·]` needs — the layers compose with no special
+    /// casing.
+    #[cube(launch)]
+    fn prover_test_nested_gather(
+        data: &Array<f32>,
+        inner: &Array<u32>,
+        outer: &Array<u32>,
+        y: &mut Array<f32>,
+    ) {
+        if ABSOLUTE_POS < y.len() {
+            y[ABSOLUTE_POS] = data[inner[outer[ABSOLUTE_POS] as usize] as usize];
+        }
+    }
+
+    #[test]
+    fn nested_gather_composes_and_proves() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let data = <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let inner =
+            <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let outer =
+            <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_nested_gather::expand(&mut builder.scope, data, inner, outer, y);
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [
+            BufferParam { name: "data", is_output: false },
+            BufferParam { name: "inner", is_output: false },
+            BufferParam { name: "outer", is_output: false },
+            BufferParam { name: "y", is_output: true },
+        ];
+        let assumes = [
+            Assume::LenEq { a: "outer", b: "y" },
+            Assume::ElemsBelowLen { arr: "outer", len_of: "inner" },
+            Assume::ElemsBelowLen { arr: "inner", len_of: "data" },
+        ];
+        match prove_bounds_freedom(&def, &buffers, &assumes) {
+            // outer[pos], inner[elem], data[elem] reads + y[pos] write.
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 4),
+            other => panic!("expected Proved (nested gather composes), got {other:?}"),
+        }
+    }
+
+    // ---- write invalidation, both directions ------------------------
+
+    /// Read BEFORE write: the modeled `offsets[i]` (used as the `x` index) is
+    /// resolved before the later `offsets[i] = 7` write, so the assumption is
+    /// still in force there and the gather proves — invalidation must not act
+    /// retroactively.
+    #[cube(launch)]
+    fn prover_test_read_before_write(offsets: &mut Array<u32>, x: &Array<f32>, y: &mut Array<f32>) {
+        if ABSOLUTE_POS < y.len() {
+            let t = offsets[ABSOLUTE_POS];
+            y[ABSOLUTE_POS] = x[t as usize];
+            offsets[ABSOLUTE_POS] = 7u32;
+        }
+    }
+
+    /// Write BEFORE read: the `offsets[i] = 7` write invalidates the assumption,
+    /// so the subsequent `offsets[i]` load is tainted and `x[offsets[i]]` is
+    /// `OutOfSubset` — the write-invalidation rule firing.
+    #[cube(launch)]
+    #[allow(unused_assignments)]
+    fn prover_test_write_before_read(offsets: &mut Array<u32>, x: &Array<f32>, y: &mut Array<f32>) {
+        if ABSOLUTE_POS < y.len() {
+            offsets[ABSOLUTE_POS] = 7u32;
+            let t = offsets[ABSOLUTE_POS];
+            y[ABSOLUTE_POS] = x[t as usize];
+        }
+    }
+
+    /// A loop that both reads and writes the assume array: even though the read
+    /// textually precedes the write, a later iteration's write happens-before
+    /// this iteration's read, so the loop pre-scan invalidates `offsets` for the
+    /// whole body and the gather is `OutOfSubset` — never a wrong `Proved`.
+    #[cube(launch)]
+    fn prover_test_loop_self_mutation(offsets: &mut Array<u32>, x: &Array<f32>, y: &mut Array<f32>) {
+        for i in 0..y.len() {
+            let t = offsets[i];
+            y[i] = x[t as usize];
+            offsets[i] = 3u32;
+        }
+    }
+
+    macro_rules! build_offsets_mut {
+        ($kernel:path) => {{
+            let mut builder = KernelBuilder::default();
+            builder.runtime_properties(Default::default());
+            cubecl::ir::AddressType::U32.register(&mut builder.scope);
+            let offsets = <Array<u32> as LaunchArg>::expand_output(
+                &ArrayCompilationArg { inplace: None },
+                &mut builder,
+            );
+            let x = <Array<f32> as LaunchArg>::expand(
+                &ArrayCompilationArg { inplace: None },
+                &mut builder,
+            );
+            let y = <Array<f32> as LaunchArg>::expand_output(
+                &ArrayCompilationArg { inplace: None },
+                &mut builder,
+            );
+            $kernel(&mut builder.scope, offsets, x, y);
+            builder.build(KernelSettings::default())
+        }};
+    }
+
+    /// Buffers for the write-invalidation kernels (offsets is `&mut`, so it
+    /// registers first as an output; then x input, y output).
+    const OFFSETS_MUT_BUFFERS: &[BufferParam] = &[
+        BufferParam { name: "offsets", is_output: true },
+        BufferParam { name: "x", is_output: false },
+        BufferParam { name: "y", is_output: true },
+    ];
+
+    #[test]
+    fn element_read_before_write_stays_modeled_and_proves() {
+        let def = build_offsets_mut!(prover_test_read_before_write::expand);
+        let assumes = [
+            Assume::LenEq { a: "offsets", b: "y" },
+            Assume::ElemsBelowLen { arr: "offsets", len_of: "x" },
+        ];
+        match prove_bounds_freedom(&def, OFFSETS_MUT_BUFFERS, &assumes) {
+            // offsets[pos] read, x[elem] read, y[pos] write, offsets[pos] write.
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 4),
+            other => panic!("expected Proved (read precedes write), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn element_write_invalidates_subsequent_read() {
+        let def = build_offsets_mut!(prover_test_write_before_read::expand);
+        let assumes = [
+            Assume::LenEq { a: "offsets", b: "y" },
+            Assume::ElemsBelowLen { arr: "offsets", len_of: "x" },
+        ];
+        match prove_bounds_freedom(&def, OFFSETS_MUT_BUFFERS, &assumes) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("read index") && reason.contains('x'),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (write invalidated the assume), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_self_mutation_invalidates_element_reads() {
+        let def = build_offsets_mut!(prover_test_loop_self_mutation::expand);
+        let assumes = [
+            Assume::LenEq { a: "offsets", b: "y" },
+            Assume::ElemsBelowLen { arr: "offsets", len_of: "x" },
+        ];
+        match prove_bounds_freedom(&def, OFFSETS_MUT_BUFFERS, &assumes) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("read index") && reason.contains('x'),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!(
+                "expected OutOfSubset (loop pre-scan invalidates the self-mutated array), \
+                 got {other:?}"
+            ),
         }
     }
 }

@@ -44,6 +44,12 @@ fn prove_kernel(
             vericl::StructuredAssume::LenEqConst { a, value } => {
                 vericl_ir::Assume::LenEqConst { a, value }
             }
+            vericl::StructuredAssume::ElemsBelowLen { arr, len_of } => {
+                vericl_ir::Assume::ElemsBelowLen { arr, len_of }
+            }
+            vericl::StructuredAssume::ElemsBelowConst { arr, bound } => {
+                vericl_ir::Assume::ElemsBelowConst { arr, bound }
+            }
         })
         .collect();
     vericl_ir::prove_bounds_freedom(def, &buffers, &assumes)
@@ -139,6 +145,36 @@ fn main() {
             eprintln!(
                 "  !! axpy_off_by_one's bounds check did NOT refute ({other:?}) — this is a \
                  vericl failure"
+            );
+            all_caught = false;
+        }
+    }
+
+    // Array-value-dependent-index defect: an offset table whose declared
+    // element bound (`< 16`) is looser than the data array it indexes
+    // (`x.len() == 8`). The bounds prover models the loaded offset `< 16` and
+    // REFUTES `x[offsets[i]]`, with the fresh element symbol pinned at the
+    // boundary (`elem == x.len()`) in the counterexample — the deterministic
+    // catch for a gather whose offsets can exceed the data array (a differential
+    // run only surfaces it when an offset happens to be drawn >= 8).
+    let gather_oob_def = gather_oob_vericl::kernel_definition();
+    match prove_kernel(
+        &gather_oob_def,
+        gather_oob_vericl::BUFFER_PARAMS,
+        gather_oob_vericl::contract().structured_assumes,
+    ) {
+        vericl_ir::ProveResult::Refuted { obligation, counterexample } => {
+            println!("  [REFUTED] gather_oob: {obligation}");
+            println!("    counterexample (element symbol at the boundary): {counterexample}");
+            println!(
+                "  -> value-dependent-index defect caught (an offset in [8, 16) reads out of \
+                 bounds of the length-8 data array)"
+            );
+        }
+        other => {
+            eprintln!(
+                "  !! gather_oob's bounds check did NOT refute ({other:?}) — this is a vericl \
+                 failure"
             );
             all_caught = false;
         }

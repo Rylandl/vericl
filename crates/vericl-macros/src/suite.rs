@@ -360,6 +360,12 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
                             ::vericl::StructuredAssume::LenEqConst { a, value } => {
                                 ::vericl_ir::Assume::LenEqConst { a, value }
                             }
+                            ::vericl::StructuredAssume::ElemsBelowLen { arr, len_of } => {
+                                ::vericl_ir::Assume::ElemsBelowLen { arr, len_of }
+                            }
+                            ::vericl::StructuredAssume::ElemsBelowConst { arr, bound } => {
+                                ::vericl_ir::Assume::ElemsBelowConst { arr, bound }
+                            }
                         })
                         .collect();
                     match ::vericl_ir::prove_cooperative(&__def, &__buffers, &__assumes, __coop_cd) {
@@ -476,6 +482,12 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
                             ::vericl::StructuredAssume::LenEq { a, b } => ::vericl_ir::Assume::LenEq { a, b },
                             ::vericl::StructuredAssume::LenEqConst { a, value } => {
                                 ::vericl_ir::Assume::LenEqConst { a, value }
+                            }
+                            ::vericl::StructuredAssume::ElemsBelowLen { arr, len_of } => {
+                                ::vericl_ir::Assume::ElemsBelowLen { arr, len_of }
+                            }
+                            ::vericl::StructuredAssume::ElemsBelowConst { arr, bound } => {
+                                ::vericl_ir::Assume::ElemsBelowConst { arr, bound }
                             }
                         })
                         .collect();

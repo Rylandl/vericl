@@ -19,6 +19,12 @@ vericl::suite! {
     kernels: [
         axpy, xorshift_step, mix_u32, fir3, flatten_decode_scale,
         gain_kernel, fir_pair_kernel,
+        // Array-value-dependent indices (offset table / gather) — the last
+        // Tier-2 prover gap (docs/dogfood-2026-07.md). `y[i] = x[offsets[i]]`
+        // carries `tested` (bit-exact differential) + `proved` (3-obligation
+        // SMT bounds), the latter only reachable because the element-range
+        // assume models the loaded offset `< x.len()`.
+        gather_copy,
         // Cooperative (workgroup-shared-memory) reduction — the shared-memory
         // milestone (docs/design-shared-memory.md). Carries the triple: tested
         // (differential, race-freedom dependency cited) + proved smt-oob-freedom

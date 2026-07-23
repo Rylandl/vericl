@@ -440,8 +440,7 @@ caught deterministically.
    on today's one supported backend; not something to rely on in general, and the first concrete
    motivation for this item rather than a purely speculative one. Also: fold cubecl version into
    Identity; upstream conversation with tracel-ai; standalone `vericl check` CLI (README CI story
-   row); array-value-dependent indices (offset tables / gather) via quantified assumes
-   (docs/dogfood-2026-07.md Tier-2 gap #3, still open); a `FLOAT_METHOD_CONST_ONLY` distinction
+   row); a `FLOAT_METHOD_CONST_ONLY` distinction
    if a dogfooded kernel needs a runtime `new`/`from_int`. [The `f64` instantiation tier this line
    previously listed as hypothetical debt is now DONE — see roadmap item 11 below; the production
    codebase validates at f64 on cubecl-cpu, which drove it.]
@@ -1006,3 +1005,54 @@ caught deterministically.
     `VERICL_UPDATE=1` was run LAST and ONLY on the new `conformance_f64` test binary (the sole
     evidence that changed), leaving `vericl.json`/`cooperative_fallback.json` untouched, per the
     staleness-guard lesson.
+
+12. [DONE 2026-07-23] **Array-value-dependent indices (offset tables / gather)** — the last Tier-2
+    prover gap (docs/dogfood-2026-07.md, ≥5 kernels), via element-range `assumes(...)`. All prover
+    work in `crates/vericl-ir/src/prover.rs`; see that file's "Element-range assumptions" +
+    "Write invalidation" module docs for the full soundness argument.
+
+    **New assume forms.** `StructuredAssume::ElemsBelowLen { arr, len_of }` / `ElemsBelowConst {
+    arr, bound }` (mirrored as `vericl_ir::Assume`), parsed from `A.iter().all(|v| (*v as usize) <
+    B.len())` / `… < N` — the LHS normalized through parens/`as _` casts/`*` deref down to exactly
+    the closure binding (so `*v + 1 < N` is correctly NOT recognized), strict `<` only (a `<=`
+    admits `v == bound`, not a valid in-bounds guarantee, so it stays string-only). Unrecognized
+    clauses stay string-only, sound (fewer constraints).
+
+    **Prover encoding.** When an element assume covers global array `A`, a read `A[i]` — its own
+    `0 <= i < A.len()` obligation still emitted and discharged as today — binds its output to a
+    FRESH symbol `v` with `v < bound` (and `0 <= v` iff the element type is unsigned, a sound type
+    fact; a signed element models `v < bound` alone so `0 <= index` stays a real proof). The ONLY
+    case array contents get a model; everything else stays tainted. Gathers `x[offsets[i]]` and
+    nested `a[b[i]]` prove (the fresh symbol flows through modeled arithmetic + is exactly the
+    inner index the next layer needs); a wrong/too-loose bound REFUTES with the `elem…` symbol at
+    the boundary.
+
+    **Write invalidation** (both directions, tested): a write `A[j] = …` invalidates `A`'s assume
+    for every *subsequent* read (`elem_invalidated`, monotonic); a read *before* a write keeps its
+    model. For a loop, a body that writes `A` anywhere invalidates `A` for the whole body *before*
+    the walk (a later iteration's write happens-before an earlier read — the in-order rule alone
+    would be unsound). All conservative (only ever removes a model). Existing kernels are
+    byte-identical (the invalidation set stays empty when no element assume is declared).
+
+    **gen ergonomics.** The element bound doubles as the `gen(...)` range for the index array when
+    it has no explicit `gen(arr in …)` — `Const(n)` draws `[0, n)`, `Len(b)` draws `[0, b.len())`
+    (only when `b` is declared before `arr`, else it falls back to the resample loop's actionable
+    panic). Stated once, in `assumes(...)`.
+
+    **Examples.** `gather_copy` (`y[i] = x[offsets[i]]`, suite-wired: bit-exact differential +
+    3-obligation `smt-oob-freedom` proof); `nested_gather` (`data[inner[outer[i]]]`, prover-only
+    composition control); `gather_oob` (stale const bound `< 16` vs `x.len() == 8`, a `conform`
+    demo-defect that REFUTES with `elem == x.len()`).
+
+    **Private dogfood** (Substrate policy — construct classes only). The offset-table source-anchor
+    shape from a production coherent-accumulate primitive: the pure gather core `source[offsets[i]]`
+    PROVES (3 obligations, no adaptation beyond the assume); the faithful additive anchor
+    `out_idx + offsets[e]` is honestly REFUTED (the element assume bounds the offset but not the
+    sum — a new "implicit host-side buffer-sizing invariant" finding needing a length-*relationship*
+    assume beyond v0, same class as the div/mod and cooperative-store findings). Gen derivation
+    validated (no `gen(offsets in …)` needed).
+
+    **Soundness bar.** Taint over guess; write-invalidation tested both directions; a negative twin
+    per positive; obligation counts for existing suite kernels unchanged; full suite (both feature
+    sets) + clippy (both) + demo-defects green; `VERICL_UPDATE` run LAST (only `gather_copy` added
+    an evidence entry).

@@ -38,7 +38,7 @@ Tier 2 — prover gates (twin + differential fine; proof honestly unavailable):
 |---|---|---|
 | Loop-carried accumulators | 8 | **[implemented, 2026-07]** Refined per this table's own suggestion: carried variables are tainted (not the whole loop rejected), so an accumulator whose index/branch expressions don't touch carried state now proves — see `vericl-ir`'s `process_range_loop`/`loop_carried_accumulator_unused_as_index_proves` |
 | `/`, `%`-derived indices (flat 1-D → row/col decode) | 7 | **[implemented, 2026-07]** Modeled via SMT-LIB `div`/`mod` (Euclidean) behind a solver-discharged nonzero+nonnegative side-obligation — see `vericl-ir`'s `divmod_int` and the public `flatten_decode_scale` example (candidate #1 below) |
-| Array-value-dependent indices (offset tables / gather) | ≥5 | Needs element-range assumptions (e.g. quantified assumes) to be provable — not yet implemented |
+| Array-value-dependent indices (offset tables / gather) | ≥5 | **[implemented, 2026-07]** Element-range `assumes(...)` — `A.iter().all(\|v\| (*v as usize) < B.len())` / `… < N` — let a read `A[i]` produce a value modeled as a fresh symbol bounded by the assume (the ONLY case array contents get a model), so `x[offsets[i]]` and nested `a[b[i]]` gathers prove; a write to `A` invalidates it. See `vericl-ir`'s "Element-range assumptions" + the public `gather_copy` example (candidate #2 below) |
 
 Notable non-findings: zero uses of `Tensor`, `Line`/`Vector`, `Slice`, `plane_*`, or `Atomic`;
 all dispatch is 1-D in-kernel. Earlier roadmap speculation about Tensor/2D support is
@@ -55,7 +55,15 @@ guard. Unreachable today (all users also hit other gates) but now banned explici
    `crates/vericl-examples/src/lib.rs`, wired into `vericl::suite!`; carries both a `tested`
    (differential) and `proved` (2-obligation SMT bounds) claim in `evidence/vericl.json`.
 2. `gather_copy` — `output[i] = input[offsets[i]]` with element-range assumes; pins the
-   value-dependent-index boundary.
+   value-dependent-index boundary. **[implemented, 2026-07]** —
+   `crates/vericl-examples/src/lib.rs`, wired into `vericl::suite!`; carries a `tested`
+   (bit-exact differential — a gather is a pure permutation) and a `proved` (3-obligation SMT
+   bounds) claim. The element bound is stated once: it doubles as the `gen(...)` range for
+   `offsets` (drawn in `[0, x.len())`), so the differential lane exercises satisfying offset
+   tables with no separate `gen(offsets in …)` clause. Its negative twin `gather_oob` (a stale
+   constant bound `< 16` looser than `x.len() == 8`) is `Refuted` with the fresh element symbol
+   pinned at the boundary — a `conform` demo-defect. A `nested_gather` example
+   (`data[inner[outer[i]]]`) pins that element assumes compose across index layers.
 3. `block_sum_reduce` (aspirational) — minimal shared-memory tree reduction; the design target
    for lifting the topology gate.
 
@@ -132,3 +140,32 @@ classes only, per the Substrate policy):
 - **No new wall in the prover.** The div-derived loop bound (`buf.len() / 2`) and the
   complex-interleaved indices (`buf[k*2]`, `buf[k*2+1]`) discharged their bounds through the existing
   div/mod modeling with no changes — the two-thread walk proved the whole real shape in-subset.
+
+## Addendum (element-range / offset-table milestone, July 2026)
+
+The array-value-dependent-index gap was closed with element-range `assumes(...)` (this table's own
+suggestion), and validated against a real offset-table shape from the private workspace (construct
+classes only, per the Substrate policy):
+
+- **Pure offset-table gather PROVES.** A production coherent-accumulate primitive reads a per-emitter
+  source anchor out of a `&Array<u32>` offset table and uses it as a source index. Distilled to its
+  value-dependent-index core — `out[i] = source[base_offsets[i]]`, one lane per output sample, the FIR
+  conv / Doppler phasor / complex gain / emitter runtime-loop all dropped (each a *separately*-named
+  composition or comptime subset gap, none bearing on the index) — it `Proved` in bounds with a single
+  element-range assume (`base_offsets.iter().all(|v| (*v as usize) < source.len())`), 3 obligations, no
+  prover adaptation beyond stating the assume. The value-dependent index the tool refused to reason
+  about now lands on the real shape.
+- **The faithful additive anchor surfaces a new implicit-invariant finding.** The real anchor is not a
+  pure gather but a *sum*, `base_src = out_idx + base_offsets[e]`. The element-range assume bounds the
+  loaded offset (`base_offsets[i] < source.len()`) but says nothing about `out_idx + base_offsets[i]`,
+  so the shape is honestly `Refuted` (counterexample: `out_idx` near `out.len()`, offset near
+  `source.len()`, the sum overruns). In the production kernel that sum stays in bounds only because the
+  resident buffer is host-sized with headroom (`ResidentPipeline`'s `shifted_len` contract) — an
+  implicit caller-side invariant nothing in the kernel declares. Exactly the "boundary behavior can be
+  implicit" class already found on the div/mod flat-index decode and the cooperative single-writer
+  store. The residual: expressing it needs a length *relationship* assume (`out.len() + max_offset <=
+  source.len()`), an inequality/sum shape beyond v0's `LenEq`/`LenEqConst`/element-range recognizer —
+  queued, and the honest `Refuted` (never a false `Proved`) is the correct v0 verdict meanwhile.
+- **Gen ergonomics validated.** Neither distilled kernel needed a `gen(offsets in …)` clause: the
+  element bound derives the offset table's generation range (`[0, source.len())`) automatically, so the
+  differential lane draws satisfying tables from the single `assumes(...)` statement.

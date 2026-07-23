@@ -2038,11 +2038,19 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         .filter(|p| matches!(p.kind, ParamKind::ArrayRef(_) | ParamKind::ArrayMut(_)))
         .map(|p| p.name.to_string())
         .collect();
-    let structured_assumes: Vec<TokenStream2> = spec
+    let recognized_assumes: Vec<RecognizedAssume> = spec
         .assumes
         .iter()
-        .filter_map(|e| structured_assume_tokens(e, &array_param_names))
+        .filter_map(|e| recognize_assume(e, &array_param_names))
         .collect();
+    let structured_assumes: Vec<TokenStream2> =
+        recognized_assumes.iter().map(RecognizedAssume::to_tokens).collect();
+    // Element-range assumes double as a `gen(...)` derivation source: an
+    // integer index array with such an assume and no explicit `gen(arr in ..)`
+    // range is generated within the assumed bound (see `build_gen_field`), so
+    // the author states the bound once (in `assumes`) rather than twice.
+    let elem_gen_bounds: HashMap<String, ElemGenBound> =
+        recognized_assumes.iter().filter_map(RecognizedAssume::elem_gen_bound).collect();
 
     // --- kernel_definition(): builds the CubeCL IR `KernelDefinition` with
     // zero client/runtime/device, per docs/prototypes/ir_extraction.rs and
@@ -2177,6 +2185,7 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             &fn_name_str,
             &plan.comptime_values,
             generic_types,
+            &elem_gen_bounds,
         )?;
         (reference_fn, conformance)
     };
@@ -2903,28 +2912,179 @@ fn expand_reference(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStrea
     })
 }
 
-/// Recognize `A.len() == B.len()` and `A.len() == <int literal>` (either
-/// operand order) among the array parameters named in `array_params`, and
-/// emit the matching `::vericl::StructuredAssume` constructor tokens.
-/// Anything else returns `None` — see the call site's doc comment on why
-/// that's sound rather than a silent loss of soundness.
-fn structured_assume_tokens(expr: &Expr, array_params: &[String]) -> Option<TokenStream2> {
+/// An `assumes(...)` clause the macro recognized as a structured shape (the
+/// mirror of `::vericl::StructuredAssume`, but at macro-expansion time as
+/// `String`s). Kept as a value — rather than emitting tokens directly — so the
+/// same recognition drives both the emitted `StructuredAssume` constructors
+/// *and* the `gen(...)` element-range derivation (`ElemGenBound`).
+enum RecognizedAssume {
+    /// `A.len() == B.len()`.
+    LenEq { a: String, b: String },
+    /// `A.len() == <int literal>`.
+    LenEqConst { a: String, value: u64 },
+    /// `A.iter().all(|v| (*v as usize) < B.len())`.
+    ElemsBelowLen { arr: String, len_of: String },
+    /// `A.iter().all(|v| *v < N)`.
+    ElemsBelowConst { arr: String, bound: u64 },
+}
+
+impl RecognizedAssume {
+    /// The `::vericl::StructuredAssume` constructor tokens.
+    fn to_tokens(&self) -> TokenStream2 {
+        match self {
+            RecognizedAssume::LenEq { a, b } => {
+                quote!(::vericl::StructuredAssume::LenEq { a: #a, b: #b })
+            }
+            RecognizedAssume::LenEqConst { a, value } => {
+                quote!(::vericl::StructuredAssume::LenEqConst { a: #a, value: #value })
+            }
+            RecognizedAssume::ElemsBelowLen { arr, len_of } => {
+                quote!(::vericl::StructuredAssume::ElemsBelowLen { arr: #arr, len_of: #len_of })
+            }
+            RecognizedAssume::ElemsBelowConst { arr, bound } => {
+                quote!(::vericl::StructuredAssume::ElemsBelowConst { arr: #arr, bound: #bound })
+            }
+        }
+    }
+
+    /// If this is an element-range assume, the `(array, derived-gen-bound)` the
+    /// `gen(...)` machinery uses to draw satisfying inputs when the author gave
+    /// no explicit range for that array (see `build_gen_field`).
+    fn elem_gen_bound(&self) -> Option<(String, ElemGenBound)> {
+        match self {
+            RecognizedAssume::ElemsBelowLen { arr, len_of } => {
+                Some((arr.clone(), ElemGenBound::Len(len_of.clone())))
+            }
+            RecognizedAssume::ElemsBelowConst { arr, bound } => {
+                Some((arr.clone(), ElemGenBound::Const(*bound)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Recognize the structured `assumes(...)` shapes over `array_params`: the two
+/// length forms (`A.len() == B.len()`, `A.len() == <int literal>`, either
+/// operand order) and the two element-range forms (`A.iter().all(|v| (*v as
+/// usize) < B.len())` and `A.iter().all(|v| *v < N)`). Anything else returns
+/// `None` — see the call site's doc comment on why that's sound rather than a
+/// silent loss of soundness.
+fn recognize_assume(expr: &Expr, array_params: &[String]) -> Option<RecognizedAssume> {
+    recognize_len_assume(expr, array_params).or_else(|| recognize_elem_assume(expr, array_params))
+}
+
+fn recognize_len_assume(expr: &Expr, array_params: &[String]) -> Option<RecognizedAssume> {
     let Expr::Binary(ExprBinary { left, op: BinOp::Eq(_), right, .. }) = expr else {
         return None;
     };
     let l_len = len_call_target(left, array_params);
     let r_len = len_call_target(right, array_params);
     match (l_len, r_len) {
-        (Some(a), Some(b)) => Some(quote!(::vericl::StructuredAssume::LenEq { a: #a, b: #b })),
-        (Some(a), None) => {
-            let value = int_literal(right)?;
-            Some(quote!(::vericl::StructuredAssume::LenEqConst { a: #a, value: #value }))
-        }
+        (Some(a), Some(b)) => Some(RecognizedAssume::LenEq { a, b }),
+        (Some(a), None) => Some(RecognizedAssume::LenEqConst { a, value: int_literal(right)? }),
         (None, Some(b)) => {
-            let value = int_literal(left)?;
-            Some(quote!(::vericl::StructuredAssume::LenEqConst { a: #b, value: #value }))
+            Some(RecognizedAssume::LenEqConst { a: b, value: int_literal(left)? })
         }
         (None, None) => None,
+    }
+}
+
+/// Recognize `arr.iter().all(|v| LHS < RHS)` where `LHS` is exactly the
+/// closure's single binding (peeling parens, `as _` casts, and `*` deref — the
+/// syntactic variants the task calls out as safe to normalize) and `RHS` is
+/// either `B.len()` (→ `ElemsBelowLen`) or an integer literal (→
+/// `ElemsBelowConst`). Only the *strict* `<` is recognized: a `<=` would admit
+/// `v == bound`, which is not a valid in-bounds guarantee, so it deliberately
+/// stays string-only (sound). Non-negativity of a signed element is NOT assumed
+/// here — the prover derives it from the element type — so the `as usize` cast
+/// is normalized away rather than required.
+fn recognize_elem_assume(expr: &Expr, array_params: &[String]) -> Option<RecognizedAssume> {
+    // arr.iter().all(<closure>)
+    let Expr::MethodCall(all_call) = expr else { return None };
+    if all_call.method != "all" || all_call.args.len() != 1 {
+        return None;
+    }
+    let Expr::MethodCall(iter_call) = all_call.receiver.as_ref() else { return None };
+    if iter_call.method != "iter" || !iter_call.args.is_empty() {
+        return None;
+    }
+    let Expr::Path(ap) = iter_call.receiver.as_ref() else { return None };
+    let arr = ap.path.get_ident()?.to_string();
+    if !array_params.contains(&arr) {
+        return None;
+    }
+    let Expr::Closure(closure) = &all_call.args[0] else { return None };
+    let binding = closure_single_binding(closure)?;
+    // body: LHS < RHS (strict `<` only — soundness).
+    let Expr::Binary(ExprBinary { left, op: BinOp::Lt(_), right, .. }) = peel_paren(&closure.body)
+    else {
+        return None;
+    };
+    if peel_to_ident(left)? != binding {
+        return None;
+    }
+    let rhs = peel_cast_paren(right);
+    if let Some(len_of) = len_call_target(rhs, array_params) {
+        return Some(RecognizedAssume::ElemsBelowLen { arr, len_of });
+    }
+    Some(RecognizedAssume::ElemsBelowConst { arr, bound: int_literal(rhs)? })
+}
+
+/// The single binding ident of a one-argument closure (`|v|`, `|&v|`, `|v:
+/// &u32|`), or `None` for anything more complex.
+fn closure_single_binding(closure: &syn::ExprClosure) -> Option<String> {
+    if closure.inputs.len() != 1 {
+        return None;
+    }
+    pat_binding(&closure.inputs[0])
+}
+
+fn pat_binding(pat: &Pat) -> Option<String> {
+    match pat {
+        Pat::Ident(pi) => Some(pi.ident.to_string()),
+        Pat::Reference(pr) => pat_binding(&pr.pat),
+        Pat::Type(pt) => pat_binding(&pt.pat),
+        _ => None,
+    }
+}
+
+/// Peel `Paren`/`Group` wrappers, returning the innermost expression.
+fn peel_paren(mut e: &Expr) -> &Expr {
+    loop {
+        match e {
+            Expr::Paren(p) => e = &p.expr,
+            Expr::Group(g) => e = &g.expr,
+            _ => return e,
+        }
+    }
+}
+
+/// Peel `Paren`/`Group`/`Cast` wrappers (an element-bound RHS like `x.len() as
+/// usize` normalizes to `x.len()`).
+fn peel_cast_paren(mut e: &Expr) -> &Expr {
+    loop {
+        match e {
+            Expr::Paren(p) => e = &p.expr,
+            Expr::Group(g) => e = &g.expr,
+            Expr::Cast(c) => e = &c.expr,
+            _ => return e,
+        }
+    }
+}
+
+/// If `expr` — after peeling parens/`Group`s, `as _` casts, and a leading `*`
+/// deref — is a bare identifier, that identifier's string. Used to check the
+/// LHS of an element-range comparison is exactly the closure binding (`*v`,
+/// `(*v as usize)`, `v as usize`, `v` all normalize to `v`; `*v + 1` does not,
+/// so an arithmetic index expression is correctly not recognized).
+fn peel_to_ident(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Paren(p) => peel_to_ident(&p.expr),
+        Expr::Group(g) => peel_to_ident(&g.expr),
+        Expr::Cast(c) => peel_to_ident(&c.expr),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => peel_to_ident(&u.expr),
+        Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
+        _ => None,
     }
 }
 
@@ -2978,6 +3138,19 @@ struct GenField {
 type GenRanges = std::collections::HashMap<String, (Expr, Expr)>;
 /// `gen(...)` `len(...)` pins by parameter name.
 type GenLens = std::collections::HashMap<String, Expr>;
+
+/// A `gen(...)` range derived from an element-range `assumes(...)` clause, for
+/// an integer index array that has no explicit `gen(arr in ..)` range (so the
+/// index bound is stated once, in `assumes(...)`, not twice). `Const(n)` draws
+/// elements in `[0, n)`; `Len(b)` draws them in `[0, b.len())`. `Len` requires
+/// the referenced array `b` to be generated first (declared before `arr`);
+/// when it is not — including a self-referential `arr.iter().all(|v| *v <
+/// arr.len())` — the derivation is skipped and `generate_case`'s resample loop
+/// (with its actionable "gen inconsistent with assumes" panic) is the backstop.
+enum ElemGenBound {
+    Const(u64),
+    Len(String),
+}
 
 /// Resolve the `gen(...)` clause into a lookup by parameter name, validating
 /// that every entry names a real parameter (and that `len(...)` only targets
@@ -3103,6 +3276,7 @@ fn build_gen_field(
     ranges: &GenRanges,
     lens: &GenLens,
     fn_name_str: &str,
+    elem_bound: Option<&ElemGenBound>,
 ) -> syn::Result<GenField> {
     let name = p.name.clone();
     let name_str = name.to_string();
@@ -3182,7 +3356,27 @@ fn build_gen_field(
                     }
                 }
             } else {
-                let draw = integer_draw_expr(&quote!(#elem), kind, range);
+                // An explicit `gen(arr in ..)` range always wins; otherwise an
+                // element-range assume derives one (draw within the assumed
+                // index bound), else full-range integers.
+                let draw = match (range, elem_bound) {
+                    (Some(_), _) | (None, None) => integer_draw_expr(&quote!(#elem), kind, range),
+                    (None, Some(ElemGenBound::Const(nbound))) => {
+                        quote! {{
+                            let __n: u64 = #nbound;
+                            if __n == 0 { 0 as #elem }
+                            else { (__vericl_rng.next_u64() % __n) as #elem }
+                        }}
+                    }
+                    (None, Some(ElemGenBound::Len(target))) => {
+                        let target = format_ident!("{}", target);
+                        quote! {{
+                            let __n: u64 = #target.len() as u64;
+                            if __n == 0 { 0 as #elem }
+                            else { (__vericl_rng.next_u64() % __n) as #elem }
+                        }}
+                    }
+                };
                 quote! {
                     let #name: ::std::vec::Vec<#elem> =
                         (0..#len_tokens).map(|_| #draw).collect();
@@ -3208,6 +3402,7 @@ fn build_conformance_items(
     fn_name_str: &str,
     comptime_values: &HashMap<String, TokenStream2>,
     generic_types: &[Type],
+    elem_gen_bounds: &HashMap<String, ElemGenBound>,
 ) -> syn::Result<TokenStream2> {
     let (ranges, lens) = resolve_gen_entries(params, gen_entries, fn_name_str)?;
     // #[comptime] params are pinned by instantiate(...), not generated —
@@ -3215,10 +3410,27 @@ fn build_conformance_items(
     // mentions them. They still get a `conformance_case`/`kernel_definition`
     // argument at their declared position — see the full-`params` pass
     // below (`launch_args`), separate from this Gen-only `fields` list.
+    //
+    // Element-range assumes derive a `gen(...)` range when the array has no
+    // explicit one. For the `Len(b)` form the draw references `b.len()`, which
+    // only exists once `b`'s own `let b = …;` has run — so it is applied only
+    // when `b` is declared *before* this array (tracked by `generated_so_far`);
+    // otherwise it is dropped and the resample loop's actionable panic catches
+    // an impossible pairing. `Const(n)` has no such dependency.
+    let mut generated_so_far: HashSet<String> = HashSet::new();
     let fields: Vec<GenField> = params
         .iter()
         .filter(|p| !matches!(p.kind, ParamKind::Comptime(_)))
-        .map(|p| build_gen_field(p, &ranges, &lens, fn_name_str))
+        .map(|p| {
+            let name = p.name.to_string();
+            let elem_bound = elem_gen_bounds.get(&name).filter(|b| match b {
+                ElemGenBound::Const(_) => true,
+                ElemGenBound::Len(target) => generated_so_far.contains(target),
+            });
+            let field = build_gen_field(p, &ranges, &lens, fn_name_str, elem_bound);
+            generated_so_far.insert(name);
+            field
+        })
         .collect::<syn::Result<_>>()?;
 
     let gen_stmts: Vec<&TokenStream2> = fields.iter().map(|f| &f.stmt).collect();

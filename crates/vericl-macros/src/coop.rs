@@ -855,14 +855,14 @@ pub(crate) fn build_conformance_items(
         field_names.push(name.clone());
         match &p.kind {
             ParamKind::Scalar(ty) => {
-                let field = build_gen_field(p, &ranges, &lens, fn_name_str)?;
+                let field = build_gen_field(p, &ranges, &lens, fn_name_str, None)?;
                 let stmt = &field.stmt;
                 draw_stmts.push(quote! { #stmt });
                 owned_tys.push(quote!(#ty));
                 check_args.push(quote!(#name));
             }
             ParamKind::ArrayRef(elem) => {
-                let field = build_gen_field(p, &ranges, &lens, fn_name_str)?;
+                let field = build_gen_field(p, &ranges, &lens, fn_name_str, None)?;
                 let stmt = &field.stmt;
                 draw_stmts.push(quote! { #stmt });
                 owned_tys.push(quote!(::std::vec::Vec<#elem>));

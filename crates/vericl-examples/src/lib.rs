@@ -238,6 +238,99 @@ pub fn flatten_decode_scale(x: &Array<f32>, y: &mut Array<f32>, width: u32, scal
 }
 
 // ---------------------------------------------------------------------------
+// Array-value-dependent indices (offset tables / gather) — the last Tier-2
+// prover gap (docs/dogfood-2026-07.md, ≥5 kernels). A read of an *offset* array
+// produces a value the checker cannot know, so it is normally tainted and any
+// `x[offsets[i]]` index is `OutOfSubset`. An element-range `assumes(...)` clause
+// — `offsets.iter().all(|v| (*v as usize) < x.len())` — lets that read be
+// modeled as a fresh symbol bounded by the assumption, so the gather's inner
+// index obligation discharges (see `crates/vericl-ir/src/prover.rs`'s
+// "Element-range assumptions"). The bound is stated once: it doubles as the
+// `gen(...)` range for `offsets`, so the differential lane draws satisfying
+// offset tables with no separate `gen(offsets in ..)` clause.
+// ---------------------------------------------------------------------------
+
+/// Gather: `y[i] = x[offsets[i]]` — the milestone's headline
+/// (docs/dogfood-2026-07.md candidate #2), pinning the array-value-dependent
+/// index boundary with a publicly-committable example. The element-range assume
+/// `offsets.iter().all(|v| (*v as usize) < x.len())` is what makes the inner
+/// `x[offsets[i]]` read provable: without it the loaded offset is opaque and the
+/// index is `OutOfSubset`. `offsets.len() == y.len()` covers the *outer*
+/// `offsets[i]` read under the `ABSOLUTE_POS < y.len()` guard. The comparison is
+/// bit-exact (`max_ulp = 0`): a gather is a pure memory permutation, no
+/// arithmetic to contract. `offsets` needs no `gen(...)` range — it is derived
+/// from the element assume (drawn in `[0, x.len())`), so the whole differential
+/// lane exercises in-bounds offset tables automatically. Wired into
+/// `vericl::suite!` — carries `tested` (differential) + `proved` (3-obligation
+/// SMT bounds) claims. See `gather_copy_kernel_definition_is_provably_in_bounds`.
+#[vericl::kernel(
+    assumes(
+        offsets.len() == y.len(),
+        offsets.iter().all(|v| (*v as usize) < x.len()),
+    ),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn gather_copy(x: &Array<f32>, offsets: &Array<u32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = x[offsets[ABSOLUTE_POS] as usize];
+    }
+}
+
+/// Nested / two-level gather: `y[i] = data[inner[outer[i]]]`. Pins that element
+/// assumes *compose* — the fresh symbol `outer[i]` yields (bounded `< inner`) is
+/// exactly the index `inner[·]` needs, whose own fresh symbol (bounded `<
+/// data`) is what `data[·]` needs — with no special casing in the prover.
+/// Prover-only control (like `tap_pair_guarded_kernel`), not suite-wired; see
+/// `nested_gather_kernel_definition_is_provably_in_bounds`.
+#[vericl::kernel(
+    assumes(
+        outer.len() == y.len(),
+        outer.iter().all(|v| (*v as usize) < inner.len()),
+        inner.iter().all(|v| (*v as usize) < data.len()),
+    ),
+    compare(max_ulp = 0),
+    gen(data in -10.0..=10.0, y in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn nested_gather(
+    data: &Array<f32>,
+    inner: &Array<u32>,
+    outer: &Array<u32>,
+    y: &mut Array<f32>,
+) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = data[inner[outer[ABSOLUTE_POS] as usize] as usize];
+    }
+}
+
+/// DEFECTIVE (bounds): the declared element bound is a stale constant (`< 16`)
+/// looser than the data array it indexes (`x.len() == 8`), so an offset in
+/// `[8, 16)` reads out of bounds. The bounds prover models the offset value
+/// `< 16` and *refutes* the `x[offsets[i]]` obligation with the fresh element
+/// symbol pinned at the boundary (`elem == x.len()`). This is the
+/// value-dependent-index defect the demo catches deterministically by proof
+/// (unlike a differential run, where the OOB surfaces only for offsets that
+/// happen to be drawn `>= 8`); it belongs to the `conform` binary's
+/// demo-defects mode, not the honest suite.
+#[vericl::kernel(
+    assumes(
+        offsets.len() == y.len(),
+        x.len() == 8,
+        offsets.iter().all(|v| (*v as usize) < 16),
+    ),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, len(x = 8))
+)]
+#[cube(launch)]
+pub fn gather_oob(x: &Array<f32>, offsets: &Array<u32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = x[offsets[ABSOLUTE_POS] as usize];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Kernel composition: #[vericl::helper] + uses(...) — the milestone this
 // section demonstrates (docs/dogfood-2026-07.md Tier-1 gap #2, blocking
 // 16/22 dogfooded kernels). See README "Kernel composition" for the design.
@@ -1225,6 +1318,104 @@ mod tests {
             // x[pos] read, y[row*width+col] write.
             vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
             other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Array-value-dependent indices (offset tables / gather).
+    // -----------------------------------------------------------------
+
+    /// Both element-range assume shapes are recognized: the outer-read length
+    /// tie AND the `offsets[·] < x.len()` element bound (the new
+    /// `ElemsBelowLen`).
+    #[test]
+    fn gather_copy_structured_assumes() {
+        assert_eq!(
+            gather_copy_vericl::contract().structured_assumes,
+            &[
+                vericl::StructuredAssume::LenEq { a: "offsets", b: "y" },
+                vericl::StructuredAssume::ElemsBelowLen { arr: "offsets", len_of: "x" },
+            ]
+        );
+    }
+
+    /// The derived sequential twin performs the gather its body says — guards
+    /// the twin derivation for the value-dependent-index shape.
+    #[test]
+    fn gather_copy_twin_matches_hand_computed() {
+        let x = vec![10.0f32, 20.0, 30.0, 40.0];
+        let offsets = vec![3u32, 1, 0, 2];
+        let mut y = vec![0.0f32; 4];
+        gather_copy_vericl::reference(&x, &offsets, &mut y, 4);
+        assert_eq!(y, vec![40.0, 20.0, 10.0, 30.0]);
+    }
+
+    /// The milestone's headline: `y[i] = x[offsets[i]]` proves in bounds only
+    /// because `offsets[i]`'s value is modeled `< x.len()` by the element-range
+    /// assume — the value-dependent index the checker never used to reach.
+    #[test]
+    fn gather_copy_kernel_definition_is_provably_in_bounds() {
+        let def = gather_copy_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = gather_copy_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [
+            vericl_ir::Assume::LenEq { a: "offsets", b: "y" },
+            vericl_ir::Assume::ElemsBelowLen { arr: "offsets", len_of: "x" },
+        ];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            // offsets[pos] read, x[elem] read, y[pos] write.
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    /// Element assumes compose: `data[inner[outer[i]]]` proves with an assume
+    /// on each index layer, no special casing.
+    #[test]
+    fn nested_gather_kernel_definition_is_provably_in_bounds() {
+        let def = nested_gather_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = nested_gather_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [
+            vericl_ir::Assume::LenEq { a: "outer", b: "y" },
+            vericl_ir::Assume::ElemsBelowLen { arr: "outer", len_of: "inner" },
+            vericl_ir::Assume::ElemsBelowLen { arr: "inner", len_of: "data" },
+        ];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            // outer[pos], inner[elem], data[elem] reads + y[pos] write.
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 4),
+            other => panic!("expected Proved (nested gather composes), got {other:?}"),
+        }
+    }
+
+    /// The defect twin: a stale constant bound (`< 16`) looser than `x.len() ==
+    /// 8` — the prover models the offset `< 16` and refutes `x[offsets[i]]`,
+    /// with the element symbol at the boundary in the counterexample.
+    #[test]
+    fn gather_oob_kernel_definition_refutes_with_element_symbol() {
+        let def = gather_oob_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = gather_oob_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [
+            vericl_ir::Assume::LenEq { a: "offsets", b: "y" },
+            vericl_ir::Assume::LenEqConst { a: "x", value: 8 },
+            vericl_ir::Assume::ElemsBelowConst { arr: "offsets", bound: 16 },
+        ];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Refuted { obligation, counterexample } => {
+                assert!(obligation.contains('x'), "unexpected obligation: {obligation}");
+                assert!(
+                    counterexample.contains("elem"),
+                    "counterexample should exhibit the element symbol: {counterexample}"
+                );
+            }
+            other => panic!("expected Refuted (offset overruns x), got {other:?}"),
         }
     }
 

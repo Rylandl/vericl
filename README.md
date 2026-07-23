@@ -402,6 +402,23 @@ drift. `axpy_off_by_one` REFUTES with a counterexample exhibiting the out-of-bou
 `sum_racy`'s bounds PROVE even though its differential check correctly fails — the race is a
 distinct, differential finding, never conflated with the bounds claim.
 
+**Array-value-dependent indices (offset tables / gather).** The prover recognizes two *element-range*
+`assumes(...)` shapes over an integer index array, in addition to the length shapes (`A.len() ==
+B.len()`, `A.len() == N`): `A.iter().all(|v| (*v as usize) < B.len())` and `A.iter().all(|v| *v < N)`
+(with/without the deref and `usize` cast normalized; only the strict `<` — a `<=` is not a valid
+in-bounds guarantee and stays string-only). Under such an assume, a read `A[i]` — whose *own* index
+obligation still has to discharge — produces a value modeled as a fresh symbol bounded by the assume,
+instead of the usual taint. This is the **only** case array *contents* get a model, and it is what
+lets a gather `y[i] = x[offsets[i]]` prove in bounds (`gather_copy`, wired into the suite: bit-exact
+differential + a 3-obligation `smt-oob-freedom` proof), with nested gathers `a[b[i]]` composing
+automatically. It stays sound the same way a length assume does — the proof is conditional on an
+assumed claim that the executable `check_assumes` predicate tests at generation time (so the
+differential lane only runs offset tables satisfying it, and the bound doubles as `offsets`' `gen(...)`
+range, stated once). A write to `A`'s elements invalidates the assumption for every subsequent read of
+`A` (including across loop iterations), and a *wrong* (too-loose) bound does not hide a bug: `gather_oob`
+(a stale constant bound looser than the indexed array) REFUTES with the fresh element symbol pinned at
+the boundary.
+
 The second proved claim is **data-race freedom** (`smt-race-freedom`), for the cooperative
 shared-memory kernels. It is discharged by a GPUVerify-style two-thread symbolic reduction: two
 arbitrary distinct threads `t1 ≠ t2` of one cube are walked, and within each barrier-delimited phase
