@@ -15,6 +15,7 @@
 pub mod compare;
 pub mod contract;
 pub mod evidence;
+pub mod host_shims;
 pub mod panic;
 pub mod rng;
 pub mod shared;

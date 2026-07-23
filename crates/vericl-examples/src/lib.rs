@@ -1118,6 +1118,146 @@ pub fn block_sum_reduce_declared(input: &Array<f32>, output: &mut Array<f32>) {
     }
 }
 
+// ===========================================================================
+// Quick-wins batch 2 (macro-leaning): verified host shims (cast_from / mul_hi),
+// helper-level `wrapping`, and comptime! block evaluation.
+// ===========================================================================
+
+// --- Feature 1: verified cast_from / mul_hi host shims --------------------
+//
+// `Cast::cast_from` / `Numeric::mul_hi` are `unexpanded!()` on host, so a twin
+// cannot call them directly. `#[vericl::kernel]`/`#[vericl::helper]` rewrite a
+// recognized call to a GPU-verified `::vericl::host_shims::` shim, pinned
+// bit-exactly against the real intrinsic on wgpu in
+// `tests/host_shim_gpu_ground_truth.rs`.
+
+/// A `u32` → `f32` unit-interval `[0, 1)` converter — the reusable heart of a
+/// GPU RNG's float output (Lemire's upper-24-bits technique,
+/// <https://lemire.me/blog/2017/02/28/how-many-floating-point-numbers-are-in-the-interval-01/>;
+/// the same shape cubek-random's `to_unit_interval_closed_open` uses). Its
+/// `f32::cast_from(shifted)` is exactly what used to be `FLOAT_METHOD_REJECT`ed;
+/// now it rewrites to the verified `cast_to_f32` shim. Both the u32→f32 cast
+/// (round-to-nearest-even) and the divide by 2^24 (an exact power-of-two scale)
+/// are bit-exact on GPU and host, so the composing kernel compares at 0 ULP.
+#[vericl::helper]
+#[cube]
+pub fn to_unit_interval(int_random: u32) -> f32 {
+    let shifted = int_random >> 8u32; // keep the upper 24 bits
+    f32::cast_from(shifted) / 16777216.0 // / 2^24
+}
+
+/// FLAGSHIP (Feature 1): the u32-RNG-output → unit-interval-f32 kernel that
+/// completes the RNG story end-to-end — a `u32` stream in, a `[0, 1)` `f32`
+/// stream out, via the verified `cast_from` shim inside a composed helper.
+/// Bit-exact (`max_ulp = 0`) against the GPU, bounds `Proved`.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(y in 0.0..=0.0),
+    uses(to_unit_interval)
+)]
+#[cube(launch)]
+pub fn unit_interval_map(x: &Array<u32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = to_unit_interval(x[ABSOLUTE_POS]);
+    }
+}
+
+/// Feature 1 (`mul_hi`): the high 32 bits of the full-width `u32` product — the
+/// core of a fixed-point / fast-division multiply (cubecl-std's `FastDivmod`
+/// uses `mul_hi`). `a.mul_hi(b)` rewrites to the verified `mul_hi` shim
+/// (`(a·b) >> 32`); the result is exact `u32`, so `compare(exact)`, bounds
+/// `Proved` (the high word is not used as an index).
+#[vericl::kernel(
+    assumes(a.len() == b.len(), a.len() == y.len()),
+    compare(exact)
+)]
+#[cube(launch)]
+pub fn mul_hi_map(a: &Array<u32>, b: &Array<u32>, y: &mut Array<u32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = a[ABSOLUTE_POS].mul_hi(b[ABSOLUTE_POS]);
+    }
+}
+
+// --- Feature 2: helper-level `wrapping` -----------------------------------
+//
+// `#[vericl::helper(wrapping)]` applies the same `WrappingFold` a kernel's
+// `wrapping` clause applies, to the helper twin's own body (integer-only gate).
+// Interaction rule (each item governs ONLY its own body; integers cross the
+// boundary as plain integers): a NON-wrapping kernel may freely use a wrapping
+// helper — the flagship below.
+
+/// A linear-congruential-generator step, `z*a + b` (Numerical Recipes
+/// constants) — wrap-on-overflow by intent, matching WGSL. As a
+/// `#[vericl::helper(wrapping)]` its twin's `z*a + b` folds to
+/// `z.wrapping_mul(a).wrapping_add(b)`; without `wrapping` the checked twin
+/// would panic on overflow (the negative control below).
+#[vericl::helper(wrapping)]
+#[cube]
+pub fn lcg_step(z: u32) -> u32 {
+    let a = 1664525u32;
+    let b = 1013904223u32;
+    z * a + b
+}
+
+/// FLAGSHIP (Feature 2): a NON-wrapping kernel composing the WRAPPING `lcg_step`
+/// helper. The kernel body has no arithmetic of its own (checked semantics are
+/// fine for it); the helper wraps internally, matching the GPU. Exact `u32`
+/// compare, bounds `Proved`. This is the interaction rule in action — the
+/// helper declares its own wrap semantics and integers cross the call boundary
+/// as plain values, so no `wrapping` clause is needed (or allowed) on the
+/// kernel.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(exact),
+    uses(lcg_step)
+)]
+#[cube(launch)]
+pub fn lcg_map(x: &Array<u32>, y: &mut Array<u32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = lcg_step(x[ABSOLUTE_POS]);
+    }
+}
+
+/// NEGATIVE CONTROL (Feature 2 interaction rule, the other half): the SAME LCG
+/// body WITHOUT the `wrapping` clause. Its twin computes CHECKED `z*a + b`, so a
+/// `wrapping` kernel that composed it would get a loud overflow panic in the
+/// twin instead of the GPU's wrap — the round-3 behavior kept by design (each
+/// item governs only its own body; a non-wrapping helper's checked arithmetic
+/// panics rather than silently diverging). Not suite-wired; pinned by
+/// `nonwrapping_helper_twin_panics_on_overflow` below. The faithful path is the
+/// `wrapping` clause (`lcg_step` above).
+#[vericl::helper]
+#[cube]
+pub fn lcg_step_checked(z: u32) -> u32 {
+    z * 1664525u32 + 1013904223u32
+}
+
+// --- Feature 3: comptime! block evaluation --------------------------------
+//
+// A `comptime! { EXPR }` block whose expression references only #[comptime]
+// parameters (concrete under instantiate) + literals is evaluated at expansion
+// by stripping the wrapper to `EXPR` (host Rust the twin re-runs identically);
+// a block referencing a runtime value is rejected by name.
+
+/// Feature 3: a right-shift whose amount is derived in a `comptime!` block from
+/// the `#[comptime] extra` parameter (`shift = extra + 2`, pinned to 3). The
+/// block is evaluated at expansion — `extra` is compile-time-known — so the
+/// twin re-emits `(extra + 2)` over its `let extra = 1;` const. Exact `u32`
+/// compare, bounds `Proved`.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(exact),
+    instantiate(extra = 1)
+)]
+#[cube(launch)]
+pub fn comptime_shift(x: &Array<u32>, y: &mut Array<u32>, #[comptime] extra: u32) {
+    if ABSOLUTE_POS < y.len() {
+        let shift = comptime!(extra + 2u32);
+        y[ABSOLUTE_POS] = x[ABSOLUTE_POS] >> shift;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2606,5 +2746,105 @@ mod tests {
             block_sum_reduce_vericl::identity().source_hash,
             block_sum_reduce_vericl::SOURCE_HASH,
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Quick-wins batch 2: twin-derivation guards for the new example kernels.
+    // Each pins the macro-derived twin (which now routes cast_from/mul_hi
+    // through host shims, wraps a helper's body, or strips a comptime! block)
+    // against independently hand-written scalar code.
+    // ---------------------------------------------------------------------
+
+    /// Feature 1: the `cast_from` shim path. The `to_unit_interval` helper twin
+    /// must compute `(int_random >> 8) as f32 / 2^24` exactly — the same value
+    /// the verified `cast_from_u32_f32` shim + exact power-of-two divide give.
+    #[test]
+    fn to_unit_interval_twin_matches_hand_computed() {
+        for &v in &[0u32, 1, 255, 256, 0x00FF_FFFF, 0x0100_0000, 0xFFFF_FFFF, 0xDEAD_BEEF] {
+            let got = to_unit_interval_vericl_ref(v);
+            let want = ((v >> 8) as f32) / 16_777_216.0;
+            assert_eq!(got.to_bits(), want.to_bits(), "int_random={v}");
+            assert!((0.0..1.0).contains(&got), "out of [0,1): {got}");
+        }
+    }
+
+    /// Feature 1: the flagship kernel twin routes through the helper and honors
+    /// the guard (threads past `y.len()` write nothing).
+    #[test]
+    fn unit_interval_map_twin_matches_and_respects_guard() {
+        let x: Vec<u32> = vec![0, 0x0100_0000, 0xFFFF_FFFF, 42];
+        let mut y = vec![-1.0f32; x.len()];
+        unit_interval_map_vericl::reference(&x, &mut y, 256); // threads >> len
+        for (i, &v) in x.iter().enumerate() {
+            assert_eq!(y[i].to_bits(), (((v >> 8) as f32) / 16_777_216.0).to_bits());
+        }
+    }
+
+    /// Feature 1: the `mul_hi` shim path — the twin computes the high word of
+    /// the full-width u32 product, `(a*b) >> 32`.
+    #[test]
+    fn mul_hi_map_twin_matches_hand_computed() {
+        let a: Vec<u32> = vec![0, u32::MAX, 0x8000_0000, 65536, 0x1234_5678];
+        let b: Vec<u32> = vec![u32::MAX, u32::MAX, 2, 65536, 0x9ABC_DEF0];
+        let mut y = vec![0u32; a.len()];
+        mul_hi_map_vericl::reference(&a, &b, &mut y, a.len());
+        for i in 0..a.len() {
+            let want = (((a[i] as u64) * (b[i] as u64)) >> 32) as u32;
+            assert_eq!(y[i], want, "a={} b={}", a[i], b[i]);
+        }
+    }
+
+    /// Feature 2: the WRAPPING `lcg_step` helper twin folds `z*a + b` to
+    /// wrap-on-overflow — matching WGSL. The hand-written reference uses
+    /// `wrapping_*` explicitly; a checked twin would panic on these inputs.
+    #[test]
+    fn lcg_step_twin_wraps_on_overflow() {
+        for &z in &[0u32, 1, 0xFFFF_FFFF, 0x1234_5678, u32::MAX / 2] {
+            let got = lcg_step_vericl_ref(z);
+            let want = z.wrapping_mul(1664525).wrapping_add(1013904223);
+            assert_eq!(got, want, "z={z}");
+        }
+    }
+
+    /// Feature 2: the NON-wrapping kernel composing the wrapping helper — the
+    /// interaction rule. The kernel twin calls the helper twin (which wraps);
+    /// the result matches the fully-wrapping hand computation, and no overflow
+    /// panic occurs despite the kernel itself being non-wrapping.
+    #[test]
+    fn lcg_map_twin_matches_hand_computed() {
+        let x: Vec<u32> = vec![0, 1, 0xFFFF_FFFF, 0xDEAD_BEEF, u32::MAX];
+        let mut y = vec![0u32; x.len()];
+        lcg_map_vericl::reference(&x, &mut y, x.len());
+        for (i, &z) in x.iter().enumerate() {
+            assert_eq!(y[i], z.wrapping_mul(1664525).wrapping_add(1013904223), "z={z}");
+        }
+    }
+
+    /// Feature 2 interaction rule (the loud half): a NON-wrapping helper's twin
+    /// computes CHECKED arithmetic, so it panics on overflow rather than
+    /// silently diverging from the GPU (which wraps). This is why a wrapping
+    /// kernel composing a non-wrapping helper gets a loud signal, kept per
+    /// round-3. `lcg_step`'s WRAPPING twin, by contrast, never panics
+    /// (`lcg_step_twin_wraps_on_overflow`).
+    #[test]
+    fn nonwrapping_helper_twin_panics_on_overflow() {
+        // z * 1664525 overflows u32 for large z; the checked twin panics.
+        let panicked = std::panic::catch_unwind(|| lcg_step_checked_vericl_ref(u32::MAX)).is_err();
+        assert!(panicked, "a non-wrapping helper twin must panic (not wrap) on overflow");
+        // The wrapping sibling on the same input does NOT panic — it wraps.
+        let wrapped = lcg_step_vericl_ref(u32::MAX);
+        assert_eq!(wrapped, u32::MAX.wrapping_mul(1664525).wrapping_add(1013904223));
+    }
+
+    /// Feature 3: the `comptime!` block is evaluated at expansion — the twin
+    /// shifts by `extra + 2` with `extra` pinned to 1, i.e. `>> 3`.
+    #[test]
+    fn comptime_shift_twin_evaluates_comptime_block() {
+        let x: Vec<u32> = vec![0, 8, 0xFFFF_FFFF, 1024, 0x1234_5678];
+        let mut y = vec![0u32; x.len()];
+        comptime_shift_vericl::reference(&x, &mut y, x.len());
+        for (i, &v) in x.iter().enumerate() {
+            assert_eq!(y[i], v >> 3, "x={v}"); // extra(1) + 2 == 3
+        }
     }
 }

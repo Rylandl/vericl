@@ -274,3 +274,15 @@ tracel-ai's kernels".
   (writes evidence, both lanes), then `cargo test --features cpu --test conformance` (verifies).
 - Negative controls: `cargo run --bin negatives` (exit 0 = all defects caught).
 - Gate map: `python3 classify.py`.
+
+---
+
+**Update (2026-07-23, post-survey):** §3a residuals 2 and 3 are closed. Quick-wins batch 2
+added verified `cast_from`/`mul_hi` host shims (GPU-ground-truth-verified bit-exact on both
+wgpu/Metal and cubecl-cpu — u32/i32→f32 is round-to-nearest-even everywhere, matching Rust
+`as f32`; no backend divergence) and helper-level `wrapping`. Re-validated against the
+verbatim cubek shapes in the survey workspace: `combined_taus_lcg` recomposed with
+`lcg_step` as a wrapping helper (Proved{5}, bit-exact both lanes) and
+`to_unit_interval_closed_open` with its verbatim `f32::cast_from` body (0-ULP, Proved{2}).
+The dominant remaining ecosystem gaps are unchanged: Line/Vector, View/Slice, and
+struct-typed comptime params (the majority shape among the 120 comptime! incidences).

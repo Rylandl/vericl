@@ -1439,3 +1439,111 @@ rationale: cost, capability reduction, and no authoritative CubeCL spec to ancho
 Quick-wins batch 1 (prover-leaning): match/Switch modeling; length-relationship assumes.
 Quick-wins batch 2 (macro-leaning): verified cast_from/mul_hi host shims; helper-level
 wrapping; comptime! block evaluation under instantiate. Review round 7 after both.
+
+## Quick-wins batch 2 (macro-leaning) — DONE 2026-07-23
+
+Three features at the seven-round soundness standard, motivated by
+`docs/ecosystem-survey-2026-07.md` (§3a residuals + §4 recommendation #3). Round-7 review
+attacks batches 1+2 together.
+
+**Feature 1 — verified `cast_from` / `mul_hi` host shims.** New `crates/vericl/src/host_shims.rs`
+(vericl core, no cubecl dep). `Cast::cast_from`/`Numeric::mul_hi` are `unexpanded!()` on host
+(they panic — the reason they were `FLOAT_METHOD_REJECT`ed, blocking 82 surveyed kernels incl.
+cubek-random's u32→f32 converters). A new `ShimRewriteFold` (runs in both the kernel and helper
+twin pipelines, BEFORE `FloatMethodCheck`) rewrites recognized intrinsic CALLS to GPU-verified
+shims: `f32::cast_from(x)` → `::vericl::host_shims::cast_to_f32(x)` (source type resolved by Rust
+trait dispatch, `CastToF32` impl'd for u32/i32/f32-identity — the surveyed set; an unsupported
+source is a `CastToF32: not satisfied` compile error in the twin, loud); `T::mul_hi(a,b)` and
+`a.mul_hi(b)` → `::vericl::host_shims::mul_hi(a,b)` (`MulHi` trait, u32 only). An UNRECOGNIZED
+`cast_from` (non-f32 target, e.g. `u32::cast_from` / `f64::cast_from`, or a qualified-self path) is
+left unrewritten and still rejected BY NAME by `FloatMethodCheck` (which now skips only
+`vericl`-rooted paths so the shim's own `mul_hi` last-segment isn't self-rejected). A bare
+single-segment `mul_hi(a,b)` is left alone (it cannot be the intrinsic — always `T::mul_hi`/
+`x.mul_hi`), so a `uses(...)` helper named `mul_hi` is not hijacked.
+  **Shim set (scoped to survey demand):** `cast_from_u32_f32`, `cast_from_i32_f32`,
+  `cast_from_f32_f32` (identity), `mul_hi_u32`. Reject everything else (by name for wrong cast
+  target; by trait-bound error for unsupported source/operand type).
+  **GPU ground truth (the load-bearing verification — GPU-defined semantics, verified against GPU
+  not std).** `crates/vericl-examples/tests/host_shim_gpu_ground_truth.rs` runs the REAL intrinsic
+  in real `#[cube]` kernels and asserts the shim matches bit-for-bit across boundary + random
+  inputs (u32/i32 incl. the >2^24 rounding-sensitive range; mul_hi full range). **FINDING /
+  result: on wgpu/Metal AND cubecl-cpu, `cast_from` u32→f32 and i32→f32 match Rust `x as f32`
+  bit-for-bit (both round-to-nearest-even), and `mul_hi` u32 matches `((a as u64)*(b as u64))>>32`
+  bit-for-bit — NO divergence between backends, and none from `as f32`.** (So the "verify, don't
+  assume the rounding mode" concern resolved to agreement; documented in the shim module + test.)
+  **Prover:** unchanged — cast_from produces a float (tainted anyway) and mul_hi's high word taints
+  via the existing `Arithmetic` catch-all (`_ => None`, prover.rs); neither feeds an index in the
+  examples, so bounds still `Proved` (taint is fine v1, documented).
+  **Flagship example:** `unit_interval_map` (`crates/vericl-examples/src/lib.rs`) — the u32-RNG →
+  unit-interval-f32 kernel `y[i] = cast_from(x[i] >> 8) / 2^24` via a composed `to_unit_interval`
+  helper (Lemire's technique / cubek `to_unit_interval_closed_open` shape), bit-exact (max_ulp=0),
+  `Proved{2}`. Plus `mul_hi_map` (exact u32, `Proved{3}`).
+
+**Feature 2 — helper-level `wrapping`.** `#[vericl::helper(wrapping, ...)]` now accepted (was
+rejected). `WrappingFold` applied to the helper twin body under the same integer-only gate as
+kernels (every value param + the RETURN type must be u32/i32/u64/i64; the untyped fold must not
+touch float math — a float param/return is rejected). **Interaction rule decided + documented +
+tested (ergonomics-first): each item's `wrapping` governs ONLY its own body; integers cross the
+helper boundary as plain values.** So (a) a NON-wrapping kernel freely uses a wrapping helper — the
+flagship `lcg_map` (`y[i] = lcg_step(x[i])`, non-wrapping kernel, `#[vericl::helper(wrapping)]
+lcg_step` = `z*a+b`); and (b) a wrapping kernel using a non-wrapping helper gets the helper's
+CHECKED arithmetic, which panics loudly on overflow — the round-3 behavior KEPT (not forced
+clause-matching, which would wrongly reject `taus_step`-style shift/xor helpers that never
+overflow). Both halves pinned: `lcg_step_twin_wraps_on_overflow` (wrapping helper never panics) +
+`nonwrapping_helper_twin_panics_on_overflow` (the `lcg_step_checked` negative-control helper's
+twin panics on overflow, vs its wrapping sibling wrapping cleanly).
+
+**Feature 3 — `comptime! { EXPR }` block evaluation.** Was blanket-banned (`comptime` ∈
+`BANNED_IDENTS`). New token-level pre-pass `rewrite_comptime_blocks` (runs before `transform_body`
+in kernel + helper) strips `comptime! { EXPR }` → `(EXPR)`/`{EXPR}` (host Rust the twin re-runs —
+exactly what cube does at expansion) IFF every bare value identifier EXPR references is a
+`#[comptime]` parameter (concrete under instantiate) or a literal; multi-segment paths / method
+names / field accessors are not runtime values and are allowed. Rejected BY NAME otherwise: a
+reference to a runtime scalar/array/local (names it), or a nested macro invocation (opaque tokens
+can't be validated — e.g. `comptime!(assert!(...))` rejected). A leftover bare `comptime` ident
+still hits the `BANNED_IDENTS` ban. Example: `comptime_shift` (`shift = comptime!(extra + 2)`,
+`extra` pinned via `instantiate(extra = 1)`), exact u32, `Proved{2}`.
+  **Coverage (honest):** UNLOCKS comptime! blocks that are pure host arithmetic/logic over scalar
+  `#[comptime]` params + literals — the shape vericl's subset can actually have (surveyed real uses
+  like `comptime!(layout.num_rows * layout.num_cols)` on scalar comptime, `comptime!(extra+1)`,
+  `comptime!(a.min(b))`). REMAINS REJECTED (correctly, out of subset): comptime! over custom
+  CubeType struct params (`comptime!(t.config.tile_size.m())` — the dominant real shape, but needs
+  struct comptime params vericl doesn't support), nested macros, and any runtime-value reference.
+  Of the survey's 120 comptime!-block incidences, essentially all are struct-typed (matmul/reduce
+  tile config) so remain gated on the unrelated CubeType gap; the scalar-comptime shape this
+  unlocks is the one vericl kernels can express.
+
+**Ecosystem validation (verbatim cubek shapes, `/Users/ryland/code/vericl-ecosystem-survey/
+annotated`, non-destructively — backed up + restored byte-identical, coordinated with the
+ecosystem-survey agent; workspace is not a git repo).** Closes survey §3a residuals 2 & 3 on the
+real bodies: `combined_taus_lcg` recomposed to `uses(taus_step_0/1/2, lcg_step)` with `lcg_step` a
+`#[vericl::helper(wrapping)]` (dropping the kernel's own `wrapping` clause — a NON-wrapping kernel
+composing a wrapping helper), still `Proved{5}` + bit-exact on wgpu+cpu (identical to the old inline
+form); `to_unit_interval_closed_open` (verbatim base.rs 191-197, `f32::cast_from`) added as a helper
++ driver, compiles (was §3a rejection), 0-ULP on wgpu+cpu, `Proved{2}`; negatives bin still exits 0.
+(Noted a pre-existing drift for the survey agent: their `negatives.rs` match on `StructuredAssume`
+lacks the `LenPlusConstLe` arm batch-1 added — their point-in-time snapshot; not my change to make.)
+
+**Files.** `crates/vericl/src/host_shims.rs` (new); `crates/vericl/src/lib.rs` (+`pub mod
+host_shims`); `crates/vericl-macros/src/lib.rs` (`ShimRewriteFold`, `rewrite_comptime_blocks` +
+`ComptimeRefCheck` + `validate_comptime_expr`, `HelperSpec.wrapping` + helper wrapping gate + fold,
+`FloatMethodCheck` vericl-path skip, generated `unused_parens`/`unused_braces` allow);
+`crates/vericl-examples/src/lib.rs` (5 kernels + 3 helpers: `to_unit_interval`+`unit_interval_map`,
+`mul_hi_map`, `lcg_step`+`lcg_map`, `lcg_step_checked` [neg control], `comptime_shift`; 7 new twin
+guards); `crates/vericl-examples/tests/host_shim_gpu_ground_truth.rs` (new, GPU ground truth);
+`crates/vericl-examples/tests/conformance.rs` (4 suite kernels); `crates/vericl-examples/evidence/
+vericl.json` (+4 kernels, additive only — 255 insertions, 0 removals, no cpu-lane leakage);
+`README.md` (comptime! accuracy fix). `docs/` unchanged (survey doc is the ecosystem-survey agent's
+point-in-time snapshot).
+
+**Verification.** `cargo test --workspace` green (244 tests, 0 failed; +4 host_shims unit,
++11 vericl-macros batch-2, +7 vericl-examples twin guards, +1 GPU ground-truth wgpu);
+`-p vericl-examples --features cpu` green incl. the cpu GPU-ground-truth lane
+(`shims_match_cpu_ground_truth`, no backend divergence) + the cpu conformance lane;
+`cargo clippy --workspace --all-targets` zero warnings on BOTH feature sets; `conform demo-defects`
+exits 0 (unchanged); the 4 new suite kernels each carry `tested` (differential) + `proved`
+(smt-oob-freedom) claims; existing kernels' evidence byte-identical (suite obligation counts
+unchanged; +4 kernels justified). `VERICL_UPDATE` run cpu-then-default LAST per the staleness
+lesson — committed evidence is default (non-cpu) shape. Negative test per positive (macro-level
+white-box + example-level twin guards + the neg-control helper). No prover changes (taint suffices
+v1, documented).

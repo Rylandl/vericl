@@ -48,6 +48,22 @@ vericl::suite! {
         // lib unit tests), just outside the multi-LANE suite so the cpu lane
         // stays green.
         block_sum_reduce,
+        // --- Quick-wins batch 2 (macro-leaning) ---
+        // Feature 1 (verified host shims): the flagship u32-RNG-output →
+        // unit-interval-f32 kernel, `y[i] = cast_from(x[i] >> 8) / 2^24` via a
+        // composed helper using the GPU-verified `cast_from` shim. Bit-exact
+        // (max_ulp=0) + proved bounds. `mul_hi_map` exercises the verified
+        // `mul_hi` shim (exact u32 high word) + proved bounds.
+        unit_interval_map,
+        mul_hi_map,
+        // Feature 2 (helper-level wrapping): a NON-wrapping kernel composing the
+        // WRAPPING `lcg_step` helper (`z*a+b`, wrap-on-overflow) — the interaction
+        // rule in action. Exact u32 + proved bounds.
+        lcg_map,
+        // Feature 3 (comptime! block evaluation): `comptime!(extra + 2)` is
+        // evaluated at expansion (extra is #[comptime]-pinned) and used as a
+        // shift amount. Exact u32 + proved bounds.
+        comptime_shift,
         // Cooperative v1.1 acceptance example — the `emitter_powers_multi_rx`
         // shape (minus 2-D dispatch): a #[comptime] `n_emitters`, a `uses(...)`
         // helper in phase 0 (`square_sample`), and a workgroup-uniform

@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use proc_macro::TokenStream;
-use proc_macro2::{Group, Ident, TokenStream as TokenStream2, TokenTree};
+use proc_macro2::{Delimiter, Group, Ident, TokenStream as TokenStream2, TokenTree};
 use quote::{ToTokens, format_ident, quote};
 use sha2::{Digest, Sha256};
 use syn::fold::Fold;
@@ -681,6 +681,161 @@ fn find_ident_span(ts: TokenStream2, targets: &[&str]) -> Option<(String, proc_m
     None
 }
 
+/// Evaluate `comptime! { EXPR }` / `comptime!(EXPR)` / `comptime![EXPR]` blocks
+/// in a twin body by re-emitting `EXPR` directly (the macro wrapper stripped),
+/// which is exactly what CubeCL does at expansion: a `comptime!` block runs as
+/// host Rust during expand, over the values in scope. In the twin — itself host
+/// Rust, with every `#[comptime]` parameter bound as a `let name = value;` const
+/// (kernels) or an ordinary value parameter (helpers) — re-emitting the inner
+/// expression reproduces that host evaluation, **iff** the expression depends
+/// only on compile-time-known values.
+///
+/// So a block is stripped only when every *bare value identifier* it references
+/// is a `#[comptime]` parameter (any other bare ident — a runtime scalar/array
+/// parameter, a local binding, an unknown const — is a value the twin would
+/// evaluate differently from cube's expand-time evaluation, so the block is
+/// rejected by name). Multi-segment paths (`Ord::max`, `Enum::Variant`),
+/// method names, and field accessors are not runtime values and are allowed;
+/// a *nested* macro invocation inside the block is rejected outright (its
+/// opaque tokens cannot be validated). This runs BEFORE `transform_body`, so a
+/// recognized block never reaches the `comptime`-ident ban there; an
+/// unrecognized/leftover `comptime` ident still is (rejected as out-of-subset).
+///
+/// `errors` accumulates any rejection; the block is still stripped (so the
+/// downstream token flow is well-formed), and the caller returns the combined
+/// error before the twin is ever parsed/emitted.
+fn rewrite_comptime_blocks(
+    ts: TokenStream2,
+    comptime_params: &HashSet<String>,
+    errors: &mut Vec<syn::Error>,
+) -> TokenStream2 {
+    let mut out = TokenStream2::new();
+    let mut iter = ts.into_iter().peekable();
+    while let Some(tt) = iter.next() {
+        match tt {
+            TokenTree::Ident(id) if id == "comptime" => {
+                // `comptime` must be immediately followed by `!` then a group
+                // to be a macro invocation; anything else is a bare `comptime`
+                // ident, left for `transform_body`'s ban.
+                let is_bang = matches!(iter.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '!');
+                if !is_bang {
+                    out.extend(std::iter::once(TokenTree::Ident(id)));
+                    continue;
+                }
+                let bang = iter.next().expect("peeked `!`");
+                let TokenTree::Punct(bang_p) = &bang else { unreachable!() };
+                // Joint spacing (`!=`, `!x`) means this is not `comptime! {…}`.
+                let followed_by_group = bang_p.spacing() == proc_macro2::Spacing::Alone
+                    && matches!(iter.peek(), Some(TokenTree::Group(_)));
+                if !followed_by_group {
+                    out.extend([TokenTree::Ident(id), bang]);
+                    continue;
+                }
+                let Some(TokenTree::Group(group)) = iter.next() else { unreachable!() };
+                // Recurse into the inner tokens first (nested comptime! — a
+                // degenerate but not-forbidden shape).
+                let inner = rewrite_comptime_blocks(group.stream(), comptime_params, errors);
+                validate_comptime_expr(&inner, comptime_params, id.span(), errors);
+                // Re-emit: a brace-delimited `comptime!{…}` becomes a block
+                // expression `{…}` (may hold statements); a paren/bracket form
+                // becomes `(…)`. Both are valid in any expression position.
+                let delim = if group.delimiter() == Delimiter::Brace {
+                    Delimiter::Brace
+                } else {
+                    Delimiter::Parenthesis
+                };
+                let mut g = Group::new(delim, inner);
+                g.set_span(group.span());
+                out.extend(std::iter::once(TokenTree::Group(g)));
+            }
+            TokenTree::Group(g) => {
+                let inner = rewrite_comptime_blocks(g.stream(), comptime_params, errors);
+                let mut ng = Group::new(g.delimiter(), inner);
+                ng.set_span(g.span());
+                out.extend(std::iter::once(TokenTree::Group(ng)));
+            }
+            other => out.extend(std::iter::once(other)),
+        }
+    }
+    out
+}
+
+/// Visit a parsed `comptime!` block's expression, pushing a rejection for every
+/// bare value identifier that is not a `#[comptime]` parameter and for any
+/// nested macro invocation — see [`rewrite_comptime_blocks`].
+struct ComptimeRefCheck<'a> {
+    comptime_params: &'a HashSet<String>,
+    macro_span: proc_macro2::Span,
+    errors: Vec<syn::Error>,
+}
+
+impl<'ast> Visit<'ast> for ComptimeRefCheck<'_> {
+    fn visit_expr_path(&mut self, ep: &'ast syn::ExprPath) {
+        // A bare single-segment path used as a value: must be a #[comptime]
+        // parameter. Multi-segment paths (functions, consts, enum variants)
+        // and qualified paths are not runtime values — allowed.
+        if ep.qself.is_none() && ep.path.leading_colon.is_none() {
+            if let Some(id) = ep.path.get_ident() {
+                let s = id.to_string();
+                if !self.comptime_params.contains(&s) {
+                    self.errors.push(syn::Error::new(
+                        self.macro_span,
+                        format!(
+                            "comptime! block references `{s}`, which is not a #[comptime] \
+                             parameter — a comptime! block is evaluated at expansion (as host \
+                             Rust over compile-time-known values), so it may reference only \
+                             #[comptime] parameters and literals; `{s}` is outside the vericl v0 \
+                             subset here"
+                        ),
+                    ));
+                }
+            }
+        }
+        syn::visit::visit_expr_path(self, ep);
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        // A nested macro invocation's tokens are opaque to `syn` — its
+        // identifier references cannot be validated, so it is rejected rather
+        // than trusted (a `comptime!(assert!(runtime_value > 0))` would
+        // otherwise strip to a twin that reads a runtime value).
+        let name = m.path.to_token_stream().to_string().replace(' ', "");
+        self.errors.push(syn::Error::new(
+            self.macro_span,
+            format!(
+                "comptime! block contains a nested `{name}!` macro invocation, whose contents \
+                 cannot be validated — outside the vericl v0 subset"
+            ),
+        ));
+        // Do not recurse into the opaque macro tokens.
+    }
+}
+
+/// Parse a `comptime!` block's inner tokens as a block and run
+/// [`ComptimeRefCheck`], accumulating any rejection into `errors`.
+fn validate_comptime_expr(
+    inner: &TokenStream2,
+    comptime_params: &HashSet<String>,
+    macro_span: proc_macro2::Span,
+    errors: &mut Vec<syn::Error>,
+) {
+    // Wrap in braces so both a single expression (`taps + 1`) and a statement
+    // sequence (`let x = taps; x + 1`) parse uniformly as a block.
+    let block: syn::Block = match syn::parse2(quote!({ #inner })) {
+        Ok(b) => b,
+        Err(e) => {
+            errors.push(syn::Error::new(
+                macro_span,
+                format!("comptime! block does not parse as a host expression: {e}"),
+            ));
+            return;
+        }
+    };
+    let mut check = ComptimeRefCheck { comptime_params, macro_span, errors: Vec::new() };
+    check.visit_block(&block);
+    errors.extend(check.errors);
+}
+
 /// Reject a `#[vericl::helper]` that uses a workgroup-cooperative construct
 /// (`sync_cube()` barrier or `SharedMemory` tile) — the twin-lane half of the
 /// cooperative-composition soundness crux (docs/design-shared-memory.md §7.4).
@@ -1051,11 +1206,112 @@ impl Fold for FloatMethodCheck {
 
     fn fold_expr_call(&mut self, i: syn::ExprCall) -> syn::ExprCall {
         if let Expr::Path(p) = i.func.as_ref() {
-            if let Some(last) = p.path.segments.last() {
-                self.check(&last.ident);
+            // Skip our own shim calls (`::vericl::host_shims::mul_hi`, …): a
+            // `ShimRewriteFold`-emitted shim's LAST segment can share a name
+            // with a rejected intrinsic (`mul_hi`), but it is a verified host
+            // function, not the `unexpanded!()` trait method. A twin author
+            // never writes a `vericl`-rooted path, so this only ever exempts
+            // our own rewrite output — an author's `::cubecl::…::cast_from`
+            // (rooted elsewhere) still has its last segment checked.
+            let vericl_rooted =
+                p.path.segments.first().is_some_and(|s| s.ident == "vericl");
+            if !vericl_rooted {
+                if let Some(last) = p.path.segments.last() {
+                    self.check(&last.ident);
+                }
             }
         }
         syn::fold::fold_expr_call(self, i)
+    }
+}
+
+/// Rewrites recognized GPU-intrinsic calls in a reference twin body to their
+/// GPU-verified `::vericl::host_shims::` equivalents (`crates/vericl/src/
+/// host_shims.rs`) — the real `cubecl::prelude::Cast::cast_from` /
+/// `Numeric::mul_hi` are `unexpanded!()` on host (they panic; see
+/// `FLOAT_METHOD_REJECT` and `tests/float_method_whitelist.rs`), and their
+/// semantics are GPU-defined (u32→f32 rounding in particular), so each shim is
+/// pinned against GPU ground truth in
+/// `crates/vericl-examples/tests/host_shim_gpu_ground_truth.rs`.
+///
+/// Runs BEFORE [`FloatMethodCheck`], so a *recognized* call is rewritten away
+/// (its new callee — `::vericl::host_shims::…` — is not a rejected name) while
+/// an UNRECOGNIZED `cast_from`/`mul_hi` (e.g. a non-`f32` cast target, for which
+/// vericl has no verified shim) survives to be rejected by name, exactly as
+/// today. Recognized shapes:
+///   - `f32::cast_from(x)`  →  `::vericl::host_shims::cast_to_f32(x)` — only
+///     when the qualifying segment is literally `f32` (after instantiate(...)
+///     substitution), the sole verified cast target. The SOURCE type is
+///     resolved by Rust trait dispatch (`CastToF32`); an unsupported source is a
+///     `CastToF32: not satisfied` compile error in the twin (loud, never a
+///     silently wrong value).
+///   - `T::mul_hi(a, b)` (qualified path, `T` any type) and `a.mul_hi(b)`
+///     (method form)  →  `::vericl::host_shims::mul_hi(a, b)` — via the `MulHi`
+///     trait (u32 is the sole verified type; other operand types are a
+///     `MulHi: not satisfied` error). A *bare* single-segment `mul_hi(a, b)` is
+///     left untouched (it cannot be the cubecl intrinsic, which is always
+///     `T::mul_hi`/`x.mul_hi`; leaving it lets it classify as a possible
+///     `uses(...)` helper in the later pass instead of being hijacked here).
+#[derive(Default)]
+struct ShimRewriteFold;
+
+impl ShimRewriteFold {
+    fn rewrite_call(call: ExprCall) -> Expr {
+        let Expr::Path(ep) = call.func.as_ref() else {
+            return Expr::Call(call);
+        };
+        if ep.qself.is_some() {
+            // `<f32 as Cast>::cast_from(...)` — a qualified-self path; not
+            // recognized here (documented residual). FloatMethodCheck will
+            // reject its `cast_from`/`mul_hi` last segment by name.
+            return Expr::Call(call);
+        }
+        let segs = &ep.path.segments;
+        let Some(last) = segs.last() else {
+            return Expr::Call(call);
+        };
+        let method = last.ident.to_string();
+        // `f32::cast_from(x)` — qualified (>= 2 segments), target segment `f32`.
+        if method == "cast_from"
+            && segs.len() >= 2
+            && call.args.len() == 1
+            && segs[segs.len() - 2].ident == "f32"
+        {
+            let arg = &call.args[0];
+            return syn::parse_quote!(::vericl::host_shims::cast_to_f32(#arg));
+        }
+        // `T::mul_hi(a, b)` — qualified only (a bare `mul_hi(a, b)` is left for
+        // the uses(...) classifier; the intrinsic is never a free function).
+        if method == "mul_hi" && segs.len() >= 2 && call.args.len() == 2 {
+            let a = &call.args[0];
+            let b = &call.args[1];
+            return syn::parse_quote!(::vericl::host_shims::mul_hi(#a, #b));
+        }
+        Expr::Call(call)
+    }
+
+    fn rewrite_method(mc: syn::ExprMethodCall) -> Expr {
+        // `a.mul_hi(b)` — the method form of the intrinsic.
+        if mc.method == "mul_hi" && mc.args.len() == 1 {
+            let recv = mc.receiver.as_ref();
+            let arg = &mc.args[0];
+            return syn::parse_quote!(::vericl::host_shims::mul_hi(#recv, #arg));
+        }
+        Expr::MethodCall(mc)
+    }
+}
+
+impl Fold for ShimRewriteFold {
+    fn fold_expr(&mut self, expr: Expr) -> Expr {
+        // Post-order: rewrite nested intrinsics (and the arguments of this
+        // call) first, then this node — so `f32::cast_from(a.mul_hi(b))`
+        // rewrites both layers.
+        let expr = syn::fold::fold_expr(self, expr);
+        match expr {
+            Expr::Call(call) => Self::rewrite_call(call),
+            Expr::MethodCall(mc) => Self::rewrite_method(mc),
+            other => other,
+        }
     }
 }
 
@@ -1902,8 +2158,15 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     // a `syn::Block` so the twin-only Fold passes below (unroll-attribute
     // stripping, and optionally `wrapping`) can run.
     let mut errors = Vec::new();
+    // comptime! { EXPR } blocks: evaluate at expansion by stripping the wrapper
+    // to `EXPR`, provided EXPR references only #[comptime] params + literals
+    // (see `rewrite_comptime_blocks`). Runs before `transform_body` so a
+    // recognized block never trips the `comptime`-ident ban there.
+    let comptime_set: HashSet<String> =
+        comptime_param_names.iter().map(|i| i.to_string()).collect();
+    let pre_body = rewrite_comptime_blocks(func.block.to_token_stream(), &comptime_set, &mut errors);
     let ref_body_tokens =
-        transform_body(func.block.to_token_stream(), &plan.generic_subst, true, is_coop, &mut errors);
+        transform_body(pre_body, &plan.generic_subst, true, is_coop, &mut errors);
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
         a
@@ -1932,6 +2195,12 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     }) {
         return Err(combined);
     }
+
+    // Rewrite recognized GPU-intrinsic calls (`f32::cast_from`, `T::mul_hi`) to
+    // their GPU-verified `::vericl::host_shims::` equivalents BEFORE the reject
+    // check below — a recognized call is rewritten away, an unrecognized one
+    // (e.g. a non-f32 cast target) survives to be rejected by name.
+    ref_block = ShimRewriteFold.fold_block(ref_block);
 
     // Reject any call to a Float/Numeric method whose host-callability isn't
     // verified (see FLOAT_METHOD_REJECT) — a silently panicking or
@@ -2330,7 +2599,11 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
 
     Ok(quote! {
         #[doc = #doc]
-        #[allow(non_snake_case, unused_variables, clippy::all)]
+        // `unused_parens`/`unused_braces`: a stripped `comptime!` block re-emits
+        // its inner expression wrapped in `(…)`/`{…}` (see
+        // `rewrite_comptime_blocks`), which is redundant in a `let x = …;` RHS
+        // but harmless — this is generated twin code, not authored.
+        #[allow(non_snake_case, unused_variables, unused_parens, unused_braces, clippy::all)]
         #vis mod #mod_name {
             use super::*;
 
@@ -2554,16 +2827,29 @@ pub fn reference(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// A `#[vericl::helper(...)]` clause set. Only `instantiate(...)` and
-/// `uses(...)` are recognized — a helper is not launched and has no
-/// independent conformance case, so the kernel-only clauses
-/// (`assumes(...)`, `compare(...)`, `gen(...)`, `wrapping`) are rejected
-/// outright rather than silently parsed and ignored (an accepted-but-inert
-/// clause would be exactly the kind of quiet lie this project's contract
-/// surface exists to prevent).
+/// A `#[vericl::helper(...)]` clause set. `instantiate(...)`, `uses(...)`, and
+/// `wrapping` are recognized; the launch-only clauses (`assumes(...)`,
+/// `compare(...)`, `gen(...)`) are rejected outright rather than silently
+/// parsed and ignored (a helper is not launched and has no independent
+/// conformance case, so an accepted-but-inert clause would be exactly the kind
+/// of quiet lie this project's contract surface exists to prevent).
+///
+/// `wrapping` on a helper applies the same `WrappingFold` a kernel's `wrapping`
+/// clause applies, to the helper twin's own body, under the same integer-only
+/// parameter/return gate — so a helper declaring wrap-on-overflow arithmetic
+/// (e.g. cubek's `lcg_step`, `z * a + b`) computes it faithfully instead of the
+/// checked-arithmetic panic a non-wrapping twin would produce. Each item's
+/// `wrapping` governs **only its own body**: integer values cross the helper
+/// boundary as plain integers, so a non-wrapping kernel may freely use a
+/// wrapping helper, and a wrapping kernel using a non-wrapping helper gets the
+/// helper's checked arithmetic (which panics loudly on overflow — the correct,
+/// non-silent signal, kept per round-3).
 struct HelperSpec {
     instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)>,
     uses: Vec<Ident>,
+    /// `wrapping` clause span, if declared — gates the integer-only check and
+    /// applies `WrappingFold` to the helper twin body (see the struct doc).
+    wrapping: Option<proc_macro2::Span>,
 }
 
 fn parse_helper_attr(attr: TokenStream2) -> syn::Result<HelperSpec> {
@@ -2572,6 +2858,7 @@ fn parse_helper_attr(attr: TokenStream2) -> syn::Result<HelperSpec> {
 
     let mut instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)> = None;
     let mut uses: Vec<Ident> = Vec::new();
+    let mut wrapping: Option<proc_macro2::Span> = None;
 
     for meta in metas {
         match &meta {
@@ -2610,19 +2897,22 @@ fn parse_helper_attr(attr: TokenStream2) -> syn::Result<HelperSpec> {
                     })?;
                 uses.extend(idents);
             }
+            Meta::Path(p) if p.is_ident("wrapping") => {
+                wrapping = Some(p.span());
+            }
             other => {
                 return Err(syn::Error::new(
                     other.span(),
-                    "#[vericl::helper(...)] only accepts `instantiate(...)` and `uses(...)` — a \
-                     helper is not launched and has no independent conformance case, so \
-                     assumes(...)/compare(...)/gen(...)/wrapping (kernel-only contract clauses) \
+                    "#[vericl::helper(...)] only accepts `instantiate(...)`, `uses(...)`, and \
+                     `wrapping` — a helper is not launched and has no independent conformance \
+                     case, so assumes(...)/compare(...)/gen(...) (launch-only contract clauses) \
                      are not accepted here",
                 ));
             }
         }
     }
 
-    Ok(HelperSpec { instantiate, uses })
+    Ok(HelperSpec { instantiate, uses, wrapping })
 }
 
 fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
@@ -2742,14 +3032,67 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
         &fn_name_str,
     )?;
 
+    // `wrapping` on a helper: the same integer-only gate a kernel gets (the
+    // `WrappingFold` is untyped, so folding `+`/`-`/`*` to `wrapping_*` must
+    // not silently touch float math). Every value parameter — and the return
+    // type — must be an integer scalar or integer Array. A #[comptime] param
+    // participates in the body like any other value, so it is gated too.
+    if spec.wrapping.is_some() {
+        for p in &params {
+            let (ok, ty_span) = match &p.kind {
+                ParamKind::Scalar(ty) | ParamKind::Comptime(ty) => {
+                    (is_wrapping_integer_type(ty), ty.span())
+                }
+                ParamKind::ArrayRef(elem) | ParamKind::ArrayMut(elem) => {
+                    (is_wrapping_integer_type(elem), elem.span())
+                }
+            };
+            if !ok {
+                return Err(syn::Error::new(
+                    ty_span,
+                    "`wrapping` is outside the vericl v0 subset for this helper: every parameter \
+                     must be an integer scalar or integer Array (u32/i32/u64/i64) when \
+                     `wrapping` is declared — the fold is untyped and must not silently touch \
+                     float math",
+                ));
+            }
+        }
+        if let ReturnType::Type(_, ty) = &func.sig.output {
+            let ty = subst_type_tokens(ty.to_token_stream(), &plan.generic_subst);
+            let ty: Type = syn::parse2(ty).map_err(|e| {
+                syn::Error::new(func.sig.output.span(), format!("internal error: {e}"))
+            })?;
+            if !is_wrapping_integer_type(&ty) {
+                return Err(syn::Error::new(
+                    func.sig.output.span(),
+                    "`wrapping` is outside the vericl v0 subset for this helper: the return type \
+                     must be an integer scalar (u32/i32/u64/i64) when `wrapping` is declared",
+                ));
+            }
+        }
+    }
+
     // --- twin body: the same ABSOLUTE_POS-banned (see `transform_body`'s
     // `allow_absolute_pos` doc) + generic-substituted + banned-construct
-    // pipeline as a kernel's, minus `wrapping` (not part of the helper
-    // design — a helper wanting wrap-on-overflow arithmetic is future
-    // work, not yet demanded by any dogfooded shape).
+    // pipeline as a kernel's — including `wrapping` (v1.1 helper support:
+    // `WrappingFold` applied to the helper twin's own body below, under the
+    // integer-only gate above) and comptime! evaluation.
     let mut errors = Vec::new();
+    // A helper's #[comptime] params stay pass-through value parameters, so a
+    // comptime! block referencing one strips exactly as in a kernel.
+    let comptime_set: HashSet<String> = func
+        .sig
+        .inputs
+        .iter()
+        .filter(|a| is_comptime_param(a))
+        .filter_map(|a| {
+            let FnArg::Typed(pt) = a else { return None };
+            fn_arg_ident(pt).ok().map(|i| i.to_string())
+        })
+        .collect();
+    let pre_body = rewrite_comptime_blocks(func.block.to_token_stream(), &comptime_set, &mut errors);
     let ref_body_tokens =
-        transform_body(func.block.to_token_stream(), &plan.generic_subst, false, false, &mut errors);
+        transform_body(pre_body, &plan.generic_subst, false, false, &mut errors);
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
         a
@@ -2775,6 +3118,10 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
     }) {
         return Err(combined);
     }
+
+    // Rewrite recognized GPU-intrinsic calls to their `::vericl::host_shims::`
+    // equivalents before the reject check — same as a kernel twin.
+    ref_block = ShimRewriteFold.fold_block(ref_block);
 
     // Reject any call to a Float/Numeric method whose host-callability
     // isn't verified — the exact same check a kernel twin gets, now genuinely
@@ -2805,6 +3152,17 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
         a
     }) {
         return Err(combined);
+    }
+
+    // `wrapping` (v1.1 helper support): fold the helper twin's own body's
+    // integer `+`/`-`/`*`/`<<`/`>>` to their `wrapping_*` equivalents, matching
+    // WGSL. Only the twin — the `#[cube]` helper is re-emitted untouched. The
+    // integer-only gate above makes this sound (an untyped fold on float math
+    // would otherwise miscompile). Runs after the uses rewrite so a folded
+    // arithmetic expression never wraps a rewritten `_vericl_ref` call itself
+    // (only genuine arithmetic operators are folded).
+    if spec.wrapping.is_some() {
+        ref_block = WrappingFold.fold_block(ref_block);
     }
 
     // --- identity hash: the same recipe as a kernel's own SOURCE_HASH
@@ -2872,7 +3230,9 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
 
     Ok(quote! {
         #[doc = #doc]
-        #[allow(non_snake_case, unused_variables, clippy::all)]
+        // `unused_parens`/`unused_braces`: see the kernel twin's allow — a
+        // stripped `comptime!` block re-emits `(…)`/`{…}` in generated code.
+        #[allow(non_snake_case, unused_variables, unused_parens, unused_braces, clippy::all)]
         #vis fn #ref_fn_name(#(#ref_params),*) #ref_output #ref_block
 
         #[doc = "VeriCL identity metadata for the helper function above."]
@@ -4565,5 +4925,184 @@ mod tests {
         // against a contradictory assume that would otherwise reach the prover).
         reject("a.len() + 4 <= a.len()");
         reject("a.len() <= a.len()");
+    }
+
+    // -----------------------------------------------------------------
+    // Quick-wins batch 2, Feature 1: `ShimRewriteFold` (verified
+    // cast_from / mul_hi host shims). White-box over the fold + one
+    // end-to-end rejection through `expand`.
+    // -----------------------------------------------------------------
+
+    fn shim(src: &str) -> String {
+        let expr: Expr = syn::parse_str(src).expect("valid expr");
+        ShimRewriteFold.fold_expr(expr).to_token_stream().to_string().replace(' ', "")
+    }
+
+    /// `f32::cast_from(x)` rewrites to the verified `cast_to_f32` shim; the
+    /// source type is left to Rust trait dispatch (`CastToF32`).
+    #[test]
+    fn shim_rewrite_cast_from_f32() {
+        assert_eq!(shim("f32::cast_from(x)"), "::vericl::host_shims::cast_to_f32(x)");
+        // Nested: the argument is folded too.
+        assert_eq!(
+            shim("f32::cast_from(a.mul_hi(b))"),
+            "::vericl::host_shims::cast_to_f32(::vericl::host_shims::mul_hi(a,b))"
+        );
+    }
+
+    /// Both `a.mul_hi(b)` (method) and `T::mul_hi(a, b)` (qualified path) rewrite
+    /// to the `mul_hi` shim.
+    #[test]
+    fn shim_rewrite_mul_hi_method_and_path() {
+        assert_eq!(shim("a.mul_hi(b)"), "::vericl::host_shims::mul_hi(a,b)");
+        assert_eq!(shim("u32::mul_hi(a,b)"), "::vericl::host_shims::mul_hi(a,b)");
+    }
+
+    /// An unrecognized cast target (`f64`/`u32`) and a *bare* `mul_hi(a, b)`
+    /// (which cannot be the intrinsic — it is always `T::mul_hi`/`x.mul_hi`)
+    /// are left byte-for-byte untouched, so the former still reaches
+    /// `FloatMethodCheck` to be rejected by name and the latter stays a
+    /// possible `uses(...)` helper call.
+    #[test]
+    fn shim_rewrite_leaves_unrecognized_untouched() {
+        for src in ["f64::cast_from(x)", "u32::cast_from(x)", "mul_hi(a,b)"] {
+            let expr: Expr = syn::parse_str(src).unwrap();
+            let before = expr.to_token_stream().to_string();
+            let after = ShimRewriteFold.fold_expr(expr).to_token_stream().to_string();
+            assert_eq!(after, before, "`{src}` must be left untouched");
+        }
+    }
+
+    /// End-to-end: a kernel calling `u32::cast_from` (unrecognized target — no
+    /// verified shim) is rejected by name at macro time, exactly as before this
+    /// feature. The RECOGNIZED `f32::cast_from` path is exercised end-to-end by
+    /// the `unit_interval_map` example instead (it compiles and proves).
+    #[test]
+    fn unrecognized_cast_target_is_rejected_by_name() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<u32>, y: &mut Array<u32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = u32::cast_from(x[ABSOLUTE_POS]); } }",
+        )
+        .expect("valid fn");
+        let err = expand(quote!(compare(exact)), &func)
+            .expect_err("u32::cast_from has no verified shim and must be rejected");
+        assert!(
+            err.to_string().contains("cast_from"),
+            "the rejection must name the method: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Quick-wins batch 2, Feature 2: helper-level `wrapping`.
+    // -----------------------------------------------------------------
+
+    /// `#[vericl::helper(wrapping)]` parses, and the derived twin's `z*a + b`
+    /// folds to the wrap-on-overflow form (matching WGSL) — the whole point of
+    /// the clause.
+    #[test]
+    fn helper_wrapping_folds_the_twin_body() {
+        let spec = parse_helper_attr(quote!(wrapping)).expect("wrapping is accepted on a helper");
+        assert!(spec.wrapping.is_some());
+
+        let func: ItemFn =
+            syn::parse_str("pub fn lcg(z: u32) -> u32 { let a = 3u32; let b = 5u32; z * a + b }")
+                .expect("valid fn");
+        let out = expand_helper(quote!(wrapping), &func).expect("wrapping helper expands").to_string();
+        assert!(out.contains("wrapping_mul"), "twin must fold `*` to wrapping_mul: {out}");
+        assert!(out.contains("wrapping_add"), "twin must fold `+` to wrapping_add: {out}");
+    }
+
+    /// The integer-only gate: `wrapping` on a helper with a float parameter is
+    /// rejected (the untyped fold must never silently touch float math) — the
+    /// same gate a kernel's `wrapping` clause has.
+    #[test]
+    fn helper_wrapping_rejects_float_param() {
+        let func: ItemFn =
+            syn::parse_str("pub fn f(z: f32) -> f32 { z * z }").expect("valid fn");
+        let err = expand_helper(quote!(wrapping), &func)
+            .expect_err("wrapping on a float helper must be rejected");
+        assert!(
+            err.to_string().contains("integer scalar or integer Array"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// The integer-only gate covers the return type too: a wrapping helper
+    /// returning a non-integer is rejected.
+    #[test]
+    fn helper_wrapping_rejects_float_return() {
+        let func: ItemFn =
+            syn::parse_str("pub fn f(z: u32) -> f32 { let a = z; 1.0 }").expect("valid fn");
+        let err = expand_helper(quote!(wrapping), &func)
+            .expect_err("wrapping with a float return must be rejected");
+        assert!(err.to_string().contains("return type"), "unexpected message: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Quick-wins batch 2, Feature 3: comptime! block evaluation.
+    // -----------------------------------------------------------------
+
+    fn comptime_params(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A `comptime!` block referencing only #[comptime] params + literals is
+    /// stripped to its inner expression (the wrapper removed), with no error.
+    #[test]
+    fn comptime_block_referencing_only_comptime_params_is_stripped() {
+        let params = comptime_params(&["extra"]);
+        let mut errors = Vec::new();
+        let ts: TokenStream2 = syn::parse_str("{ let s = comptime!(extra + 2u32); x >> s }").unwrap();
+        let out = rewrite_comptime_blocks(ts, &params, &mut errors)
+            .to_string()
+            .replace(' ', "");
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(!out.contains("comptime"), "the comptime wrapper must be gone: {out}");
+        assert!(out.contains("(extra+2u32)"), "inner expression must remain: {out}");
+    }
+
+    /// A `comptime!` block referencing a NON-comptime identifier (a runtime
+    /// value) is rejected by name — evaluating it in the twin would read a value
+    /// cube never evaluates at expansion.
+    #[test]
+    fn comptime_block_referencing_runtime_value_is_rejected_by_name() {
+        let params = comptime_params(&["extra"]); // `runtime_val` is NOT comptime
+        let mut errors = Vec::new();
+        let ts: TokenStream2 = syn::parse_str("{ let s = comptime!(runtime_val + 2u32); s }").unwrap();
+        let _ = rewrite_comptime_blocks(ts, &params, &mut errors);
+        assert_eq!(errors.len(), 1, "exactly one rejection expected");
+        assert!(
+            errors[0].to_string().contains("runtime_val"),
+            "the rejection must name the offending identifier: {}",
+            errors[0]
+        );
+    }
+
+    /// A `comptime!` block with only literals (no identifiers) is stripped even
+    /// with no comptime params in scope.
+    #[test]
+    fn comptime_block_with_only_literals_is_stripped() {
+        let params: HashSet<String> = HashSet::new();
+        let mut errors = Vec::new();
+        let ts: TokenStream2 = syn::parse_str("{ let n = comptime!(4u32 + 3u32); n }").unwrap();
+        let out = rewrite_comptime_blocks(ts, &params, &mut errors).to_string().replace(' ', "");
+        assert!(errors.is_empty(), "literals-only block must strip cleanly: {errors:?}");
+        assert!(out.contains("(4u32+3u32)"));
+    }
+
+    /// A nested macro invocation inside a `comptime!` block is rejected — its
+    /// opaque tokens cannot be validated, so it is not silently trusted.
+    #[test]
+    fn comptime_block_with_nested_macro_is_rejected() {
+        let params = comptime_params(&["extra"]);
+        let mut errors = Vec::new();
+        let ts: TokenStream2 =
+            syn::parse_str("{ comptime!(assert!(extra > 0u32)); x }").unwrap();
+        let _ = rewrite_comptime_blocks(ts, &params, &mut errors);
+        assert!(!errors.is_empty(), "a nested macro must be rejected");
+        assert!(
+            errors.iter().any(|e| e.to_string().contains("nested")),
+            "the rejection must mention the nested macro: {errors:?}"
+        );
     }
 }

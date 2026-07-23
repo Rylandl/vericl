@@ -87,10 +87,12 @@ substituted to its pinned concrete type) sharing no CubeCL machinery; the `assum
 executable `check_assumes` predicate; a `SOURCE_HASH` identity that evidence binds to; and — from
 the `gen(...)` clause — a `conformance_case` function that generates inputs, runs the reference and
 the real kernel, and compares them, so no kernel needs hand-written GPU launch/input-gen glue.
-Kernels using constructs the twin cannot model (`UNIT_POS`, `SharedMemory`, `plane_*`, `comptime!`
-blocks, vectors, `return`) are rejected at compile time rather than silently approximated. Kernel
-*composition* — calling another `#[cube]` fn — is supported via `#[vericl::helper]` and a
-kernel-side `uses(...)` clause; see "Kernel composition" below.
+Kernels using constructs the twin cannot model (`UNIT_POS`, `SharedMemory`, `plane_*`, vectors,
+`return`) are rejected at compile time rather than silently approximated. A `comptime! { … }` block
+is evaluated at expansion when it depends only on `#[comptime]` parameters + literals, and rejected
+by name otherwise (see "comptime! block evaluation" below). Kernel *composition* — calling another
+`#[cube]` fn — is supported via `#[vericl::helper]` and a kernel-side `uses(...)` clause; see "Kernel
+composition" below.
 
 ### The `instantiate(...)` clause: monomorphizing generic + `#[comptime]` kernels
 
