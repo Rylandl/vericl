@@ -29,9 +29,9 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{
-    BinOp, Expr, ExprBinary, ExprCall, ExprForLoop, ExprLoop, ExprRange, ExprWhile, FnArg,
-    GenericParam, ItemFn, Meta, Pat, PatIdent, PatType, Path, RangeLimits, ReturnType, Token, Type,
-    parse_macro_input,
+    BinOp, Expr, ExprBinary, ExprCall, ExprForLoop, ExprLit, ExprLoop, ExprRange, ExprWhile, FnArg,
+    GenericArgument, GenericParam, ItemFn, Lit, LitInt, Meta, Pat, PatIdent, PatType, Path,
+    RangeLimits, ReturnType, Token, Type, parse_macro_input, parse_quote,
 };
 
 mod coop;
@@ -574,6 +574,7 @@ fn transform_body(
     subst: &GenericSubst,
     allow_absolute_pos: bool,
     coop: bool,
+    vector_gate: bool,
     errors: &mut Vec<syn::Error>,
 ) -> TokenStream2 {
     let mut out = TokenStream2::new();
@@ -595,6 +596,20 @@ fn transform_body(
                 }
                 if let Some(replacement) = subst.get(&s) {
                     out.extend(replacement.clone());
+                    continue;
+                }
+                // Recognized `Vector<F, N>` kernel (design-line-vector.md §4.2,
+                // §11 V3): rewrite the banned `Vector` head to the host lane-array
+                // shim `::vericl::Line`. The width/lane args that follow are left
+                // as written — a `Vector::<f32, N>::new(x)` has already had its `N`
+                // substituted to the pinned width literal above, so this yields
+                // `::vericl::Line::<f32, 4>::new(x)`, and a bare `Vector::new(x)`
+                // yields `::vericl::Line::new(x)`. The ban stays in force for every
+                // NON-vector kernel (the gate is off), so this never widens the
+                // subset silently. `Line` itself stays banned as an input ident
+                // (cubecl 0.10 has no `Line` type; an author cannot write one).
+                if vector_gate && s == "Vector" {
+                    out.extend(quote!(::vericl::Line));
                     continue;
                 }
                 // Under the `cooperative(...)` clause, the 1-D topology builtins
@@ -640,7 +655,8 @@ fn transform_body(
                 out.extend(std::iter::once(TokenTree::Ident(id)));
             }
             TokenTree::Group(g) => {
-                let inner = transform_body(g.stream(), subst, allow_absolute_pos, coop, errors);
+                let inner =
+                    transform_body(g.stream(), subst, allow_absolute_pos, coop, vector_gate, errors);
                 let mut ng = Group::new(g.delimiter(), inner);
                 ng.set_span(g.span());
                 out.extend(std::iter::once(TokenTree::Group(ng)));
@@ -1710,6 +1726,98 @@ fn elem_of_array(ty: &Type) -> Option<Type> {
     }
 }
 
+/// If `elem` is a `Vector<P, W>` element type with a concrete integer width `W`
+/// (the shape `instantiate(N = W)` produces after lexical substitution turns the
+/// width generic into a literal), return `(P, W)`: the lane scalar type and the
+/// pinned width literal. Matches `Vector` by its last path segment, mirroring
+/// `elem_of_array`'s `Array` match, so `cubecl::prelude::Vector<f32, 4>` and a
+/// bare `Vector<f32, 4>` both classify. Returns `None` for any non-vector
+/// element (the ordinary scalar-`Array` path is unaffected), and for a vector
+/// whose width is still a generic ident — that unpinned case is rejected earlier
+/// with the targeted "add instantiate(N = W)" error (`check_unpinned_vector_width`).
+fn vector_elem_parts(elem: &Type) -> Option<(Type, LitInt)> {
+    let Type::Path(tp) = elem else { return None };
+    let last = tp.path.segments.last()?;
+    if last.ident != "Vector" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(ab) = &last.arguments else {
+        return None;
+    };
+    if ab.args.len() != 2 {
+        return None;
+    }
+    let p = match &ab.args[0] {
+        GenericArgument::Type(t) => t.clone(),
+        _ => return None,
+    };
+    // A literal generic argument parses as `GenericArgument::Const(Expr::Lit)`;
+    // some spellings surface it as a bare `Type` path — accept only a genuine
+    // integer literal either way, never a leftover generic ident.
+    let w = match &ab.args[1] {
+        GenericArgument::Const(Expr::Lit(ExprLit { lit: Lit::Int(li), .. })) => li.clone(),
+        _ => return None,
+    };
+    Some((p, w))
+}
+
+/// `true` if a classified array element is a pinned-width `Vector`.
+fn is_vector_elem(elem: &Type) -> bool {
+    vector_elem_parts(elem).is_some()
+}
+
+/// The reference-twin element type for a `Vector<P, W>`: the host lane-array
+/// shim `::vericl::Line<P, W>` (design §4.2). `None` for a non-vector element.
+fn vector_twin_elem(elem: &Type) -> Option<Type> {
+    let (p, w) = vector_elem_parts(elem)?;
+    Some(parse_quote!(::vericl::Line<#p, #w>))
+}
+
+/// The real CubeCL element type for a `Vector<P, W>` on the kernel/IR side:
+/// `::cubecl::prelude::Vector<P, ::cubecl::prelude::Const<W>>`. The width lives
+/// in the type as a `Size` (`Const<W>`), not a bare literal — this is the form
+/// `LaunchArg::expand` / the `expand::<Const<W>>` turbofish need (design §2.1,
+/// validated by `scratchpad/linevec/src/bin/ir.rs`). `None` for a non-vector
+/// element (which passes through unchanged as its own CubeElement type).
+fn vector_kernel_elem(elem: &Type) -> Option<Type> {
+    let (p, w) = vector_elem_parts(elem)?;
+    Some(parse_quote!(::cubecl::prelude::Vector<#p, ::cubecl::prelude::Const<#w>>))
+}
+
+/// If `ty` is `&(mut) Array<Vector<P, WID>>` with `WID` a generic *ident* (an
+/// un-pinned width), return that ident. Used to emit the targeted
+/// "add instantiate(N = W)" rejection (design §8.3) before the generic
+/// `resolve_instantiate` "missing value" error, so the message names the vector
+/// width specifically.
+fn unpinned_vector_width_ident(ty: &Type) -> Option<Ident> {
+    let Type::Reference(r) = ty else { return None };
+    let elem = elem_of_array(&r.elem)?;
+    let Type::Path(tp) = &elem else { return None };
+    let last = tp.path.segments.last()?;
+    if last.ident != "Vector" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(ab) = &last.arguments else {
+        return None;
+    };
+    if ab.args.len() != 2 {
+        return None;
+    }
+    // Width position is a bare generic ident (a `Size` type parameter), not a
+    // concrete `Const<_>`/literal.
+    match &ab.args[1] {
+        GenericArgument::Type(Type::Path(p)) => {
+            let seg = p.path.segments.last()?;
+            if p.path.segments.len() == 1 && matches!(seg.arguments, syn::PathArguments::None) {
+                Some(seg.ident.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Apply `subst` (generic type ident -> concrete type tokens) to one
 /// function argument's declared type, reparsing the result as a [`Type`].
 /// A no-op clone when `subst` is empty (the overwhelmingly common case: a
@@ -1744,6 +1852,14 @@ struct InstantiatePlan {
     /// *original declared generic order* — what `expand::<...>`/
     /// `launch::<..., R>` turbofish need.
     generic_types_in_order: Vec<Type>,
+    /// The resolved `usize` width for each `Vector`-width (`Size`) generic, in
+    /// declared generic order — the extra runtime argument cubecl's generated
+    /// `expand`/`launch` take *per `Size` generic*, right after the scope
+    /// (design §2.1; validated by `scratchpad/linevec/src/bin/ir.rs`'s
+    /// `expand::<Const<4>>(&mut scope, 4usize, …)`). Empty for a kernel with no
+    /// `Size` generic — so an ordinary type-generic kernel's call site is
+    /// unchanged.
+    width_args: Vec<TokenStream2>,
     /// `"F = f32"`, `"taps = 3"`, ... — pretty-printed, in clause order, for
     /// `Contract::instantiate`.
     pretty: Vec<String>,
@@ -1788,6 +1904,7 @@ fn resolve_instantiate(
             generic_subst: HashMap::new(),
             comptime_values: HashMap::new(),
             generic_types_in_order: Vec::new(),
+            width_args: Vec::new(),
             pretty: Vec::new(),
         });
     };
@@ -1804,6 +1921,16 @@ fn resolve_instantiate(
     }
 
     let mut generic_subst: GenericSubst = HashMap::new();
+    // The turbofish type for each generic param — how `expand::<...>` /
+    // `launch::<...>` name it. For an ordinary type param this equals its
+    // substituted type; for a `Vector` **width** param pinned as `N = 4` it is
+    // `::cubecl::prelude::Const<4>` (a `Size` type), while `generic_subst` holds
+    // the bare literal `4` (what a `Line<f32, 4>` const generic and the twin body
+    // need). The two faces of a width diverge here and only here.
+    let mut turbofish: HashMap<String, Type> = HashMap::new();
+    // Width literals for `Vector`-width (`Size`) generics, keyed by param name —
+    // the `usize` cubecl's `expand`/`launch` take per `Size` generic.
+    let mut width_vals: HashMap<String, LitInt> = HashMap::new();
     let mut comptime_values: HashMap<String, TokenStream2> = HashMap::new();
     let mut seen: HashMap<String, proc_macro2::Span> = HashMap::new();
     let mut pretty_entries: Vec<String> = Vec::new();
@@ -1839,14 +1966,27 @@ fn resolve_instantiate(
                             continue;
                         }
                     };
-                    generic_subst.insert(key, ty.to_token_stream());
+                    generic_subst.insert(key.clone(), ty.to_token_stream());
+                    turbofish.insert(key, ty);
+                }
+                // A bare integer literal pins a `Vector` **width** generic
+                // (`N: Size`) to a concrete lane count (design §1, §8.1):
+                // `instantiate(N = 4)`. Substitute the width as the literal `4`
+                // (twin-body / `Line<_, 4>` face) and turbofish it as
+                // `Const<4>` (the kernel/IR `Size` face).
+                Expr::Lit(ExprLit { lit: Lit::Int(li), .. }) => {
+                    generic_subst.insert(key.clone(), quote!(#li));
+                    turbofish.insert(key.clone(), parse_quote!(::cubecl::prelude::Const<#li>));
+                    width_vals.insert(key, li.clone());
                 }
                 other => {
                     errors.push(syn::Error::new(
                         other.span(),
                         format!(
                             "instantiate(...) value for type parameter `{key}` must be a \
-                             concrete type (e.g. `{key} = f32`), not an expression"
+                             concrete type (e.g. `{key} = f32`) or, for a `Vector` width \
+                             generic, an integer literal (e.g. `{key} = 4`) — not an arbitrary \
+                             expression"
                         ),
                     ));
                 }
@@ -1906,13 +2046,19 @@ fn resolve_instantiate(
 
     let generic_types_in_order: Vec<Type> = generic_params
         .iter()
-        .map(|g| syn::parse2(generic_subst[&g.to_string()].clone()).expect("validated above"))
+        .map(|g| turbofish[&g.to_string()].clone())
+        .collect();
+    // One `usize` width argument per `Size` generic, in declared generic order.
+    let width_args: Vec<TokenStream2> = generic_params
+        .iter()
+        .filter_map(|g| width_vals.get(&g.to_string()).map(|li| quote!(#li as usize)))
         .collect();
 
     Ok(InstantiatePlan {
         generic_subst,
         comptime_values,
         generic_types_in_order,
+        width_args,
         pretty: pretty_entries,
     })
 }
@@ -1988,6 +2134,32 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         ));
     }
 
+    // A `Vector<_, N>` kernel must pin its width via `instantiate(N = W)`: the
+    // reference twin (`Line<_, W>`) and the launch vectorization both need a
+    // concrete lane count (design-line-vector.md §8.1, §8.3). Emit that targeted
+    // message *before* `resolve_instantiate`'s generic "missing value" error so
+    // the diagnostic names the vector width.
+    let instantiate_names: HashSet<String> = spec
+        .instantiate
+        .as_ref()
+        .map(|(_, entries)| entries.iter().map(|e| e.name.to_string()).collect())
+        .unwrap_or_default();
+    for arg in &func.sig.inputs {
+        let FnArg::Typed(pt) = arg else { continue };
+        if let Some(wid) = unpinned_vector_width_ident(&pt.ty) {
+            if !instantiate_names.contains(&wid.to_string()) {
+                return Err(syn::Error::new(
+                    wid.span(),
+                    format!(
+                        "a `Vector<_, {wid}>` kernel requires `instantiate({wid} = W)` to pin the \
+                         vector width; `{wid}` is unpinned — the reference twin (`Line<_, W>`) and \
+                         the launch vectorization both need a concrete width"
+                    ),
+                ));
+            }
+        }
+    }
+
     let fn_name = &func.sig.ident;
     let fn_name_str = fn_name.to_string();
 
@@ -2050,6 +2222,33 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         .map(|arg| substitute_fn_arg(arg, &plan.generic_subst))
         .collect::<syn::Result<_>>()?;
     let params: Vec<Param> = subst_args.iter().map(classify_param).collect::<syn::Result<_>>()?;
+
+    // A kernel is a "vector kernel" (design §11 V3) iff any array parameter's
+    // element is a pinned-width `Vector<P, W>`. This gate lifts the `Vector`
+    // ban for the twin body and swaps the twin/kernel element type mappings
+    // below; it is off for every ordinary scalar-`Array` kernel, so their
+    // codegen is byte-for-byte unchanged.
+    let is_vector_kernel = params.iter().any(|p| match &p.kind {
+        ParamKind::ArrayRef(e) | ParamKind::ArrayMut(e) => is_vector_elem(e),
+        _ => false,
+    });
+
+    // The vectorized launch / input-generation / per-lane comparison path is
+    // delivered in V4 (design §11). Until then a `Vector` kernel generates its
+    // reference twin, `kernel_definition()` (for bounds proving), and contract,
+    // but not the differential `conformance_case`/`generate_case` — so a
+    // `gen(...)` clause on a vector kernel would be silently unused. Reject it by
+    // name rather than record a contract clause that does nothing.
+    if is_vector_kernel && !spec.gen_entries.is_empty() {
+        return Err(syn::Error::new(
+            func.sig.span(),
+            format!(
+                "kernel `{fn_name_str}`: gen(...) input generation for `Vector<_, N>` kernels is \
+                 delivered in a later milestone (the vectorized launch/I/O path); remove the \
+                 gen(...) clause for now — the reference twin and bounds proof do not need it"
+            ),
+        ));
+    }
 
     // instantiate(...) namespace-collision gate (see
     // `check_instantiate_local_collisions`'s doc): must run on the
@@ -2184,7 +2383,7 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         comptime_param_names.iter().map(|i| i.to_string()).collect();
     let pre_body = rewrite_comptime_blocks(func.block.to_token_stream(), &comptime_set, &mut errors);
     let ref_body_tokens =
-        transform_body(pre_body, &plan.generic_subst, true, is_coop, &mut errors);
+        transform_body(pre_body, &plan.generic_subst, true, is_coop, is_vector_kernel, &mut errors);
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
         a
@@ -2307,14 +2506,24 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     // bound as `let name: ty = value;` consts — loop-invariant by
     // construction, so they're injected once at the top of each generated
     // function that needs them (see `comptime_bindings` below).
+    // The twin's element type for an array parameter: `Line<P, W>` for a
+    // `Vector<P, W>` element (design §4.2), the element type itself otherwise.
+    let twin_elem = |elem: &Type| vector_twin_elem(elem).unwrap_or_else(|| elem.clone());
+
     let ref_params: Vec<TokenStream2> = params
         .iter()
         .filter_map(|p| {
             let name = &p.name;
             match &p.kind {
                 ParamKind::Scalar(ty) => Some(quote!(#name: #ty)),
-                ParamKind::ArrayRef(elem) => Some(quote!(#name: &[#elem])),
-                ParamKind::ArrayMut(elem) => Some(quote!(#name: &mut [#elem])),
+                ParamKind::ArrayRef(elem) => {
+                    let e = twin_elem(elem);
+                    Some(quote!(#name: &[#e]))
+                }
+                ParamKind::ArrayMut(elem) => {
+                    let e = twin_elem(elem);
+                    Some(quote!(#name: &mut [#e]))
+                }
                 ParamKind::Comptime(_) => None,
             }
         })
@@ -2343,7 +2552,8 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             match &p.kind {
                 ParamKind::Scalar(ty) => Some(quote!(#name: #ty)),
                 ParamKind::ArrayRef(elem) | ParamKind::ArrayMut(elem) => {
-                    Some(quote!(#name: &[#elem]))
+                    let e = twin_elem(elem);
+                    Some(quote!(#name: &[#e]))
                 }
                 ParamKind::Comptime(_) => None,
             }
@@ -2464,6 +2674,10 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 kd_call_args.push(quote!(#name));
             }
             ParamKind::ArrayRef(elem) => {
+                // The IR side uses the real CubeCL element type: a `Vector<P, W>`
+                // element becomes `Vector<P, Const<W>>` (the width as a `Size`),
+                // a scalar element stays itself (design §2.1).
+                let elem = vector_kernel_elem(elem).unwrap_or_else(|| elem.clone());
                 kd_stmts.push(quote! {
                     let #name = <::cubecl::prelude::Array<#elem> as ::cubecl::prelude::LaunchArg>::expand(
                         &::cubecl::prelude::ArrayCompilationArg { inplace: None },
@@ -2474,6 +2688,7 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 kd_call_args.push(quote!(#name));
             }
             ParamKind::ArrayMut(elem) => {
+                let elem = vector_kernel_elem(elem).unwrap_or_else(|| elem.clone());
                 kd_stmts.push(quote! {
                     let #name = <::cubecl::prelude::Array<#elem> as ::cubecl::prelude::LaunchArg>::expand_output(
                         &::cubecl::prelude::ArrayCompilationArg { inplace: None },
@@ -2505,6 +2720,10 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     } else {
         quote!(::<#(#generic_types),*>)
     };
+    // The extra `usize` width argument(s) cubecl's `expand` takes per `Size`
+    // generic, spliced right after the scope in `kernel_definition()` (empty for
+    // any kernel without a `Vector` width generic — the scalar path unchanged).
+    let kd_width_args = &plan.width_args;
 
     // --- reference() function + conformance_case(): the macro-generated GPU
     // launch/input-gen glue (README ergonomics milestone). The cooperative
@@ -2569,15 +2788,26 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 for __vericl_abs_pos in 0..num_threads #ref_body
             }
         };
-        let conformance = build_conformance_items(
-            &params,
-            &spec.gen_entries,
-            fn_name,
-            &fn_name_str,
-            &plan.comptime_values,
-            generic_types,
-            &elem_gen_bounds,
-        )?;
+        // The vectorized differential path (flat-scalar gen, `lines*W` buffer
+        // sizing, launch vectorization, per-lane compare) is V4 (design §11). A
+        // vector kernel therefore ships its twin + `kernel_definition()` (for
+        // bounds proving) + contract, but no `conformance_case`/`generate_case`
+        // yet — the scalar codegen here assumes the element type is both a
+        // `CubeElement` and directly comparable, which `Line<_, W>` is not. The
+        // scalar path is byte-for-byte unchanged.
+        let conformance = if is_vector_kernel {
+            quote! {}
+        } else {
+            build_conformance_items(
+                &params,
+                &spec.gen_entries,
+                fn_name,
+                &fn_name_str,
+                &plan.comptime_values,
+                generic_types,
+                &elem_gen_bounds,
+            )?
+        };
         (reference_fn, conformance)
     };
 
@@ -2737,7 +2967,11 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 // indices) map to concrete storage types; panics without it.
                 ::cubecl::prelude::AddressType::U32.register(&mut __vericl_builder.scope);
                 #(#kd_stmts)*
-                #fn_name::expand #expand_turbofish(&mut __vericl_builder.scope, #(#kd_call_args),*);
+                #fn_name::expand #expand_turbofish(
+                    &mut __vericl_builder.scope,
+                    #(#kd_width_args,)*
+                    #(#kd_call_args),*
+                );
                 __vericl_builder.build(::cubecl::prelude::KernelSettings::default())
             }
 
@@ -3109,8 +3343,11 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
         })
         .collect();
     let pre_body = rewrite_comptime_blocks(func.block.to_token_stream(), &comptime_set, &mut errors);
+    // Vector-typed helpers (uses(...) composition with a `Vector` element) are
+    // deferred past V3 — the gate is off here, so a `Vector` in a helper body
+    // stays banned. Kernel-level vector support is the V3 deliverable.
     let ref_body_tokens =
-        transform_body(pre_body, &plan.generic_subst, false, false, &mut errors);
+        transform_body(pre_body, &plan.generic_subst, false, false, false, &mut errors);
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
         a
@@ -5008,6 +5245,53 @@ mod tests {
             err.to_string().contains("cast_from"),
             "the rejection must name the method: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Vector<P, N> element support — V3 macro gates (design-line-vector.md
+    // §8.1, §8.3, §11). Recognition + width pinning + the ban lift, and the
+    // two targeted rejections.
+    // -----------------------------------------------------------------
+
+    /// A `Vector<_, N>` kernel whose width is not pinned by `instantiate(N = W)`
+    /// gets the targeted add-the-clause error naming the vector width — before
+    /// the generic "missing instantiate value" message (design §8.3).
+    #[test]
+    fn vector_kernel_without_pinned_width_is_rejected() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k<N: Size>(a: &Array<Vector<f32, N>>, out: &mut Array<Vector<f32, N>>) { \
+             if ABSOLUTE_POS < out.len() { out[ABSOLUTE_POS] = a[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let err = expand(quote!(compare(abs = 1e-6)), &func)
+            .expect_err("an unpinned Vector width must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("instantiate(N = W)") && msg.contains("width"),
+            "expected the targeted add-the-clause error naming the width: {msg}"
+        );
+    }
+
+    /// A cross-lane reduction (`dot`/`magnitude`/`normalize`) on a vector twin is
+    /// outside the §7 op surface and rejected by name at macro time — its
+    /// GPU-defined summation order is unverified (design §7 "Cross-lane reduce",
+    /// §8.3). It is on `FLOAT_METHOD_REJECT`, so the existing `FloatMethodCheck`
+    /// fires on the (method-form) call in the derived twin.
+    #[test]
+    fn vector_cross_lane_reduce_is_rejected_by_name() {
+        for method in ["dot", "magnitude", "normalize"] {
+            let src = format!(
+                "pub fn k<N: Size>(a: &Array<Vector<f32, N>>, out: &mut Array<f32>) {{ \
+                 if ABSOLUTE_POS < out.len() {{ out[ABSOLUTE_POS] = a[ABSOLUTE_POS].{method}(); }} }}"
+            );
+            let func: ItemFn = syn::parse_str(&src).expect("valid fn");
+            let err = expand(quote!(compare(abs = 1e-6), instantiate(N = 4)), &func)
+                .expect_err(&format!("cross-lane `{method}` must be rejected"));
+            assert!(
+                err.to_string().contains(method),
+                "the rejection must name the method `{method}`: {err}"
+            );
+        }
     }
 
     /// Round-7 F1 (defense-in-depth): a *parenthesised* intrinsic callee

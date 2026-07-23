@@ -1258,9 +1258,54 @@ pub fn comptime_shift(x: &Array<u32>, y: &mut Array<u32>, #[comptime] extra: u32
     }
 }
 
+/// Clean-room vectorized elementwise add over `Array<Vector<f32, N>>`
+/// (design-line-vector.md §11 V3). The width is pinned to `4` via
+/// `instantiate(N = 4)`, so the reference twin is monomorphized to
+/// `&[::vericl::Line<f32, 4>]` and the `Vector` element ban is lifted under the
+/// vector gate. Reference kernel shape is upstream-public (cubecl-core's own
+/// `runtime_tests/vector.rs`; MIT/Apache-2.0). No `gen(...)`: the vectorized
+/// differential launch/I/O is delivered in a later milestone — this fixture
+/// exercises the twin + bounds path, not the GPU conformance path.
+#[vericl::kernel(
+    assumes(a.len() == out.len(), b.len() == out.len()),
+    compare(abs = 1e-6),
+    instantiate(N = 4)
+)]
+#[cube(launch)]
+pub fn vec_add<N: Size>(
+    a: &Array<Vector<f32, N>>,
+    b: &Array<Vector<f32, N>>,
+    out: &mut Array<Vector<f32, N>>,
+) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] + b[ABSOLUTE_POS];
+    }
+}
+
+/// Clean-room vectorized scale-by-splat: `out[p] = a[p] * Vector::new(s)`. Its
+/// body contains a `Vector` ident (the splat constructor), so it exercises the
+/// V3 `Vector`->`::vericl::Line` head rewrite inside the twin body (design §4.3),
+/// which `vec_add` above does not.
+#[vericl::kernel(
+    assumes(a.len() == out.len()),
+    compare(abs = 1e-6),
+    instantiate(N = 4)
+)]
+#[cube(launch)]
+pub fn vec_scale<N: Size>(
+    s: f32,
+    a: &Array<Vector<f32, N>>,
+    out: &mut Array<Vector<f32, N>>,
+) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] * Vector::new(s);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vericl::Line;
 
     /// Validates the macro-derived twin against independently written scalar
     /// code — guarding the source-to-reference derivation itself.
@@ -1276,6 +1321,106 @@ mod tests {
             s ^= s << 5;
             assert_eq!(y[i], s, "index {i}");
         }
+    }
+
+    /// V3 acceptance (design §11): the macro-derived twin for the vectorized
+    /// `vec_add` — mapped to `&[Line<f32, 4>]` via `instantiate(N = 4)` and the
+    /// `Vector`->`Line` head rewrite — matches an independently hand-written
+    /// `Line` twin lane-for-lane, and honours the `ABSOLUTE_POS < out.len()`
+    /// guard. This is the `*_twin_matches_handwritten` precedent extended to a
+    /// vector element type.
+    #[test]
+    fn vec_add_twin_matches_handwritten_line() {
+        let a = vec![
+            Line([1.0f32, 2.0, 3.0, 4.0]),
+            Line([-1.0f32, 0.5, 100.0, -7.5]),
+            Line([0.0f32, 0.0, 0.0, 0.0]),
+        ];
+        let b = vec![
+            Line([10.0f32, 20.0, 30.0, 40.0]),
+            Line([1.0f32, 1.0, 1.0, 1.0]),
+            Line([9.0f32, 8.0, 7.0, 6.0]),
+        ];
+        let mut out = vec![Line([-1.0f32; 4]); a.len()];
+        // Dispatch far more threads than lines: the guard must leave nothing
+        // out of place and the twin must not run past `out.len()`.
+        vec_add_vericl::reference(&a, &b, &mut out, 256);
+
+        // Independent hand-written lane-array reference.
+        let want: Vec<Line<f32, 4>> = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| Line(core::array::from_fn(|j| x.0[j] + y.0[j])))
+            .collect();
+        assert_eq!(out, want);
+        // And bit-exact per lane (elementwise add is correctly rounded).
+        for (o, w) in out.iter().zip(&want) {
+            for j in 0..4 {
+                assert_eq!(o.0[j].to_bits(), w.0[j].to_bits(), "lane {j}");
+            }
+        }
+    }
+
+    /// V3 body-rewrite acceptance: `vec_scale`'s body uses `Vector::new(s)`,
+    /// which the macro rewrites to `::vericl::Line::new(s)` in the twin. The
+    /// derived twin computes `a[p] * splat(s)` lane-for-lane, matching a
+    /// hand-written `Line` reference — confirming the `Vector` head rewrite
+    /// inside the body (not just the signature) is correct.
+    #[test]
+    fn vec_scale_twin_rewrites_splat_and_matches_handwritten() {
+        let s = 2.5f32;
+        let a = vec![
+            Line([1.0f32, 2.0, 3.0, 4.0]),
+            Line([-2.0f32, 0.0, 8.0, -1.5]),
+        ];
+        let mut out = vec![Line([0.0f32; 4]); a.len()];
+        vec_scale_vericl::reference(s, &a, &mut out, 64);
+
+        let want: Vec<Line<f32, 4>> =
+            a.iter().map(|x| Line(core::array::from_fn(|j| x.0[j] * s))).collect();
+        assert_eq!(out, want);
+    }
+
+    /// The vectorized `vec_add` twin honours the guard: with fewer threads than
+    /// lines, lines past the dispatch keep their initial contents.
+    #[test]
+    fn vec_add_twin_respects_guard() {
+        let a = vec![Line([1.0f32; 4]); 4];
+        let b = vec![Line([2.0f32; 4]); 4];
+        let mut out = vec![Line([-9.0f32; 4]); 4];
+        vec_add_vericl::reference(&a, &b, &mut out, 2); // only 2 of 4 lines
+        assert_eq!(out[0], Line([3.0f32; 4]));
+        assert_eq!(out[1], Line([3.0f32; 4]));
+        assert_eq!(out[2], Line([-9.0f32; 4])); // untouched
+        assert_eq!(out[3], Line([-9.0f32; 4])); // untouched
+    }
+
+    /// The vectorized `vec_add` kernel's IR proves bounds-free exactly like the
+    /// scalar axpy — 3 obligations (a read, b read, out write), line-granular,
+    /// with `N` never entering the obligation (design §5.1). Confirms
+    /// `kernel_definition()` builds valid vector IR under `instantiate(N = 4)`.
+    #[test]
+    fn vec_add_kernel_definition_is_provably_in_bounds() {
+        let def = vec_add_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = vec_add_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [
+            vericl_ir::Assume::LenEq { a: "a", b: "out" },
+            vericl_ir::Assume::LenEq { a: "b", b: "out" },
+        ];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved {{ obligations: 3 }}, got {other:?}"),
+        }
+    }
+
+    /// The contract records the pinned width in `instantiate` — a re-run at a
+    /// different width is a visibly different claim.
+    #[test]
+    fn vec_add_contract_records_pinned_width() {
+        assert_eq!(vec_add_vericl::contract().instantiate, &["N = 4"]);
     }
 
     /// The twin honors the guard: threads past the guard write nothing.

@@ -16,6 +16,7 @@ pub mod compare;
 pub mod contract;
 pub mod evidence;
 pub mod host_shims;
+pub mod line;
 pub mod panic;
 pub mod rng;
 pub mod shared;
@@ -36,6 +37,7 @@ pub use evidence::{
     describe_case_outcome, differential_config, proved_bounds_cooperative_config,
     proved_config, proved_race_config, race_freedom_assumption_claim, verify,
 };
+pub use line::Line;
 pub use panic::catch_reference_panic;
 pub use rng::SplitMix64;
 pub use shared::SharedTile;

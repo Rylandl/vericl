@@ -2002,8 +2002,9 @@ impl<'a, 'b> Prover<'a, 'b> {
     ) -> Result<(), Stop> {
         if !(vector_size == 0 || vector_size == 1) || unroll_factor != 1 {
             return Err(Stop::OutOfSubset(format!(
-                "vectorized/unrolled indexing (vector_size={vector_size}, \
-                 unroll_factor={unroll_factor}) is outside the vericl v0 subset"
+                "reinterpret-vectorized indexing (vector_size={vector_size}, \
+                 unroll_factor={unroll_factor}) is a View/Slice reinterpret-slice construct \
+                 outside the vericl v0 subset"
             )));
         }
         Ok(())
@@ -3251,8 +3252,19 @@ impl<'a, 'b> Prover<'a, 'b> {
 /// checker models as an SMT `Int` — explicitly excludes `Bool` even though
 /// `ElemType::is_int()` counts it (booleans are built directly from
 /// `Comparison`, never arithmetic).
+///
+/// The `vector_size() == 1` clause is load-bearing for soundness (design-line-
+/// vector.md §5.3, round-8 risk 1): `Type::Vector(u32, N).is_int()` is `true`
+/// (a vector's *storage* is an int), so without this guard a `Vector<u32, N>`
+/// value would be eligible to be modeled as a *single* SMT `Int` — one scalar
+/// leaf standing in for N lanes. If such a value ever reached an index or an
+/// element-range assume, the bound would be a fiction. `Type::vector_size()` is
+/// `1` for a `Scalar` and `N` for a `Vector`, so requiring `== 1` admits only
+/// scalar integers; vector integers fall through to *tainted-but-unmodeled* at
+/// both live sites (`value_of`'s `GlobalScalar` leaf and `model_element_read`'s
+/// element-range leaf), exactly as the whole-vector shapes require.
 fn is_modeled_int(ty: &Type) -> bool {
-    ty.is_int() && !ty.is_bool()
+    ty.is_int() && !ty.is_bool() && ty.vector_size() == 1
 }
 
 fn is_unsigned(ty: &Type) -> bool {
@@ -7037,6 +7049,197 @@ mod tests {
                 panic!("VACUOUS PROOF: contradictory length assumes must never yield Proved")
             }
             other => panic!("expected OutOfSubset (contradictory assumptions), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Vector<P, N> element support — the soundness guard (design-line-
+    // vector.md §5, §11 V1; round-8 risk 1). Whole-vector array bounds are
+    // the existing line-granular obligation (proved unmodified), plus the
+    // `is_modeled_int` `vector_size() == 1` guard that keeps a vector integer
+    // from ever being minted as a single scalar SMT `Int`.
+    // -----------------------------------------------------------------
+
+    /// The load-bearing guard, tested at the predicate directly (the round-8
+    /// risk-1 attack surface). `Type::Vector(u32, 4).is_int()` is `true` — a
+    /// vector's *storage* is integer — so pre-guard `is_modeled_int` returned
+    /// `true` for it, making a 4-lane vector eligible to be modeled as one
+    /// scalar `Int`. The `vector_size() == 1` clause admits only genuine
+    /// scalars. This test fails loudly if the clause is ever removed.
+    #[test]
+    fn is_modeled_int_rejects_vector_integers() {
+        use cubecl::ir::StorageType;
+        let scalar_u32 = Type::scalar(ElemType::UInt(UIntKind::U32));
+        let vec_u32x4 = Type::Vector(StorageType::Scalar(ElemType::UInt(UIntKind::U32)), 4);
+        let vec_u32x1 = Type::Vector(StorageType::Scalar(ElemType::UInt(UIntKind::U32)), 1);
+
+        // The trap the guard closes: a 4-lane integer vector is `is_int()` but
+        // must NOT be modeled as a scalar integer leaf.
+        assert!(vec_u32x4.is_int(), "precondition: a u32 vector's storage is integer");
+        assert!(!vec_u32x4.is_bool());
+        assert_eq!(vec_u32x4.vector_size(), 4);
+        assert!(
+            !is_modeled_int(&vec_u32x4),
+            "a Vector<u32, 4> must never be modeled as a single scalar Int (round-8 risk 1)"
+        );
+
+        // Genuine scalars still model, unchanged.
+        assert!(is_modeled_int(&scalar_u32), "a scalar u32 must still model as an Int");
+        // A width-1 vector is a scalar in every semantic sense (vector_size == 1).
+        assert!(is_modeled_int(&vec_u32x1), "a width-1 vector is scalar-equivalent");
+    }
+
+    // The whole-vector `vec_add` from the design's `scratchpad/linevec/src/bin/
+    // prove.rs` probe, reproduced here as the V1 unit test: the current bounds
+    // walker proves a real `Array<Vector<f32, N>>` kernel unmodified, and the
+    // unguarded variant is refuted at the boundary. Whole-vector indexing lowers
+    // to `vector_size: 0` (width in the list's Type), so it passes
+    // `check_trivial_vectorization`; `.len()` is line-granular, so the obligation
+    // is exactly the scalar one — `N` never appears.
+
+    #[cube(launch)]
+    fn prover_test_vec_add<N: Size>(
+        a: &Array<Vector<f32, N>>,
+        b: &Array<Vector<f32, N>>,
+        out: &mut Array<Vector<f32, N>>,
+    ) {
+        if ABSOLUTE_POS < out.len() {
+            out[ABSOLUTE_POS] = a[ABSOLUTE_POS] + b[ABSOLUTE_POS];
+        }
+    }
+
+    #[cube(launch)]
+    fn prover_test_vec_add_oob<N: Size>(
+        a: &Array<Vector<f32, N>>,
+        b: &Array<Vector<f32, N>>,
+        out: &mut Array<Vector<f32, N>>,
+    ) {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] + b[ABSOLUTE_POS];
+    }
+
+    fn build_vec_add(oob: bool) -> KernelDefinition {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let a = <Array<Vector<f32, Const<4>>> as LaunchArg>::expand(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        let b = <Array<Vector<f32, Const<4>>> as LaunchArg>::expand(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        let out = <Array<Vector<f32, Const<4>>> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        if oob {
+            prover_test_vec_add_oob::expand::<Const<4>>(&mut builder.scope, 4, a, b, out);
+        } else {
+            prover_test_vec_add::expand::<Const<4>>(&mut builder.scope, 4, a, b, out);
+        }
+        builder.build(KernelSettings::default())
+    }
+
+    const VEC_ADD_BUFFERS: &[BufferParam] = &[
+        BufferParam { name: "a", is_output: false },
+        BufferParam { name: "b", is_output: false },
+        BufferParam { name: "out", is_output: true },
+    ];
+
+    /// Positive control (design §5.1): the real, unmodified bounds walker proves
+    /// a whole-vector `Array<Vector<f32, 4>>` kernel — 3 obligations (a read, b
+    /// read, out write), the identical count as the scalar axpy, because the
+    /// obligation is line-granular and `N` never enters it.
+    #[test]
+    fn whole_vector_vec_add_proves() {
+        let def = build_vec_add(false);
+        let assumes =
+            [Assume::LenEq { a: "a", b: "out" }, Assume::LenEq { a: "b", b: "out" }];
+        match prove_bounds_freedom(&def, VEC_ADD_BUFFERS, &assumes) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved {{ obligations: 3 }}, got {other:?}"),
+        }
+    }
+
+    /// Negative control: the unguarded whole-vector write is genuinely OOB and
+    /// must refute at the line-granular boundary (`abs_pos == len`, `len == 0`).
+    #[test]
+    fn whole_vector_vec_add_unguarded_refutes() {
+        let def = build_vec_add(true);
+        let assumes =
+            [Assume::LenEq { a: "a", b: "out" }, Assume::LenEq { a: "b", b: "out" }];
+        match prove_bounds_freedom(&def, VEC_ADD_BUFFERS, &assumes) {
+            ProveResult::Refuted { obligation: _, counterexample } => {
+                assert!(!counterexample.is_empty());
+                assert!(
+                    counterexample.contains("abs_pos"),
+                    "counterexample should exhibit the boundary position: {counterexample}"
+                );
+            }
+            other => panic!("expected Refuted (unguarded vector write), got {other:?}"),
+        }
+    }
+
+    /// Round-8 risk-1 negative control: a `Array<Vector<u32, N>>` value under an
+    /// `ElemsBelowConst` assume — the exact shape the reviewer will hand the
+    /// prover. The whole-vector read is NOT modeled as a scalar element leaf
+    /// (the `is_modeled_int` guard makes `model_element_read` decline it), and
+    /// the lane extraction `v[0]` that would turn it into an index is itself out
+    /// of subset (a register-vector index). Either way the honest answer is
+    /// `OutOfSubset` — never a `Proved` on a fictional per-lane bound. Contrast
+    /// with `gather_with_element_assume_proves`, where the *scalar* `Array<u32>`
+    /// offsets under the identical assume shape DO prove: the vector element type
+    /// is exactly what removes the false-`Proved` risk here.
+    #[cube(launch)]
+    fn prover_test_vec_offsets_gather<N: Size>(
+        offsets: &Array<Vector<u32, N>>,
+        x: &Array<f32>,
+        y: &mut Array<f32>,
+    ) {
+        if ABSOLUTE_POS < y.len() {
+            let v = offsets[ABSOLUTE_POS];
+            y[ABSOLUTE_POS] = x[v[0] as usize];
+        }
+    }
+
+    #[test]
+    fn vector_offsets_gather_is_out_of_subset() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let offsets = <Array<Vector<u32, Const<4>>> as LaunchArg>::expand(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        let x = <Array<f32> as LaunchArg>::expand(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_vec_offsets_gather::expand::<Const<4>>(&mut builder.scope, 4, offsets, x, y);
+        let def = builder.build(KernelSettings::default());
+
+        let buffers = [
+            BufferParam { name: "offsets", is_output: false },
+            BufferParam { name: "x", is_output: false },
+            BufferParam { name: "y", is_output: true },
+        ];
+        // The assume the reviewer would supply to try to force a per-lane bound.
+        let assumes = [
+            Assume::LenEq { a: "offsets", b: "y" },
+            Assume::ElemsBelowConst { arr: "offsets", bound: 8 },
+        ];
+        match prove_bounds_freedom(&def, &buffers, &assumes) {
+            ProveResult::OutOfSubset { .. } => {}
+            ProveResult::Proved { .. } => panic!(
+                "VACUOUS PROOF: a Vector<u32, N> element must never mint a per-lane bound \
+                 (round-8 risk 1)"
+            ),
+            other => panic!("expected OutOfSubset (vector value out of subset), got {other:?}"),
         }
     }
 }
