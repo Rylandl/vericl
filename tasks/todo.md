@@ -1427,3 +1427,15 @@ without Ryland's explicit go. Pre-send verification checklist:
    (axpy expected 1776.99, got 526.99; cpu lane bit-exact).
 The broader upstream package (7 compiler/runtime findings + docs/ecosystem-survey-2026-07.md)
 goes with it when Ryland green-lights contact.
+
+## Agreed sequencing (Ryland, 2026-07-23)
+
+Quick wins -> Line/Vector -> certificates + IR-interpreter cross-check (parallel with
+View/Slice) -> cubecl-0.11 upgrade drill -> productization gate. plane_* deferred.
+Ladder decision: take Rung A (cvc5/Alethe certificates + counterexample validation) and
+Rung B (IR reference interpreter + fuzz cross-check); skip Verus/Lean tiers (documented
+rationale: cost, capability reduction, and no authoritative CubeCL spec to anchor them).
+
+Quick-wins batch 1 (prover-leaning): match/Switch modeling; length-relationship assumes.
+Quick-wins batch 2 (macro-leaning): verified cast_from/mul_hi host shims; helper-level
+wrapping; comptime! block evaluation under instantiate. Review round 7 after both.
