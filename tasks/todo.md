@@ -2092,3 +2092,82 @@ on both feature sets. `conform demo-defects` exits 0, output unchanged. New file
 `crates/vericl-examples/tests/interp_crosscheck.rs`, `docs/interpreter.md`; `crates/vericl-ir/src/lib.rs`
 gained the two `mod` + re-export lines. No prover/twin/evidence code touched — the interpreter only
 *reads* `KernelDefinition`s the existing machinery already produces.
+
+## CubeCL-0.11 upgrade drill — DONE 2026-07-24
+
+Rehearsed the promised upgrade against **cubecl git main =
+`0.11.0-pre.1` @ `870666bf46e1c370d3aae08e3dcb9d9a74ed90c8`** (no 0.11 on
+crates.io yet — 0.10.0 still latest). Full write-up:
+**`docs/upgrade-drill-2026-07.md`**. Disposable drill copy left in place at
+`/Users/ryland/code/vericl-upgrade-drill` (not a git repo; `README.DRILL.md`
+inside says it's deletable — `rm -rf` it any time). Canonical repo untouched;
+`=0.10.0` pin intact.
+
+**Isolation held — the headline structural result.** Only `vericl-ir` breaks.
+`crates/vericl` (36 tests) and `crates/vericl-macros` (60 tests) pass on main
+**unchanged** (neither depends on cubecl). So a 0.11 upgrade is a `vericl-ir`
+porting job, not a workspace rewrite — the README "isolate all IR-facing code
+in one crate" decision paid off exactly as intended.
+
+**Toolchain finding:** cubecl `0.11.0-pre.1` bumped **MSRV to rustc ≥ 1.95**
+(`cubecl-zspace`); drill machine had 1.94.0. Drilled with a locally-installed
+`1.97.1` (default toolchain left unchanged). The real upgrade must bump
+`rust-version` + README toolchain note.
+
+**Breakage catalog (vericl-ir, 89 first-pass errors: prover 50, fuzz 23,
+interp 17, hash 1):**
+- `Scope` is now interior-mutable (`instructions`/`locals` are `RefCell<…>`);
+  `const_arrays` gone; `create_local_restricted` gone; `AddressType::register`
+  takes `&Scope`. Mechanical (`.borrow()`/`.get_mut()`), ~20 sites.
+- **SSA value model rebuilt:** `Variable`→`Value`, `VariableKind`→`ValueKind`,
+  and `ValueKind` collapsed to `Value{id}`|`Constant` — the rich kind enum
+  (GlobalInputArray/LocalMut/Builtin/…) is GONE; semantics moved to ops
+  (`ReadBuiltin`/`ReadScalar`/`global_args`). **Architectural** for the prover.
+- **Memory model rebuilt:** `Operator::Index/IndexAssign/Unchecked*` removed →
+  new `Operation::Memory(Memory::Index/Load/Store)` **pointer** model;
+  `IndexOperands` now carries **`checked: bool`** + `unroll_factor` (the IR
+  itself now models bounds-checking — directly in vericl's domain).
+  **Architectural** for the prover's bounds analysis.
+- `Metadata::Length`/`Rank` removed; `BufferLength.var`→`list`.
+- `Arithmetic::Modulo` split into `Rem` (truncated) + `ModFloor` (floored);
+  operand structs `BinaryOperator`/`UnaryOperator`→`BinaryOperands`/
+  `UnaryOperands`; `KernelDefinition.buffers`→`Vec<BufferInfo>`,
+  `scalars`→`Vec<ScalarInfo>`; launch `ArrayArg`→`BufferArg`;
+  `ComputeClient<S,C>`→`ComputeClient<R>`.
+
+**4a — axpy `ir_hash` changes: YES, guaranteed** (drift tripwire fires as
+designed). `Scope::Hash` now also folds `locals`; body IR + `Value` + `buffers`
+all restructured → the stored `sha256:3ae1a32f…` cannot match; every
+`evidence/*.json` `ir_hash` goes stale on upgrade until re-verified. Identity
+*mechanism* ports with **1 line** changed (RefCell `get_mut`) — proven to
+compile (`f64probe/src/bin/hash_port.rs`). Bonus: main adds a **`TypeHash`**
+schema-drift trait (ideal future tripwire) but its recursion overflows on
+non-flat IR types (`Type` is self-recursive) — usable only on flat leaf kinds
+today; worth an upstream report.
+
+**4b — f64-on-wgpu silent corruption: STILL REPRODUCES on main (disclosure
+headline).** Self-contained probe (`f64probe/src/bin/f64_wgpu.rs`, cubecl-only):
+cpu lane bit-exact; wgpu lane silently diverges (elem0 got 100 vs 102.5, worst
+err 2.5e3 at n=1027) with **no compile error, no panic, no naga/wgpu
+diagnostic**. Not fixed, not rejected — same silent-corruption class as 0.10.
+→ **Queued-disclosure checklist item 1 = DONE: "still present at `870666bf`
+(0.11.0-pre.1); published 0.10 affected — consider advisory + a launch-time
+f64-on-wgpu reject."** Item 2 (SPIR-V path) still open — drill covered the
+naga/WGSL/Metal path only. **Still queued; do NOT contact anyone without
+Ryland's explicit go.**
+
+**4c — other findings on main:** eager `&&` — eager `Operator::And/Or/Not`
+persist, but main **added short-circuit machinery + a `short_circuit` regression
+test** for side-effecting RHS (finding partially addressed; guarded-array-read
+case needs an IR re-probe during the real port). division/modulo — IR
+`Modulo`→`Rem`+`ModFloor` (rounding clarified); naga div-by-zero runtime
+fallback not re-probed (backend behavior). `terminate!()` host expansion /
+`CUBE_COUNT` on cpu — live above the IR layer, not re-verifiable while the
+prover is un-ported; deferred to the real upgrade's re-verification pass.
+
+**Effort estimate to port vericl-ir to 0.11:** hash core ~0.5 h (proven);
+hash harness ~1–2 h; interp ~1–2 days; fuzz ~1–2 days; **prover ~1–2 weeks +
+full 7-round soundness re-review** (both its SSA-value and memory models
+changed — architectural, characterized-not-rewritten per protocol); re-stamp
+evidence ~1 h. Recommended playbook (order, re-verify list, dedicated review
+round) in `docs/upgrade-drill-2026-07.md`.
