@@ -1729,3 +1729,20 @@ true vector element type; the whole-kernel unlock (reductions/matmul launch site
 (#2 gap) + `Atomic` + `comptime!` + `match` — a documented, non-silent boundary. Deferred with targeted
 rejections: cross-lane reductions, `SharedMemory<Vector>`, reinterpret-slice (`vector_size≠0`), vector
 `cast_from`/`wrapping`, single-clause width sweep.
+
+## Round-8 adversarial review (2026-07-23) — CLEAN
+
+Verdict: Vector milestone merge-ready, no critical — fourth consecutive clean round
+(3, 6, 7, 8). Surfaces held under injection: the is_modeled_int vector guard is
+load-bearing at cast_int (cast_is_value_preserving would pass a Vector<u32,4> as a
+scalar without it) and pinned by its direct predicate test; register-lane taint covers
+read AND write through the branch write-log; the width is single-sourced across all
+three faces (twin literal / Const<W> expand / folded launch) with factor-W mis-sizing
+caught loudly lane-named; mixed vector/scalar-array kernels rejected by name and length
+symbols opaque-in-units (no unit-confusion bound transfer); GT tiers discriminate
+(injected comparison defect caught); compound-assign GPU sharing empirically confirmed;
+empty() is zero-init on cubecl 0.10 + Metal so the twin's zero convention is
+bit-faithful. Coverage nuances recorded, not defects: the two gather attack-shape tests
+are saved by register-lane taint rather than the guard (only the predicate test
+discriminates guard removal); powi/clamp/is_nan derive from GT'd primitives rather than
+carrying dedicated GT rows (same posture as the scalar whitelist).
