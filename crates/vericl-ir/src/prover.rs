@@ -7610,6 +7610,56 @@ mod tests {
         }
     }
 
+    /// Mutable-slice **WRITE** obligation through the slice lowering (§2.4, F1
+    /// round-9). Every other slice prover test above is a *read*; this pins the
+    /// **write** lane. `output.slice_mut(0, n)[ABSOLUTE_POS] = input[ABSOLUTE_POS]`
+    /// lowers the write to `IndexAssign(output, Add(0, ABSOLUTE_POS))` — the
+    /// ordinary origin *write* obligation, discharged by the same walker with
+    /// **no** slice-specific code (deliverable B is a no-op for the prover on the
+    /// write path too). Guarded `ABSOLUTE_POS < n` (= `Metadata::Length(output)`),
+    /// under `LenEq`: `Proved{2}` (the `input` read + the `output` slice write).
+    /// This is the prover-unit twin of the example `slice_scale_inplace`
+    /// (crates/vericl-examples), whose end-to-end proved claim rides this lowering.
+    #[cube(launch)]
+    fn slice_test_write(input: &Array<f32>, output: &mut Array<f32>) {
+        let n = output.len();
+        let mut s = output.slice_mut(0, n);
+        if ABSOLUTE_POS < n {
+            s[ABSOLUTE_POS] = input[ABSOLUTE_POS];
+        }
+    }
+
+    #[test]
+    fn slice_mut_write_proves() {
+        let def = slice_two_buf(slice_test_write::expand);
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &[Assume::LenEq { a: "input", b: "output" }])
+        {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved{{2}} (slice_mut write + read), got {other:?}"),
+        }
+    }
+
+    /// Negative control for the write lane: the same `slice_mut` write with **no
+    /// guard** writes `output[ABSOLUTE_POS]` out of bounds. `Refuted` — the write
+    /// obligation is load-bearing exactly like the read obligation
+    /// (`slice_to_slice_oob_refutes`), never a silent `Proved`.
+    #[cube(launch)]
+    fn slice_test_write_oob(input: &Array<f32>, output: &mut Array<f32>) {
+        let n = output.len();
+        let mut s = output.slice_mut(0, n);
+        s[ABSOLUTE_POS] = input[ABSOLUTE_POS];
+    }
+
+    #[test]
+    fn slice_mut_write_unguarded_refutes() {
+        let def = slice_two_buf(slice_test_write_oob::expand);
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &[Assume::LenEq { a: "input", b: "output" }])
+        {
+            ProveResult::Refuted { .. } => {}
+            other => panic!("expected Refuted (unguarded slice_mut write), got {other:?}"),
+        }
+    }
+
     /// Gather **through** a slice of an element-assumed array (§5.4). The
     /// slice read lowers to a read of the *origin* buffer id, and the
     /// `ElemsBelowLen{offsets, x}` assume keys off that same id, so the loaded

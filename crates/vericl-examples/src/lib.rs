@@ -499,6 +499,75 @@ pub fn windowed_helper_kernel(x: &Array<f32>, y: &mut Array<f32>) {
     }
 }
 
+/// In-place scale **through a mutable slice** — the write-path end-to-end
+/// example (F1, round-9). Every other committed slice example reads a
+/// `Slice`/`to_slice()`; this one exercises the `slice_mut` **write** lane the
+/// twin maps to `&mut arr[a..b]` (design §2.4/§4.1). Each thread owns the
+/// **disjoint** single-element window `y.slice_mut(ABSOLUTE_POS, ABSOLUTE_POS +
+/// 1)` and scales it in place (`s[0] = s[0] * alpha`): the exact write-path
+/// mirror of `windowed_slice_sum`'s dynamic-offset read window, one element wide
+/// so the per-thread windows never overlap — the differential is deterministic
+/// (thread `i` is the sole writer of `y[i]`) and **bit-exact** (`max_ulp = 0`: a
+/// single correctly-rounded multiply on both lanes). Guarded `ABSOLUTE_POS <
+/// y.len()`, the write lowers to the ordinary origin obligation `IndexAssign(y,
+/// ABSOLUTE_POS + 0)` and **proves** with no assume (deliverable B is a no-op
+/// for the prover on the write path too, §5). Wired into `vericl::suite!` —
+/// carries `tested` (differential) + `proved` (SMT bounds).
+///
+/// A **multi-element** `slice_mut(a, b)[j]` write window and the
+/// sequential-vs-overlapping aliasing convention are exercised by
+/// `sequential_slice_mut_scale` below (a wider window cannot be a disjoint
+/// *provable* suite differential: disjoint blocks need a `start = i*W` stride
+/// whose `checked_mul` overflow side-obligation is unbounded, so it would be
+/// `OutOfSubset`, and an overlapping window is a write-order-dependent race — so
+/// the suite example stays one element wide, and the wider window is a twin
+/// unit test at a fixed length).
+#[vericl::kernel(
+    compare(max_ulp = 0),
+    gen(y in -100.0..=100.0, alpha in -4.0..=4.0)
+)]
+#[cube(launch)]
+pub fn slice_scale_inplace(y: &mut Array<f32>, alpha: f32) {
+    if ABSOLUTE_POS < y.len() {
+        let mut s = y.slice_mut(ABSOLUTE_POS, ABSOLUTE_POS + 1);
+        s[0] = s[0] * alpha;
+    }
+}
+
+/// The S3-milestone mutable-aliasing convention control (docs/design-view-slice.md
+/// §4.3, §11 S3, F1 round-9) **and** the multi-element `slice_mut(a, b)[j]` write
+/// window. Thread 0 scales two **disjoint, sequentially-created** mutable windows
+/// of one origin: `y.slice_mut(0, 4)` (used and dropped) then `y.slice_mut(4, 8)`.
+/// Because each `&mut (y)[a..b]` twin is created, used, and dropped before the
+/// next, the borrow checker (the aliasing ORACLE, §4.3) accepts the twin under
+/// NLL — **sequential mutable slices compile**, the dominant real shape. This is
+/// the *positive* control of the pair; the *negative* control is
+/// `scratchpad/slicemut/overlap.rs`, where two **simultaneously-live overlapping**
+/// `slice_mut` views of one origin fail to compile with rustc `E0499` — the borrow
+/// error IS the rejection (as-built; the prettified §8.3 macro message is deferred,
+/// §8.4). The pair is `scratchpad/slicemut/{sequential_ok,overlap}.rs`.
+///
+/// Not suite-wired: it is single-threaded (thread 0) over a fixed 8-wide layout, so
+/// its twin panics on a shorter origin — the multi-size differential does not apply.
+/// Its twin is pinned at a fixed length by `sequential_slice_mut_scale_twin_scales_two_windows`.
+#[vericl::kernel(
+    compare(max_ulp = 0),
+    gen(y in -100.0..=100.0, alpha in -4.0..=4.0)
+)]
+#[cube(launch)]
+pub fn sequential_slice_mut_scale(y: &mut Array<f32>, alpha: f32) {
+    if ABSOLUTE_POS == 0 {
+        let mut lo = y.slice_mut(0, 4);
+        for j in 0..4usize {
+            lo[j] = lo[j] * alpha;
+        }
+        let mut hi = y.slice_mut(4, 8);
+        for j in 0..4usize {
+            hi[j] = hi[j] * alpha;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Kernel composition: #[vericl::helper] + uses(...) — the milestone this
 // section demonstrates (docs/dogfood-2026-07.md Tier-1 gap #2, blocking
@@ -2403,6 +2472,61 @@ mod tests {
         windowed_helper_kernel_vericl::reference(&x, &mut y, 4);
         // y[i] = x[i] + x[i+3]
         assert_eq!(y, vec![1.0 + 4.0, 2.0 + 5.0, 3.0 + 6.0, 4.0 + 7.0]);
+    }
+
+    /// F1 (round-9): the mutable-**write** slice twin scales in place through the
+    /// `&mut y[i..i+1]` mapping of `y.slice_mut(ABSOLUTE_POS, ABSOLUTE_POS + 1)`,
+    /// writing `s[0] = s[0] * alpha` = `y[i] * alpha`. Pins the write-path twin
+    /// derivation at the value level (the `*_twin_matches_hand_computed`
+    /// precedent, now on the `slice_mut` write lane). Also confirms the guard is
+    /// honored: with more threads than elements, elements are each written once.
+    #[test]
+    fn slice_scale_inplace_twin_matches_hand_computed() {
+        let mut y = vec![1.0f32, -2.0, 3.0, -4.0, 5.0];
+        // Dispatch more threads than elements: the guard must leave nothing out
+        // of place and thread i must be the sole writer of y[i].
+        slice_scale_inplace_vericl::reference(&mut y, 2.0, 64);
+        assert_eq!(y, vec![2.0, -4.0, 6.0, -8.0, 10.0]);
+    }
+
+    /// F1 (round-9): the mutable-slice **write** obligation proves end to end at
+    /// the example level. `s[0] = s[0] * alpha` lowers to `IndexAssign(y,
+    /// ABSOLUTE_POS + 0)` — the ordinary origin **write** obligation — plus the
+    /// `s[0]` read of the same index, both discharged by the guard `ABSOLUTE_POS <
+    /// y.len()` with **no assume**. (The prover-unit twin of this — a `slice_mut`
+    /// write proving/refuting through the lowering — is `slice_mut_write_*` in
+    /// crates/vericl-ir.)
+    #[test]
+    fn slice_scale_inplace_definition_is_provably_in_bounds() {
+        let def = slice_scale_inplace_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = slice_scale_inplace_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &[]) {
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved (slice_mut write + read), got {other:?}"),
+        }
+    }
+
+    /// F1 (round-9), the S3 mutable-aliasing convention **positive** control
+    /// (docs/design-view-slice.md §4.3, §11 S3): two **sequential** disjoint
+    /// `slice_mut` windows of one origin — `y.slice_mut(0, 4)` then
+    /// `y.slice_mut(4, 8)` — each with a `[j]` write loop. The very fact this twin
+    /// **compiles** is the control: sequential mutable slices are accepted by the
+    /// borrow checker (the aliasing oracle) under NLL, because each `&mut (y)[a..b]`
+    /// is dropped before the next is created. The **negative** control is the
+    /// scratch compile-fail demo `scratchpad/slicemut/overlap.rs`, where two
+    /// simultaneously-live *overlapping* `slice_mut` views fail rustc `E0499` — the
+    /// borrow error is the (as-built) rejection (§8.3 [as-built], §8.4 for the
+    /// deferred prettified message). This test also value-checks the two `[j]`
+    /// windows scaled correctly.
+    #[test]
+    fn sequential_slice_mut_scale_twin_scales_two_windows() {
+        let mut y = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]; // len 8
+        sequential_slice_mut_scale_vericl::reference(&mut y, 10.0, 1);
+        // Both disjoint windows [0,4) and [4,8) scaled by 10 (thread 0 only).
+        assert_eq!(y, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]);
     }
 
     // -----------------------------------------------------------------

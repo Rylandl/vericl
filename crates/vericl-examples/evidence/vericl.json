@@ -1329,6 +1329,66 @@
         "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
         "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
       ]
+    },
+    {
+      "kernel": "slice_scale_inplace",
+      "identity": {
+        "source_hash": "sha256:c78135ef887786982056f83e7722a32125b6b966d59bf864619ba550e7f175fe",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:512dca91c26e5380cd260fcbb43541b89ef3012fe93c3a6d7f42b2271db9abd8"
+      },
+      "contract": {
+        "assumes": [],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 2,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
     }
   ]
 }

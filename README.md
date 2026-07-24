@@ -427,7 +427,10 @@ slice introduces **zero numeric ops**, so the twin is **bit-exact** on wgpu and 
 guarantees become the soundness net that cubecl itself lacks: an out-of-range `&arr[a..b]` **panics** in
 the tested twin (cubecl does *not* bounds-check slice creation), and the **borrow checker is the
 aliasing oracle** — sequential mutable slices compile, but two simultaneously-live overlapping `&mut`
-subslices of one origin do not. Slice type-punning (`as_mut_unchecked`/`downcast*`), reinterpret-slice
+subslices of one origin do not. That aliasing rejection is, as-built, rustc's own `E0499`/`E0502` on the
+generated twin (a buffer-named vericl-authored message is future work, `docs/design-view-slice.md` §8.4);
+it is the borrow checker itself, not a macro pass, that rejects the unsafe program. Slice type-punning
+(`as_mut_unchecked`/`downcast*`), reinterpret-slice
 (`with_vector_size`, `vector_size ≠ 0` — also unrunnable on wgpu upstream), and the `View`/`VirtualLayout`/
 `Coordinates` strided-tensor machinery (a separate `Arc<dyn>` abstraction, **not** core `Slice`) are
 rejected with targeted errors. Slices are helper-only, not launch args; a `#[vericl::helper]` taking a

@@ -319,6 +319,18 @@ system does not stop it, and the backend does not enforce single-writer between 
     `split_at_mut`-shaped disjoint slicing); a v1 kernel that does this gets a targeted defer message,
     not a silent accept.
 
+> **[as-built] (F2, round-9).** The two sub-bullets above describe the *aspired* v1 behavior — the
+> macro detecting simultaneously-live mutable slices and emitting a prettified targeted message. That
+> detection was **not** built for v1. **As shipped, the borrow checker's own diagnostic IS the
+> rejection**, verbatim: an overlapping-live pair yields rustc `E0499` ("cannot borrow `x` as mutable
+> more than once"), and a launder that would defeat the oracle is caught separately (`as_mut_unchecked`
+> is a banned method, §8.3). This is fully sound — the borrow error rejects exactly the unsafe program,
+> which is the whole decision above — it is only *less pretty* than a macro-authored message. The
+> targeted **prettification** of the borrow error (naming the buffer, pointing at the two `slice_mut`
+> spans, distinguishing overlapping-reject from disjoint-defer) is deferred future work, tracked in
+> §8.4. The positive/negative controls are `scratchpad/slicemut/{sequential_ok,overlap}.rs` (sequential
+> compiles; overlapping fails `E0499`), referenced from the example test docs.
+
 Read-only slices (`Slice<E, ReadOnly>` from `.slice()`/`.to_slice()` — the overwhelmingly common
 case, §3) are `&[T]` and alias freely, no borrow issue.
 
@@ -503,8 +515,8 @@ proved by the existing walker (§5).
 | Construct | Error site & message |
 |---|---|
 | Reinterpret / cross-vectorization slice (`with_vector_size`/`into_vectorized`, `vector_size≠0`) | prover `check_trivial_vectorization` (already in place, `prover.rs:2003`): `"reinterpret-vectorized indexing (vector_size={v}, unroll_factor={u}) is a View/Slice reinterpret-slice construct outside the vericl v0 subset"` |
-| Simultaneously-live mutable slices of one origin (overlapping) | macro (surfacing the borrow error): `"two mutable slices of `{buf}` are live at once; overlapping mutable views are outside the vericl v0 subset (write-order-dependent)"` |
-| Simultaneously-live disjoint mutable slices (`split_at_mut` shape) | macro: `"simultaneously-live disjoint mutable slices need split_at_mut recognition — deferred to vericl v1.1"` |
+| Simultaneously-live mutable slices of one origin (overlapping) | **[as-built]** the twin's borrow checker: rustc `E0499` on the two live `&mut (x)[..]` subslices (`scratchpad/slicemut/overlap.rs`). The macro-authored message in the original cell (`"two mutable slices of `{buf}` are live at once; …"`) was **not built** — the raw `E0499` IS the (sound) rejection; prettifying it is §8.4 future work (F2). |
+| Simultaneously-live disjoint mutable slices (`split_at_mut` shape) | **[as-built]** same borrow checker (`E0499`): held-at-once disjoint `&mut` subslices still fail NLL. The macro-authored defer message (`"… need split_at_mut recognition — deferred to vericl v1.1"`) was **not built**; `split_at_mut` recognition is §8.4 deferred work (F2). |
 | `slice.downcast(...)` / `downcast_unchecked` / `as_mut_unchecked` | macro `FLOAT_METHOD_REJECT`-style: `"slice type-punning method '{m}' (ReinterpretSlice internals) is outside the vericl v0 subset"` |
 | `View<_, _, _>` / `View::new` / `.view(layout)` / `VirtualLayout` / `Coordinates` / `StridedLayout` | macro: `"tensor `View`/`VirtualLayout` (multi-dim strided views) is the cubecl-std layout machinery, outside the vericl v0 subset"` |
 | `Tensor<F>` slice origin | macro: `Tensor` stays banned (the separate `Tensor` gap); an `Array`/`SharedMemory` origin is required |
@@ -517,6 +529,27 @@ without an origin-length assume (§5.3); `split_at_mut`-recognized disjoint muta
 `Tensor` slice origins (with the Tensor gap); `SharedMemory<Vector>` slice reductions (needs Vector +
 cooperative, §10); the `View`/`VirtualLayout`/`Coordinates` strided-view machinery (a separate large
 milestone); reinterpret-slice (blocked on wgpu support upstream anyway).
+
+**Deferred macro-ergonomics / correctness work carried from round-9 (as-built gaps, not soundness
+gaps):**
+
+- **[F2] Prettify the mutable-aliasing rejection.** As-built, overlapping/disjoint simultaneously-live
+  mutable slices are rejected by the twin's borrow checker as raw `E0499`/`E0502` (§4.3 [as-built],
+  §8.3). The deferred work is a macro pass that detects the simultaneously-live pattern and emits the
+  buffer-named, span-pointed targeted message the §8.3 cells originally described — and that
+  distinguishes overlapping (reject-forever) from disjoint `split_at_mut`-shaped (defer, recognizable).
+  Sound today; only the diagnostic quality is deferred.
+- **[F4] A receiver-type guard on `SliceRewriteFold` is REQUIRED before any `View` milestone.** The
+  slice twin rewrite (`SliceRewriteFold::rewrite_method`, `crates/vericl-macros/src/lib.rs`) recognizes
+  a slice creator by **method name + arity** (`slice`/`slice_mut`/`to_slice`/`to_slice_mut`), never by
+  receiver type. This is sound *only* while no View-like type with a same-named `.slice(a, b)` /
+  `.to_slice()` method (different, multi-dim strided semantics) can reach a compilable twin — which
+  holds today precisely because the whole `View`/`Layout` surface is a banned ident (§8.3, F3). The
+  moment a future milestone un-bans a `View`-like type, `view.slice(a, b)` would be **silently**
+  mis-rewritten to a 1-D Rust subslice `&view[a..b]`. **Un-banning `View` MUST be accompanied by a
+  receiver-type guard** that fires the rewrite only for genuine core-`Slice` receivers (mirroring the
+  vector gate). This is a make-it-impossible-to-miss note: it lives here, at the fold's doc comment, and
+  in `tasks/todo.md`.
 
 ---
 
@@ -584,6 +617,15 @@ and emit the §8.3 targeted messages (overlapping = reject, disjoint = defer) in
 raw borrow error; keep sequential mutable slices compiling. *Verify*: a sequential `slice_mut_assign`
 kernel passes; an overlapping-live variant emits the targeted reject; a `split_at_mut`-shaped variant
 emits the targeted defer.
+
+> **[as-built] (F2, round-9).** S3 shipped **partially**: the *soundness* half landed and the
+> *ergonomics* half is deferred. The sequential-mutable-slice half works (the twin compiles and runs —
+> pinned by the committed `sequential_slice_mut_scale` twin test), and the rejection half works via the
+> borrow checker (overlapping-live ⟹ `E0499`, `scratchpad/slicemut/overlap.rs`). What was **not** built
+> is the macro *detection* that replaces the raw borrow error with a prettified §8.3 message and splits
+> overlapping-reject from disjoint-defer — deferred to §8.4. So as-built S3 is: sequential passes
+> (committed twin test), overlapping rejected (borrow checker, scratch compile-fail control), disjoint
+> also rejected-not-deferred (borrow checker) — every case sound, the diagnostic just unprettified.
 
 **S4 — End-to-end slice conformance + bit-exact GT (macro/runtime).** Wire the §6 `windowed_sum` /
 `tile_last` shapes through `conformance_case` (twin vs wgpu, flat-scalar compare); add a

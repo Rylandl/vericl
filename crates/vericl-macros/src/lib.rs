@@ -80,16 +80,55 @@ const BANNED_IDENTS: &[&str] = &[
     // use the twin could not model (design §8.1, reported refinement).
     "Slice",
     "SliceMut",
-    // The cubecl-std `View`/`VirtualLayout`/`Coordinates` strided-tensor-view
-    // machinery is a separate `Arc<dyn>` dynamic-dispatch abstraction, NOT core
-    // `Slice` — deferred as a much larger milestone (design §1, §8.3).
+    // The cubecl-std `View`/`Layout` strided-tensor-view machinery is a separate
+    // `Arc<dyn>` dynamic-dispatch abstraction, NOT core `Slice` — deferred as a
+    // much larger milestone (design §1, §8.3/§8.4). Every one of these is a
+    // loud failure today (the twin cannot model an `Arc<dyn Layout>` dispatch, so
+    // a kernel naming one either fails to compile in the twin or reaches the
+    // prover's reinterpret gate); banning the *idents* upgrades that to a targeted
+    // out-of-subset message at the macro, making the README/design "rejected with
+    // targeted errors" claim true for the whole surface — not just `View`.
+    //
+    // This is the public **type/trait** export surface of cubecl-std 0.10's
+    // `tensor/view/` + `tensor/layout/` modules, swept 2026-07-23 from the
+    // vendored source (`vericl-ecosystem-survey/cubecl/crates/cubecl-std`). Scope
+    // is deliberately the surface an author could *name in a kernel body*: the
+    // codegen/launch plumbing (`*Expand`, `*CompilationArg`, `*Launch`, `*Arg`)
+    // is macro-generated and never hand-written, the `Coords{1..5}{d,i}`/`CoordsDyn`
+    // aliases are bare tuples covered by the `Coordinates` trait ban, and the
+    // `Sealed` marker is excluded as too generic to ban safely. (F3, round-9.)
+    //
+    // -- views --
     "View",
-    "VirtualLayout",
     "VirtualView",
+    "VirtualViewMut",
     "LinearView",
-    "Coordinates",
-    "StridedLayout",
+    "VirtualTensor",
+    "ConcreteLayout",
     "ViewOperations",
+    "ViewOperationsMut",
+    // -- as-view / as-tensor-view creation traits --
+    "AsView",
+    "AsViewMut",
+    "AsTensorView",
+    "AsTensorViewMut",
+    // -- layouts --
+    "Layout",
+    "VirtualLayout",
+    "StridedLayout",
+    "SliceLayout",
+    "PermutedLayout",
+    "PlainLayout",
+    "SimpleLayout",
+    "FixedDimLayout",
+    "MatrixBatchLayout",
+    "LinearLayout",
+    "LinearViewLayout",
+    "Chain",
+    "Coordinates",
+    "IntoDyn",
+    "IntoDynLayout",
+    "IntoDyn2Layout",
     // early exit changes meaning between per-thread and sequential execution
     "return",
     // terminate!() is a per-lane early exit; outside #[cube] it expands to an
@@ -1419,6 +1458,32 @@ fn is_slice_creation_call(e: &Expr) -> bool {
 /// twin only; the re-emitted `#[cube]` kernel keeps `x.slice(a, b)` verbatim.
 ///
 /// Slice laundering / reinterpret methods (`SLICE_REJECT_METHODS`) are rejected.
+///
+/// # Latent fragility — keys on method **name + arity**, not receiver type (F4)
+///
+/// `rewrite_method` recognizes a slice creator purely by its method name and
+/// argument count (`slice`/`slice_mut` with 2 args, `to_slice`/`to_slice_mut`
+/// with 0) — it never inspects the *receiver's type*. This is a proc-macro
+/// working on tokens, so a receiver type is not resolvable here anyway
+/// (a `#[proc_macro_attribute]` has no type information; see `UsesRewriteFold`'s
+/// doc for the same whole-crate-visibility limitation).
+///
+/// This is **sound today only** because of a global invariant: no View-like type
+/// with a same-named-but-different-semantics `.slice(a, b)` / `.to_slice()` method
+/// can ever reach a *compilable* twin. The cubecl-std `View`/`Layout` surface is a
+/// **banned ident** (see `BANNED_IDENTS`, F3) rejected before this fold runs, and
+/// core `Slice` values only ever originate from an `Array`/`SharedMemory` origin
+/// whose twin is a Rust slice — for which `&(recv)[a..b]` is exactly right. So the
+/// only receivers that reach here are ones the rewrite is correct for.
+///
+/// **REQUIRED WORK for any future `View` milestone:** the moment a View-like type
+/// is admitted to the subset (its ident un-banned), that invariant breaks — a
+/// `view.slice(a, b)` would be mis-rewritten to `&view[a..b]` with the wrong
+/// (multi-dim strided) semantics, *silently*. Lifting the `View` ban therefore
+/// MUST be accompanied by a receiver-type guard here (e.g. gate the rewrite behind
+/// a recognized slice-typed receiver, mirroring the vector gate) so this fold only
+/// fires for genuine core-`Slice` receivers. Do not un-ban `View` without it.
+/// (Tracked: `tasks/todo.md`, and `docs/design-view-slice.md` §8.4 future work.)
 struct SliceRewriteFold {
     errors: Vec<syn::Error>,
 }
@@ -5982,6 +6047,61 @@ mod tests {
         .unwrap();
         let err = expand(quote!(compare(exact)), &g).expect_err("View machinery must be rejected");
         assert!(err.to_string().contains("View"), "got: {err}");
+    }
+
+    /// F3 (round-9): the whole cubecl-std `tensor/view` + `tensor/layout` export
+    /// surface — not just `View` — is a banned ident with the generic
+    /// out-of-subset message. A kernel naming any layout/view type is rejected at
+    /// the macro (a targeted error) instead of loud-failing deeper (an opaque twin
+    /// borrow/compile error or the prover's reinterpret gate). Samples the sweep:
+    /// the layouts, the as-view creation traits, the virtual/concrete view types,
+    /// and the into-dyn erasers.
+    #[test]
+    fn view_layout_export_surface_is_banned() {
+        for ident in [
+            "Layout",
+            "PermutedLayout",
+            "SliceLayout",
+            "StridedLayout",
+            "PlainLayout",
+            "SimpleLayout",
+            "FixedDimLayout",
+            "MatrixBatchLayout",
+            "LinearLayout",
+            "LinearViewLayout",
+            "Chain",
+            "ConcreteLayout",
+            "VirtualLayout",
+            "VirtualView",
+            "VirtualViewMut",
+            "VirtualTensor",
+            "LinearView",
+            "ViewOperations",
+            "ViewOperationsMut",
+            "Coordinates",
+            "AsView",
+            "AsViewMut",
+            "AsTensorView",
+            "AsTensorViewMut",
+            "IntoDyn",
+            "IntoDynLayout",
+            "IntoDyn2Layout",
+        ] {
+            let src = format!(
+                "pub fn k(x: &Array<f32>, y: &mut Array<f32>) {{ \
+                 if ABSOLUTE_POS < y.len() {{ let v = {ident}::new(x); y[ABSOLUTE_POS] = v[0]; }} }}"
+            );
+            let func: ItemFn = syn::parse_str(&src).expect("valid fn");
+            let err = match expand(quote!(compare(exact)), &func) {
+                Err(e) => e,
+                Ok(_) => panic!("`{ident}` (view/layout machinery) must be rejected"),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(ident) && msg.contains("outside the vericl v0"),
+                "`{ident}` must get the targeted out-of-subset message, got: {msg}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

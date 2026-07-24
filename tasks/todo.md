@@ -1824,3 +1824,111 @@ race-freedom (a cooperative-slice milestone), and `split_at_mut`-recognized disj
 **Counts:** vericl-ir 104 (+10), vericl-macros 59 (+8), vericl-examples lib 88 (+7). Clippy 0 (default +
 cpu). conform demo-defects exit 0. Full `cargo test --workspace` green; evidence append-only, existing
 entries byte-identical.
+
+## Round-9 adversarial review (2026-07-24) — CLEAN
+
+Verdict: core `Slice` milestone merge-ready, no critical — **fifth consecutive clean round**
+(3, 6, 7, 8, 9). The four round-9 findings are **coverage/doc items, not soundness defects**: no
+attack produced a false `Proved`, a silent accept, or a wrong twin. The slice design's central
+conservatism held under injection — a slice access is *indistinguishable in the IR* from a hand-written
+`origin[offset+i]`, so it rides the existing origin obligation with zero prover change, and every place
+that could have leaked the addressing view into a bound instead keys off the origin's own
+`Metadata::Length` leaf (never the derived `slice.len() = end−start`, never `BufferLength`).
+
+Surfaces held under injection / discriminate-by-injection evidence:
+- **Write lane is load-bearing, not decorative.** The new `slice_mut` write obligation
+  (`slice_mut_write_proves`) discharges through the same walker as a read; its negative twin
+  (`slice_mut_write_unguarded_refutes`) shows an unguarded `slice_mut` write **Refutes** — removing the
+  guard flips the verdict, so the write bound is not vacuously satisfied. The example
+  `slice_scale_inplace` carries the same `Proved{2}` end-to-end (write + its read) and bit-exact
+  differential on both lanes.
+- **Creation-validity conservatism (risk-1) is deliberate and documented, not a gap.** cubecl does NOT
+  bounds-check slice *creation*; the prover proves only the guarded *accesses* (`offset+i < origin_len`)
+  and leaves `end ≤ origin_len` to the twin, which **panics** on an out-of-range `&arr[a..b]`
+  (`windowed_slice_creation_panics_when_x_undersized`, `slice_dyn_offset_proves` on the prover side). The
+  two claims' scopes are split on purpose — `tested` catches invalid creation, `proved` covers accesses —
+  so neither over-claims. Attacking "create out of bounds but guard each access" yields the honest
+  answer (twin panic + accesses proved), never a false whole-slice `Proved`.
+- **Mutable-aliasing oracle is the borrow checker, and the pair discriminates.** Sequential mutable
+  slices compile (`sequential_slice_mut_scale` twin, committed); two simultaneously-live *overlapping*
+  `slice_mut` views of one origin fail `E0499` (`scratchpad/slicemut/overlap.rs`, reverified this round).
+  The scratch pair (sequential compiles / overlap `E0499`) is the discriminating control.
+- **Reinterpret gate + element-assume-through-slice unchanged and still sound.** The `with_vector_size`
+  `OutOfSubset` message stands verbatim (risk-3 control); the gather element assume transfers through a
+  `to_slice()` by origin-id keying (`Proved{3}`) and drops to `OutOfSubset` without it (never a false
+  `Proved`).
+
+Findings closed this round (F1 the only substantive one; F2–F4 doc/coverage hygiene):
+
+- **F1 — mutable-write path now has end-to-end coverage.** Was: every committed slice example *read*;
+  the `slice_mut` write lane had a twin rewrite and a design but zero committed exercise. Added
+  `slice_scale_inplace` (`crates/vericl-examples`), a per-thread disjoint-window in-place scale through
+  `y.slice_mut(ABSOLUTE_POS, ABSOLUTE_POS+1)`, suite-wired carrying `tested`(bit-exact) + `proved`{2}
+  (the one new evidence entry; existing entries byte-identical, cpu-first/default-last). A wider
+  `slice_mut(a,b)[j]` multi-element window with the sequential-two-slice_mut aliasing convention is
+  `sequential_slice_mut_scale` + its twin test (not suite-wired: single-threaded fixed-8 layout, and a
+  disjoint wide window is unprovable — the `start = i*W` stride's `checked_mul` overflow side-obligation
+  is unbounded → `OutOfSubset` — while an overlapping wide window is a write-order-dependent race, so the
+  suite differential stays one element wide). Prover unit twin of the write lowering:
+  `slice_mut_write_proves`/`_unguarded_refutes` (`crates/vericl-ir`). Overlapping-rejected control:
+  `scratchpad/slicemut/overlap.rs` (`E0499`), referenced from the example/test docs.
+- **F2 — docs state the as-built aliasing behavior honestly.** `docs/design-view-slice.md` §4.3, §8.3
+  (the two mutable-slice rows), and §11 S3 promised a *macro-authored targeted message* for
+  overlapping/disjoint mutable-slice aliasing; the implementation deliberately ships rustc's
+  `E0499`/`E0502` as the oracle (the macro detection was never built). Preserved the design text and
+  appended `[as-built]` annotations recording that the borrow checker IS the (sound) rejection and the
+  prettified message is deferred; §8.4 now lists the prettification as future work. README aliasing
+  sentence tightened to name `E0499`/`E0502` explicitly (dogfood doc was already honest).
+- **F3 — the `View`/`Layout` ban list now covers the whole cubecl-std export surface.** Swept the
+  vendored source (`vericl-ecosystem-survey/cubecl/crates/cubecl-std`, `tensor/view/` + `tensor/layout/`,
+  2026-07-23); extended `BANNED_IDENTS` from 7 view idents to 28, so a kernel naming any layout/view type
+  gets the **targeted** out-of-subset message instead of loud-failing deeper (opaque twin error / the
+  reinterpret gate). Makes the README/design "rejected with targeted errors" claim true for the surface,
+  not just `View`. Final list below. Test: `view_layout_export_surface_is_banned` (samples 27 idents).
+- **F4 — `SliceRewriteFold`'s name+arity keying is flagged as latent fragility with a required guard.**
+  The fold recognizes a slice creator by **method name + arity**, never receiver type (a proc-macro has
+  no type info). Sound TODAY only because no View-like type with a same-named `.slice(a,b)`/`.to_slice()`
+  method (different strided semantics) can reach a compilable twin — the whole `View`/`Layout` surface is
+  a banned ident (F3). **REQUIRED WORK: any future `View` milestone that un-bans a `View`-like type MUST
+  add a receiver-type guard to `SliceRewriteFold` first** (fire the rewrite only for genuine core-`Slice`
+  receivers, mirroring the vector gate); otherwise `view.slice(a,b)` is silently mis-rewritten to a 1-D
+  `&view[a..b]`. Recorded impossible-to-miss: the fold's own doc comment
+  (`crates/vericl-macros/src/lib.rs`), `docs/design-view-slice.md` §8.4, and this line.
+
+**F3 final ban list (28 view/layout idents).** Existing 7 kept; 21 added. Scope = the public
+**type/trait** surface an author could name in a kernel body, from cubecl-std 0.10's `tensor/view/` +
+`tensor/layout/`. Views: `View`, `VirtualView`, `VirtualViewMut`, `LinearView`, `VirtualTensor`,
+`ConcreteLayout`, `ViewOperations`, `ViewOperationsMut`. As-view creation traits: `AsView`, `AsViewMut`,
+`AsTensorView`, `AsTensorViewMut`. Layouts: `Layout`, `VirtualLayout`, `StridedLayout`, `SliceLayout`,
+`PermutedLayout`, `PlainLayout`, `SimpleLayout`, `FixedDimLayout`, `MatrixBatchLayout`, `LinearLayout`,
+`LinearViewLayout`, `Chain`, `Coordinates`, `IntoDyn`, `IntoDynLayout`, `IntoDyn2Layout`. Deliberately
+**excluded** (documented in the ban-list comment): the codegen/launch plumbing (`*Expand`,
+`*CompilationArg`, `*Launch`, `*Arg` — macro-generated, never hand-written), the
+`Coords{1..5}{d,i}`/`CoordsDyn` tuple aliases (bare tuples, covered by the `Coordinates` trait ban), and
+the `Sealed` marker (too generic to ban safely).
+
+**Counts:** vericl-ir 106 (+2: `slice_mut_write_proves`/`_unguarded_refutes`), vericl-macros 60 (+1:
+`view_layout_export_surface_is_banned`), vericl-examples lib 91 (+3: `slice_scale_inplace` twin+proof,
+`sequential_slice_mut_scale` twin). Clippy 0 (default + cpu). conform demo-defects 0. Full
+`cargo test --workspace` green (both feature sets). Evidence: one new entry (`slice_scale_inplace`),
+existing entries byte-identical, other two evidence files untouched (cpu-first, default-last —
+committed wgpu-only format).
+
+## Round-9 adversarial review (2026-07-23) — CLEAN, + F1-F4 closed (2026-07-24)
+
+Verdict: core Slice milestone sound and merge-ready, no false-Proved / silent-wrong-twin —
+fifth consecutive clean round (3, 6, 7, 8, 9). Discrimination proven by injection: a
+twin-only to_slice off-by-one was caught by BOTH the hand-computed test and the wgpu
+differential. The creation-validity seam is conservative and honest: whenever the twin's
+subslice creation does not panic, every access is provably in-origin-bounds — no shape
+exists where the twin silently accepts what the GPU would overrun (the twin over-rejects
+loudly, never under-rejects). Aliasing oracle: overlapping slice_mut = E0499, origin-write
+conflicts = E0502, laundering banned by name, the &&[f32] intermediate case deref-coerces
+silent-CORRECT. Rewrite shape coverage held (paren/chain/nested/stored-variable forms);
+name-only .slice rewrite sound today solely because cubecl-std View cannot reach a
+compilable twin. Findings closed post-review: F1 mutable-write end-to-end coverage
+(slice_scale_inplace suite kernel + twin/prover/sequential tests; overlapping compile-fail
+demonstrated in scratch), F2 docs annotated [as-built] (borrow checker IS the aliasing
+rejection; prettified messages future work), F3 View/layout ban list extended to the full
+cubecl-std export surface, F4 the receiver-blind .slice rewrite recorded as REQUIRED WORK
+(receiver-type guard) in any future View milestone.

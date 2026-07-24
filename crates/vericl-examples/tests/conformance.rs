@@ -103,6 +103,17 @@ vericl::suite! {
         // `#[vericl::helper]` taking a `&Slice<F>` param (§10), called with the
         // idiomatic `&x.slice(a, b)` form. Exact + proved.
         windowed_helper_kernel,
+        // `slice_scale_inplace`: the mutable-**write** path end-to-end (F1,
+        // round-9). Every slice example above reads; this scales in place through
+        // `y.slice_mut(ABSOLUTE_POS, ABSOLUTE_POS + 1)` (the twin's `&mut
+        // y[i..i+1]`), one element per thread so the per-thread windows are
+        // disjoint (deterministic differential) and the origin write obligation
+        // proves with no assume. Exact (`max_ulp = 0`, single multiply) + proved
+        // (2 obligations: the slice write + its read). The multi-element
+        // `slice_mut(a,b)[j]` window and the sequential-vs-overlapping aliasing
+        // convention are `sequential_slice_mut_scale` + `scratchpad/slicemut`
+        // (twin unit test + scratch compile-fail control; not suite-wired).
+        slice_scale_inplace,
     ],
     evidence: "evidence/vericl.json",
     extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime),
