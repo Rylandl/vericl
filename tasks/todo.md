@@ -1932,3 +1932,55 @@ demonstrated in scratch), F2 docs annotated [as-built] (borrow checker IS the al
 rejection; prettified messages future work), F3 View/layout ban list extended to the full
 cubecl-std export surface, F4 the receiver-blind .slice rewrite recorded as REQUIRED WORK
 (receiver-type guard) in any future View milestone.
+
+## Assurance ladder Rung A — counterexample validation DONE; certificates DEFERRED (2026-07-24)
+
+Rung A attacks the largest opaque component in the trusted base — the subprocess SMT solver.
+Two halves: (1) validate every `sat`-derived refutation in Rust (cheap dual); (2) independently
+checkable proof certificates for `unsat` (moves the solver out of trust for `Proved` too).
+**(1) shipped and unconditional; (2) blocked on tooling availability, documented not faked** —
+the sanctioned outcome. Full decision record: `docs/certificates-decision.md`.
+
+**Counterexample validation (SHIPPED).** Every `Refuted`-producing `check-sat` — `check_obligation`
+(bounds) and `check_race` (two-thread data race) — now re-checks the solver's model before the
+verdict is reported (`crates/vericl-ir/src/prover.rs`, `Prover::validate_counterexample`). Mechanism:
+a vericl-side mirror of z3's assertion stack (`Prover::asserts`), kept exactly parallel by routing
+all 13 push / 13 pop / 33 assert sites through the new `s_push`/`s_pop`/`s_assert` wrappers; at a
+`sat` point its flatten IS the live assertion set (negated obligation + path conditions + assumes +
+leaf type-range facts). The model is read back with `get_value` and each live assertion is evaluated
+by a small **total interpreter** over the exact emitted SMT-LIB subset (`eval_sexpr`/`eval_op`,
+free functions): int `+`/`-`/`*`/`div`/`mod` (Euclidean via i128 `checked_div_euclid`/`checked_rem_
+euclid`), `ite`, `<`/`<=`/`>`/`>=`/`=`, `and`/`or`/`not`, literals + declared consts. A model that
+fails any live assertion fails **closed** to `SolverError` — never a silent/spurious `Refuted`
+(documented invariant on `ProveResult::Refuted`). For a refutation the solver's `sat` verdict thereby
+leaves the trusted base; what remains is the ~120-line auditable Rust interpreter + vericl's encoding.
+
+**Tests (5 new, `prover::tests`):** `genuine_refutation_passes_counterexample_validation` (end-to-end
+positive — a real OOB refutes and survives validation, not flipped to SolverError);
+`cex_interp_arithmetic_and_comparisons`; `cex_interp_flags_a_model_that_violates_an_assertion` (the
+synthetic invalid-model negative — a fabricated model with `idx == len` is flagged `false`);
+`cex_interp_div_mod_ite_and_negatives` (Euclidean div/mod, unary negate, ite, div-by-zero guard);
+`cex_interp_rejects_unbound_and_unsupported` (unbound const + `bvand` → Err, fail-closed). All 106
+pre-existing prover tests pass unchanged (every existing Refuted test now routes through validation).
+
+**Verification.** Zero capability loss: vericl-examples lib 91/91, every `Proved` obligation count
+unchanged. Zero regressions: vericl-ir 111, vericl 36, vericl-macros 60, conformance (wgpu, incl.
+evidence check) 1, cooperative 6, cooperative_fallback 1, vector_conformance 2, float_method_whitelist
+2, f64_wgpu_unsound 1, conformance_f64 (cpu) 1, float_method_whitelist_f64 (cpu) 2. Demo-defects: exit
+0, all defects caught, every refutation now printed "validated in-checker" with byte-identical
+counterexamples (`elem5=8`, race `t1=1,t2=0`, etc. unchanged). Clippy both feature sets: zero.
+**Evidence byte-identical** — validation touches only `Refuted` verdicts, which produce no evidence
+entry, and adds no field to any `Proved`-claim config; the conformance evidence check passed without
+`VERICL_UPDATE`. Solver-time impact: **zero** added solver work on the `Proved` path (validation runs
+only on `sat`); on a `Refuted`, one extra `get_value` + µs-scale Rust eval, immeasurable against the
+~7-8 ms z3 spawn baseline (measured).
+
+**Certificates (DEFERRED — blocked, verified 2026-07-24).** Design prior: cvc5 + Alethe + Carcara, an
+OPTIONAL `certify: true` suite lane (re-solve each `unsat` in a fresh non-incremental cvc5 context with
+proof production, check the Alethe cert with Carcara, fail closed). Blockers at pinned versions:
+**cvc5 not available** (not on PATH; no Homebrew formula — `brew search cvc5` → only `cc65`);
+**Carcara not on crates.io** (`index.crates.io/ca/rc/carcara` → NoSuchKey; git-only, no stable library
+API); **z3's own proof format has no independent QF_LIA checker** (fails the whole point). With neither
+tool present the required round-trip + corrupted-certificate tests cannot be written or run — shipping
+the plumbing would be the half-checked lane the task forbids. z3 stays trusted for `Proved` claims,
+recorded honestly. Path forward enumerated in `docs/certificates-decision.md`.

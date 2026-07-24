@@ -506,6 +506,24 @@ drift. `axpy_off_by_one` REFUTES with a counterexample exhibiting the out-of-bou
 `sum_racy`'s bounds PROVE even though its differential check correctly fails — the race is a
 distinct, differential finding, never conflated with the bounds claim.
 
+**Counterexample validation (the solver's `sat` verdict is not trusted for refutations).** Every
+`REFUTED` verdict — bounds and two-thread data-race alike — is *independently re-checked in plain
+Rust* before it is reported. The solver's model is read back and evaluated against the obligation's
+entire live assertion set (the negated obligation, the path conditions, the assumes, and the leaf
+type-range facts) by a small total interpreter over the exact SMT-LIB subset vericl emits; a model
+that does not actually satisfy those assertions never becomes a `Refuted` — it fails **closed** to a
+solver error, never a silent (possibly spurious) refutation. So for a refutation the solver's `sat`
+verdict leaves the trusted base: what remains trusted is the ~120-line, unit-tested Rust
+interpreter (checked directly against a synthetic invalid-model negative) plus vericl's own
+encoding. This runs unconditionally, including in the defect demos, and adds no solver work on the
+`Proved` path (it only runs on `sat`). The dual for `Proved` claims — independently *checkable proof
+certificates* for `unsat`, which would move the solver binary out of the trusted base for proofs
+too — is designed but currently deferred: it requires cvc5 + Alethe + the Carcara checker, none of
+which are available at the pinned toolchain versions here (cvc5 is not packaged and Carcara is not a
+crates.io dependency). The honest decision record, and the path to enabling it, are in
+`docs/certificates-decision.md`; until then the z3 binary remains trusted for `Proved` claims, and
+is recorded as such in evidence.
+
 **Array-value-dependent indices (offset tables / gather).** The prover recognizes two *element-range*
 `assumes(...)` shapes over an integer index array, in addition to the length shapes (`A.len() ==
 B.len()`, `A.len() == N`): `A.iter().all(|v| (*v as usize) < B.len())` and `A.iter().all(|v| *v < N)`

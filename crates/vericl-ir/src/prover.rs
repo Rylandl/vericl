@@ -10,6 +10,24 @@
 //!
 //! ## Soundness notes (read before touching the walker)
 //!
+//! - **Counterexample validation (independent re-check of every `Refuted`).**
+//!   A `sat` verdict from the solver is not trusted on its own. Every
+//!   `Refuted`-producing `check-sat` (`check_obligation` for bounds,
+//!   `check_race` for data races) re-checks the solver's model in plain Rust
+//!   before reporting: the live assertion set is mirrored vericl-side
+//!   (`self.asserts`, kept exactly parallel to z3's stack by the `s_push`/
+//!   `s_pop`/`s_assert` wrappers), the model values are read back
+//!   (`get_value`), and each live assertion — the negated obligation, the path
+//!   conditions, the assumes, and the leaf type-range facts — is evaluated by a
+//!   small total interpreter over the exact SMT-LIB subset this file emits
+//!   (`eval_sexpr`: ints with `+`/`-`/`*`/`div`/`mod`/`ite`, the comparisons,
+//!   `and`/`or`/`not`, literals, and declared constants). If any live assertion
+//!   fails to hold under the model — a solver bug or a vericl encoding/parse
+//!   error — the verdict fails closed to `SolverError`, never a silent (and
+//!   possibly spurious) `Refuted` (`Prover::validate_counterexample`). This
+//!   shrinks the solver's `sat` verdict out of the trusted base for refutations:
+//!   what remains trusted for a `Refuted` is the small, auditable Rust
+//!   interpreter, not the solver.
 //! - Values are modeled as *terms*, not fresh symbols: `value_of` builds a
 //!   substituted expression tree rather than declaring an SMT constant per
 //!   IR variable. Only genuine leaves get a declared constant: `AbsolutePos`,
@@ -489,7 +507,7 @@ use cubecl::ir::{
     VariableKind,
 };
 use cubecl::prelude::KernelDefinition;
-use easy_smt::{Context, ContextBuilder, Response, SExpr};
+use easy_smt::{Context, ContextBuilder, Response, SExpr, SExprData};
 
 /// One array parameter, in buffer-registration order (index == buffer id —
 /// see `crates/vericl-macros`' generated `BUFFER_PARAMS`: buffer ids are
@@ -541,6 +559,16 @@ pub enum ProveResult {
     /// UNSAT (i.e. no in-bounds violation is reachable).
     Proved { obligations: usize },
     /// One obligation was satisfiable — a counterexample exists.
+    ///
+    /// **Invariant: the counterexample has been independently validated.**
+    /// Before this variant is ever produced, the solver's `sat` model is
+    /// re-checked in plain Rust against the obligation's entire live assertion
+    /// set (the negated obligation, path conditions, assumes, and type-range
+    /// facts) by `Prover::validate_counterexample`. A model that does not
+    /// actually satisfy those assertions never becomes a `Refuted`; it becomes
+    /// [`ProveResult::SolverError`] (fail-closed). So a `Refuted` here is not a
+    /// bare "the solver said sat" — it is a counterexample vericl has confirmed
+    /// by evaluation, shrinking the trust placed in the solver's `sat` verdict.
     Refuted {
         obligation: String,
         counterexample: String,
@@ -752,6 +780,7 @@ fn prove_bounds_freedom_impl(
         memo: HashMap::new(),
         buffer_len: HashMap::new(),
         declared: Vec::new(),
+        asserts: vec![Vec::new()],
         fresh: 0,
         obligations: 0,
         carried_stack: Vec::new(),
@@ -841,6 +870,7 @@ fn prove_race_freedom_detailed(
         memo: HashMap::new(),
         buffer_len: HashMap::new(),
         declared: Vec::new(),
+        asserts: vec![Vec::new()],
         fresh: 0,
         obligations: 0,
         carried_stack: Vec::new(),
@@ -954,6 +984,15 @@ struct Prover<'a, 'b> {
     buffer_len: HashMap<Id, SExpr>,
     /// Every declared free constant, for rendering counterexamples.
     declared: Vec<(String, SExpr)>,
+    /// A vericl-side mirror of z3's assertion stack, kept exactly parallel to
+    /// it by routing every `push`/`pop`/`assert` through `s_push`/`s_pop`/
+    /// `s_assert`. One frame per open scope (base frame + one per live
+    /// `push()`); each frame holds the `SExpr`s asserted into it. Flattened at a
+    /// `Refuted`-producing `check-sat` it *is* the live assertion set the model
+    /// must satisfy — the input to counterexample validation (`validate_
+    /// counterexample`). Costs one `SExpr` (a `Copy` arena handle) per assert,
+    /// so it is negligible next to the subprocess round-trips.
+    asserts: Vec<Vec<SExpr>>,
     fresh: u32,
     obligations: usize,
     /// Stack of "carried" variable-kind sets, one entry per currently-open
@@ -1128,6 +1167,117 @@ impl<'a, 'b> Prover<'a, 'b> {
             .unwrap_or_else(|| format!("<buffer {id}>"))
     }
 
+    // -- assertion-stack mirroring (counterexample validation) ------------
+    //
+    // Every `push`/`pop`/`assert` in this file goes through these three
+    // wrappers so `self.asserts` stays a byte-for-byte parallel of z3's own
+    // assertion stack. That mirror is what lets a `Refuted` verdict be
+    // *independently re-checked* in plain Rust before it is reported: the flat
+    // set of live assertions is evaluated against the solver's SAT model (see
+    // `validate_counterexample`), catching a solver bug or a vericl
+    // encoding/parse error rather than trusting the `sat` verdict blindly.
+
+    /// `push` a new SMT scope and mirror it with a fresh assertion frame.
+    fn s_push(&mut self) -> Result<(), Stop> {
+        self.smt.push().map_err(smt_err)?;
+        self.asserts.push(Vec::new());
+        Ok(())
+    }
+
+    /// `pop` the innermost SMT scope and drop its mirrored frame.
+    fn s_pop(&mut self) -> Result<(), Stop> {
+        self.smt.pop().map_err(smt_err)?;
+        self.asserts.pop();
+        Ok(())
+    }
+
+    /// `assert` `e` and record it into the innermost mirrored frame.
+    fn s_assert(&mut self, e: SExpr) -> Result<(), Stop> {
+        self.smt.assert(e).map_err(smt_err)?;
+        if let Some(frame) = self.asserts.last_mut() {
+            frame.push(e);
+        }
+        Ok(())
+    }
+
+    /// Independently re-check a solver `sat` model against the live assertion
+    /// set before a `Refuted` verdict is reported (deliverable: counterexample
+    /// validation). The model that `check-sat` produced assigns a concrete
+    /// value to every free constant; those values are read back
+    /// (`get_value`), then the *entire* live assertion set — the base assumes,
+    /// the leaf type-range facts, the live path conditions, and the negated
+    /// obligation / race-conflict conjuncts just asserted — is evaluated in
+    /// plain Rust arithmetic (`eval_sexpr`). If any live assertion does not
+    /// hold under the model, the model is not a genuine counterexample: that
+    /// signals a solver bug or a vericl encoding/parse error, so the verdict is
+    /// a loud [`Stop::SolverError`] (fail-closed), never a silent — and
+    /// possibly spurious — `Refuted`. Called from every `Refuted`-producing
+    /// site (`check_obligation`, `check_race`) while the solver's model and the
+    /// mirrored frame are still live (before the matching `pop`).
+    fn validate_counterexample(&mut self) -> Result<(), Stop> {
+        // 1. The live assertion set (flatten the mirror stack).
+        let live: Vec<SExpr> = self.asserts.iter().flatten().copied().collect();
+
+        // 2. The declared constants referenced by those assertions (a subset of
+        //    `self.declared`, so exactly the in-scope free symbols), in
+        //    first-encounter order.
+        let declared: HashMap<&str, SExpr> =
+            self.declared.iter().map(|(n, e)| (n.as_str(), *e)).collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut referenced: Vec<(String, SExpr)> = Vec::new();
+        for &a in &live {
+            collect_model_atoms(self.smt, a, &declared, &mut seen, &mut referenced);
+        }
+
+        // 3. Force a concrete model value for each referenced constant, and
+        //    evaluate that (ground) value term to a `ModelVal`.
+        let mut model: HashMap<String, ModelVal> = HashMap::new();
+        if !referenced.is_empty() {
+            let query: Vec<SExpr> = referenced.iter().map(|(_, e)| *e).collect();
+            let vals = self.smt.get_value(query).map_err(smt_err)?;
+            for ((name, _), (_, val)) in referenced.iter().zip(vals.iter()) {
+                let mv = eval_sexpr(self.smt, *val, &HashMap::new()).map_err(|e| {
+                    Stop::SolverError(format!(
+                        "counterexample validation could not parse the solver's model value for \
+                         `{name}`: {e}"
+                    ))
+                })?;
+                model.insert(name.clone(), mv);
+            }
+        }
+
+        // 4. Every live assertion must evaluate to `true` under the model.
+        for &a in &live {
+            match eval_sexpr(self.smt, a, &model) {
+                Ok(ModelVal::Bool(true)) => {}
+                Ok(ModelVal::Bool(false)) => {
+                    return Err(Stop::SolverError(format!(
+                        "counterexample validation FAILED: the solver reported `sat` but its model \
+                         does not satisfy the live assertion `{}` — this indicates a solver bug or \
+                         a vericl encoding/parse error, so the refutation is withheld and reported \
+                         as a solver error rather than a (possibly spurious) counterexample",
+                        self.smt.display(a)
+                    )));
+                }
+                Ok(ModelVal::Int(_)) => {
+                    return Err(Stop::SolverError(format!(
+                        "counterexample validation: the live assertion `{}` evaluated to an \
+                         integer rather than a boolean (vericl encoding error)",
+                        self.smt.display(a)
+                    )));
+                }
+                Err(e) => {
+                    return Err(Stop::SolverError(format!(
+                        "counterexample validation could not evaluate the live assertion `{}`: {e} \
+                         — reported as a solver error rather than an unvalidated refutation",
+                        self.smt.display(a)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn declare_int(&mut self, hint: &str, non_negative: bool) -> Result<SExpr, Stop> {
         self.fresh += 1;
         let name = format!("{hint}{}", self.fresh);
@@ -1136,7 +1286,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         if non_negative {
             let zero = self.smt.numeral(0);
             let ge0 = self.smt.gte(e, zero);
-            self.smt.assert(ge0).map_err(smt_err)?;
+            self.s_assert(ge0)?;
         }
         self.declared.push((name, e));
         Ok(e)
@@ -1154,11 +1304,11 @@ impl<'a, 'b> Prover<'a, 'b> {
         let e = self.declare_int(hint, is_unsigned(ty))?;
         let max = self.smt.numeral(type_max(ty));
         let le = self.smt.lte(e, max);
-        self.smt.assert(le).map_err(smt_err)?;
+        self.s_assert(le)?;
         if !is_unsigned(ty) {
             let min = int_const(self.smt, type_min(ty));
             let ge = self.smt.gte(e, min);
-            self.smt.assert(ge).map_err(smt_err)?;
+            self.s_assert(ge)?;
         }
         Ok(e)
     }
@@ -1197,14 +1347,14 @@ impl<'a, 'b> Prover<'a, 'b> {
                     let la = self.length_of(ida)?;
                     let lb = self.length_of(idb)?;
                     let eq = self.smt.eq(la, lb);
-                    self.smt.assert(eq).map_err(smt_err)?;
+                    self.s_assert(eq)?;
                 }
                 Assume::LenEqConst { a, value } => {
                     let ida = self.buffer_id_by_name(a)?;
                     let la = self.length_of(ida)?;
                     let v = self.smt.numeral(value);
                     let eq = self.smt.eq(la, v);
-                    self.smt.assert(eq).map_err(smt_err)?;
+                    self.s_assert(eq)?;
                 }
                 // Element-range assumes assert NO global fact (they constrain
                 // array *contents*, not lengths); instead they record a bound
@@ -1238,7 +1388,7 @@ impl<'a, 'b> Prover<'a, 'b> {
                     let kk = self.smt.numeral(k);
                     let sum = self.smt.plus(la, kk);
                     let le = self.smt.lte(sum, lb);
-                    self.smt.assert(le).map_err(smt_err)?;
+                    self.s_assert(le)?;
                 }
             }
         }
@@ -1327,7 +1477,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         // carries the `0 <= w` lower bound, which can only make the probe fire
         // MORE often, never less (never an unsound under-fire).
         let fallback_ty = address_type();
-        self.smt.push().map_err(smt_err)?;
+        self.s_push()?;
         for arr_id in arr_ids {
             let elem_ty = match buffer_tys.get(arr_id as usize) {
                 Some(t) if is_modeled_int(t) => t,
@@ -1341,17 +1491,17 @@ impl<'a, 'b> Prover<'a, 'b> {
             let w = self.smt.declare_const(&name, sort).map_err(smt_err)?;
             let max = self.smt.numeral(type_max(elem_ty));
             let le_max = self.smt.lte(w, max);
-            self.smt.assert(le_max).map_err(smt_err)?;
+            self.s_assert(le_max)?;
             let min = int_const(self.smt, type_min(elem_ty));
             let ge_min = self.smt.gte(w, min);
-            self.smt.assert(ge_min).map_err(smt_err)?;
+            self.s_assert(ge_min)?;
             for b in bounds {
                 let lt = self.smt.lt(w, b);
-                self.smt.assert(lt).map_err(smt_err)?;
+                self.s_assert(lt)?;
             }
         }
         let feasible = self.smt.check().map_err(smt_err)?;
-        self.smt.pop().map_err(smt_err)?;
+        self.s_pop()?;
         if feasible == Response::Unsat {
             return Err(Stop::OutOfSubset(
                 "a declared element-range assumption is unsatisfiable for every value of the \
@@ -1414,7 +1564,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         let sym = self.declare_int("unit_pos", true)?;
         let bound = self.smt.numeral(cube_dim as u64);
         let lt = self.smt.lt(sym, bound);
-        self.smt.assert(lt).map_err(smt_err)?;
+        self.s_assert(lt)?;
         self.memo.insert(kind, Some(sym));
         Ok(sym)
     }
@@ -1480,7 +1630,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         let k = self.declare_int("abs_wrap", true)?;
         let k_max = self.smt.numeral((cube_dim as u64).saturating_sub(1));
         let k_le = self.smt.lte(k, k_max);
-        self.smt.assert(k_le).map_err(smt_err)?;
+        self.s_assert(k_le)?;
         // abs_pos = cube_pos*cube_dim + unit_pos - k*2^32  (both products linear).
         let cd = self.smt.numeral(cube_dim as u64);
         let scaled = self.smt.times(cube, cd);
@@ -1489,7 +1639,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         let wraps = self.smt.times(k, modulus);
         let rhs = self.smt.sub(sum, wraps);
         let eq = self.smt.eq(abs, rhs);
-        self.smt.assert(eq).map_err(smt_err)?;
+        self.s_assert(eq)?;
         self.memo.insert(kind, Some(abs));
         Ok(abs)
     }
@@ -1613,7 +1763,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             ));
         };
         let not_cond = self.smt.not(cond);
-        self.smt.assert(not_cond).map_err(smt_err)?;
+        self.s_assert(not_cond)?;
         // In a race walk, `!cond` is also a live fact conjoined into every
         // subsequent access's recorded guard (so the deferred cross-thread
         // obligations see it), exactly like an `if`/loop guard. `race_reset_for_
@@ -1907,11 +2057,11 @@ impl<'a, 'b> Prover<'a, 'b> {
     /// as a genuine `SolverError` — that's an implementation failure, not a
     /// soundness question.
     fn try_discharge(&mut self, obligation: SExpr) -> Result<bool, Stop> {
-        self.smt.push().map_err(smt_err)?;
+        self.s_push()?;
         let negated = self.smt.not(obligation);
-        self.smt.assert(negated).map_err(smt_err)?;
+        self.s_assert(negated)?;
         let response = self.smt.check();
-        self.smt.pop().map_err(smt_err)?;
+        self.s_pop()?;
         match response {
             Ok(Response::Unsat) => Ok(true),
             Ok(Response::Sat) | Ok(Response::Unknown) => Ok(false),
@@ -2141,7 +2291,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         let v = self.declare_leaf("elem", &out.ty)?;
         for b in bounds {
             let lt = self.smt.lt(v, b);
-            self.smt.assert(lt).map_err(smt_err)?;
+            self.s_assert(lt)?;
         }
         self.bind_out(inst, Some(v));
         Ok(true)
@@ -2269,10 +2419,10 @@ impl<'a, 'b> Prover<'a, 'b> {
         let bound = self.smt.numeral(cube_dim as u64);
         let t1 = self.declare_int("t", true)?;
         let lt1 = self.smt.lt(t1, bound);
-        self.smt.assert(lt1).map_err(smt_err)?;
+        self.s_assert(lt1)?;
         let t2 = self.declare_int("t", true)?;
         let lt2 = self.smt.lt(t2, bound);
-        self.smt.assert(lt2).map_err(smt_err)?;
+        self.s_assert(lt2)?;
         // NB: `t1 != t2` is deliberately NOT asserted globally — it is part of
         // each *race* obligation (asserted per-query in `check_race`), not a
         // fact the *bounds* obligations may lean on. Asserting it globally would
@@ -2541,12 +2691,12 @@ impl<'a, 'b> Prover<'a, 'b> {
         h: SExpr,
         init: SExpr,
     ) -> Result<(), Stop> {
-        self.smt.push().map_err(smt_err)?;
+        self.s_push()?;
         let one = self.smt.numeral(1);
         let ge1 = self.smt.gte(h, one);
-        self.smt.assert(ge1).map_err(smt_err)?;
+        self.s_assert(ge1)?;
         let le_init = self.smt.lte(h, init);
-        self.smt.assert(le_init).map_err(smt_err)?;
+        self.s_assert(le_init)?;
         {
             let r = self.race.as_mut().expect("race mode");
             r.fact_stack.push(ge1);
@@ -2569,7 +2719,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             r.fact_stack.pop();
             r.fact_stack.pop();
         }
-        self.smt.pop().map_err(smt_err)?;
+        self.s_pop()?;
         result
     }
 
@@ -2651,7 +2801,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         kind: &str,
         phase: usize,
     ) -> Result<(), Stop> {
-        self.smt.push().map_err(smt_err)?;
+        self.s_push()?;
         // The two threads are distinct — asserted here, per race obligation,
         // rather than globally (see `race_setup`).
         let (t1, t2) = {
@@ -2660,23 +2810,30 @@ impl<'a, 'b> Prover<'a, 'b> {
         };
         let eq_threads = self.smt.eq(t1, t2);
         let distinct = self.smt.not(eq_threads);
-        self.smt.assert(distinct).map_err(smt_err)?;
-        self.smt.assert(a.guard).map_err(smt_err)?;
-        self.smt.assert(b.guard).map_err(smt_err)?;
+        self.s_assert(distinct)?;
+        self.s_assert(a.guard)?;
+        self.s_assert(b.guard)?;
         let same = self.smt.eq(a.index, b.index);
-        self.smt.assert(same).map_err(smt_err)?;
+        self.s_assert(same)?;
         let response = self.smt.check();
         let outcome = match response {
             Ok(Response::Unsat) => Ok(()),
             Ok(Response::Sat) => {
                 let counterexample = self.render_counterexample();
-                Err(Stop::Refuted {
-                    obligation: format!(
-                        "no {kind} race on `{}` between two threads (phase {phase})",
-                        a.name
-                    ),
-                    counterexample,
-                })
+                // Same independent re-check as the bounds path: a two-thread
+                // model that does not satisfy `guard1 ∧ guard2 ∧ idx1 = idx2`
+                // (with the thread ranges + `t1 ≠ t2`) is not a genuine race
+                // witness — fail closed to `SolverError`.
+                match self.validate_counterexample() {
+                    Ok(()) => Err(Stop::Refuted {
+                        obligation: format!(
+                            "no {kind} race on `{}` between two threads (phase {phase})",
+                            a.name
+                        ),
+                        counterexample,
+                    }),
+                    Err(stop) => Err(stop),
+                }
             }
             Ok(Response::Unknown) => Err(Stop::SolverError(format!(
                 "z3 returned `unknown` for a {kind} race obligation on `{}`",
@@ -2684,7 +2841,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             ))),
             Err(e) => Err(smt_err(e)),
         };
-        self.smt.pop().map_err(smt_err)?;
+        self.s_pop()?;
         outcome
     }
 
@@ -2737,10 +2894,10 @@ impl<'a, 'b> Prover<'a, 'b> {
                             self.smt.not(eq)
                         };
                         let implies_tid0 = self.smt.and(acc.guard, t1_ne_0);
-                        self.smt.push().map_err(smt_err)?;
-                        self.smt.assert(implies_tid0).map_err(smt_err)?;
+                        self.s_push()?;
+                        self.s_assert(implies_tid0)?;
                         let response = self.smt.check();
-                        self.smt.pop().map_err(smt_err)?;
+                        self.s_pop()?;
                         match response {
                             Ok(Response::Unsat) => {
                                 self.race.as_mut().expect("race mode").global_checks += 1;
@@ -2808,10 +2965,10 @@ impl<'a, 'b> Prover<'a, 'b> {
                 let snapshot = self.memo.clone();
                 self.write_log_stack.push(HashSet::new());
                 self.race_push_guard(&if_.cond, cond, false);
-                self.smt.push().map_err(smt_err)?;
-                self.smt.assert(cond).map_err(smt_err)?;
+                self.s_push()?;
+                self.s_assert(cond)?;
                 let r = self.process_scope(&if_.scope);
-                self.smt.pop().map_err(smt_err)?;
+                self.s_pop()?;
                 self.race_pop_guard();
                 let written =
                     self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
@@ -2832,10 +2989,10 @@ impl<'a, 'b> Prover<'a, 'b> {
 
                 self.write_log_stack.push(HashSet::new());
                 self.race_push_guard(&ie.cond, cond, false);
-                self.smt.push().map_err(smt_err)?;
-                self.smt.assert(cond).map_err(smt_err)?;
+                self.s_push()?;
+                self.s_assert(cond)?;
                 let r1 = self.process_scope(&ie.scope_if);
-                self.smt.pop().map_err(smt_err)?;
+                self.s_pop()?;
                 self.race_pop_guard();
                 let written_if =
                     self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
@@ -2849,10 +3006,10 @@ impl<'a, 'b> Prover<'a, 'b> {
                 self.write_log_stack.push(HashSet::new());
                 let not_cond = self.smt.not(cond);
                 self.race_push_guard(&ie.cond, not_cond, false);
-                self.smt.push().map_err(smt_err)?;
-                self.smt.assert(not_cond).map_err(smt_err)?;
+                self.s_push()?;
+                self.s_assert(not_cond)?;
                 let r2 = self.process_scope(&ie.scope_else);
-                self.smt.pop().map_err(smt_err)?;
+                self.s_pop()?;
                 self.race_pop_guard();
                 let written_else =
                     self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
@@ -2931,10 +3088,10 @@ impl<'a, 'b> Prover<'a, 'b> {
             let cond = self.smt.eq(value, *case_expr);
             self.write_log_stack.push(HashSet::new());
             self.race_push_guard(&sw.value, cond, false);
-            self.smt.push().map_err(smt_err)?;
-            self.smt.assert(cond).map_err(smt_err)?;
+            self.s_push()?;
+            self.s_assert(cond)?;
             let r = self.process_scope(scope);
-            self.smt.pop().map_err(smt_err)?;
+            self.s_pop()?;
             self.race_pop_guard();
             let written = self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
             r?;
@@ -2956,10 +3113,10 @@ impl<'a, 'b> Prover<'a, 'b> {
         let default_cond = self.and_fold(&negations);
         self.write_log_stack.push(HashSet::new());
         self.race_push_guard(&sw.value, default_cond, false);
-        self.smt.push().map_err(smt_err)?;
-        self.smt.assert(default_cond).map_err(smt_err)?;
+        self.s_push()?;
+        self.s_assert(default_cond)?;
         let r = self.process_scope(&sw.scope_default);
-        self.smt.pop().map_err(smt_err)?;
+        self.s_pop()?;
         self.race_pop_guard();
         let written = self.write_log_stack.pop().expect("just pushed, push/pop are balanced");
         r?;
@@ -3081,13 +3238,13 @@ impl<'a, 'b> Prover<'a, 'b> {
         let i_sym = self.declare_leaf("loop_i", &rl.i.ty)?;
         self.memo.insert(rl.i.kind, Some(i_sym));
 
-        self.smt.push().map_err(smt_err)?;
+        self.s_push()?;
         let ge_start = self.smt.gte(i_sym, start);
-        self.smt.assert(ge_start).map_err(smt_err)?;
+        self.s_assert(ge_start)?;
         let hi = if rl.inclusive { self.smt.lte(i_sym, end) } else { self.smt.lt(i_sym, end) };
-        self.smt.assert(hi).map_err(smt_err)?;
+        self.s_assert(hi)?;
         let r = self.process_scope(&rl.scope);
-        self.smt.pop().map_err(smt_err)?;
+        self.s_pop()?;
         r
     }
 
@@ -3184,8 +3341,8 @@ impl<'a, 'b> Prover<'a, 'b> {
             ));
         };
 
-        self.smt.push().map_err(smt_err)?;
-        self.smt.assert(guard).map_err(smt_err)?;
+        self.s_push()?;
+        self.s_assert(guard)?;
         // In a race walk, the loop guard is a live fact (recorded into accesses
         // inside the loop) and an enclosing loop guard (barrier uniformity — a
         // non-cooperative loop has no barrier, so a thread-varying guard here is
@@ -3202,14 +3359,14 @@ impl<'a, 'b> Prover<'a, 'b> {
             }
         }
         self.race_pop_guard();
-        self.smt.pop().map_err(smt_err)?;
+        self.s_pop()?;
         result
     }
 
     fn check_obligation(&mut self, description: String, obligation: SExpr) -> Result<(), Stop> {
-        self.smt.push().map_err(smt_err)?;
+        self.s_push()?;
         let negated = self.smt.not(obligation);
-        self.smt.assert(negated).map_err(smt_err)?;
+        self.s_assert(negated)?;
         let response = self.smt.check();
         let outcome = match response {
             Ok(Response::Unsat) => {
@@ -3218,14 +3375,20 @@ impl<'a, 'b> Prover<'a, 'b> {
             }
             Ok(Response::Sat) => {
                 let counterexample = self.render_counterexample();
-                Err(Stop::Refuted { obligation: description, counterexample })
+                // Independently re-check the model before reporting `Refuted`:
+                // a model that does not satisfy the live assertions is a solver
+                // bug / encoding error, and becomes a loud `SolverError`.
+                match self.validate_counterexample() {
+                    Ok(()) => Err(Stop::Refuted { obligation: description, counterexample }),
+                    Err(stop) => Err(stop),
+                }
             }
             Ok(Response::Unknown) => {
                 Err(Stop::SolverError(format!("z3 returned `unknown` for obligation: {description}")))
             }
             Err(e) => Err(smt_err(e)),
         };
-        self.smt.pop().map_err(smt_err)?;
+        self.s_pop()?;
         outcome
     }
 
@@ -3296,6 +3459,201 @@ impl<'a, 'b> Prover<'a, 'b> {
             ConstantValue::UInt(v) => Some(self.smt.numeral(v)),
             ConstantValue::Bool(_) | ConstantValue::Float(_) => None,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Counterexample validation: a pure-Rust interpreter over the exact SMT-LIB
+// subset this file emits, used to independently re-check a solver `sat` model
+// against the live assertion set before a `Refuted` verdict is reported
+// (`Prover::validate_counterexample`). The vocabulary is closed and small —
+// every operator below corresponds to a `self.smt.<op>` (or a closure over it)
+// used to build an assertion in this file: integer `+`/`-`/`*`/`div`/`mod`,
+// `ite`, the comparisons `<`/`<=`/`>`/`>=`/`=`, the boolean `and`/`or`/`not`,
+// the literals `true`/`false` and non-negative numerals, and the declared free
+// constants (bound by the model). Anything outside it is an `Err`, which the
+// caller treats as a validation failure (fail-closed).
+// ---------------------------------------------------------------------------
+
+/// A concrete value from the solver's SAT model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ModelVal {
+    Int(i128),
+    Bool(bool),
+}
+
+/// Collect the declared constants (by name, in first-encounter order)
+/// referenced anywhere in `e`, so exactly those in-scope free symbols can be
+/// queried from the model. `seen` dedups; `out` accumulates `(name, sexpr)`.
+fn collect_model_atoms(
+    ctx: &Context,
+    e: SExpr,
+    declared: &HashMap<&str, SExpr>,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<(String, SExpr)>,
+) {
+    match ctx.get(e) {
+        SExprData::Atom(a) => {
+            if let Some(&sexpr) = declared.get(a) {
+                if seen.insert(a.to_string()) {
+                    out.push((a.to_string(), sexpr));
+                }
+            }
+        }
+        SExprData::List(items) => {
+            let items: Vec<SExpr> = items.to_vec();
+            for it in items {
+                collect_model_atoms(ctx, it, declared, seen, out);
+            }
+        }
+        SExprData::String(_) => {}
+    }
+}
+
+/// Evaluate an SMT term over the emitted subset to a concrete [`ModelVal`],
+/// resolving free constants through `model`. `Err` on any term outside the
+/// subset, an unbound constant, a division by zero, or an arithmetic overflow
+/// (i128 is exact for every real u32/i32/…/u64 value and every one-wrap
+/// intermediate, so an overflow can only mean an out-of-model term — treated,
+/// fail-closed, as a validation failure).
+fn eval_sexpr(
+    ctx: &Context,
+    e: SExpr,
+    model: &HashMap<String, ModelVal>,
+) -> Result<ModelVal, String> {
+    match ctx.get(e) {
+        SExprData::Atom(a) => match a {
+            "true" => Ok(ModelVal::Bool(true)),
+            "false" => Ok(ModelVal::Bool(false)),
+            _ => {
+                if let Ok(n) = a.parse::<i128>() {
+                    Ok(ModelVal::Int(n))
+                } else if let Some(v) = model.get(a) {
+                    Ok(*v)
+                } else {
+                    Err(format!("unbound constant `{a}` (no model value)"))
+                }
+            }
+        },
+        SExprData::List(items) => {
+            let items: Vec<SExpr> = items.to_vec();
+            let Some((head, args)) = items.split_first() else {
+                return Err("empty list term".to_string());
+            };
+            let op =
+                ctx.get_atom(*head).ok_or_else(|| "non-atom operator head".to_string())?.to_string();
+            eval_op(ctx, &op, args, model)
+        }
+        SExprData::String(_) => Err("unexpected string literal in term".to_string()),
+    }
+}
+
+/// Apply operator `op` to its (unevaluated) `args` under `model`.
+fn eval_op(
+    ctx: &Context,
+    op: &str,
+    args: &[SExpr],
+    model: &HashMap<String, ModelVal>,
+) -> Result<ModelVal, String> {
+    let int = |e: SExpr| -> Result<i128, String> {
+        match eval_sexpr(ctx, e, model)? {
+            ModelVal::Int(n) => Ok(n),
+            ModelVal::Bool(_) => Err(format!("`{op}` expected an integer operand, got a boolean")),
+        }
+    };
+    let boolean = |e: SExpr| -> Result<bool, String> {
+        match eval_sexpr(ctx, e, model)? {
+            ModelVal::Bool(b) => Ok(b),
+            ModelVal::Int(_) => Err(format!("`{op}` expected a boolean operand, got an integer")),
+        }
+    };
+    match op {
+        // Unary negate `(- x)` vs binary/n-ary subtract `(- a b …)`.
+        "-" if args.len() == 1 => {
+            int(args[0])?.checked_neg().map(ModelVal::Int).ok_or_else(|| "negate overflow".into())
+        }
+        "-" => {
+            let mut acc = int(args[0])?;
+            for &a in &args[1..] {
+                acc = acc.checked_sub(int(a)?).ok_or_else(|| "subtraction overflow".to_string())?;
+            }
+            Ok(ModelVal::Int(acc))
+        }
+        "+" => {
+            let mut acc = 0i128;
+            for &a in args {
+                acc = acc.checked_add(int(a)?).ok_or_else(|| "addition overflow".to_string())?;
+            }
+            Ok(ModelVal::Int(acc))
+        }
+        "*" => {
+            let mut acc = 1i128;
+            for &a in args {
+                acc = acc.checked_mul(int(a)?).ok_or_else(|| "multiplication overflow".to_string())?;
+            }
+            Ok(ModelVal::Int(acc))
+        }
+        // SMT-LIB `div`/`mod` are Euclidean (remainder always non-negative),
+        // which `i128::checked_div_euclid`/`checked_rem_euclid` implement
+        // exactly. A zero divisor cannot occur in a genuine model (the div/mod
+        // side-obligation proves the divisor non-zero) — if it does, that is
+        // itself a validation failure.
+        "div" if args.len() == 2 => {
+            let (a, b) = (int(args[0])?, int(args[1])?);
+            if b == 0 {
+                return Err("division by zero in model".to_string());
+            }
+            a.checked_div_euclid(b).map(ModelVal::Int).ok_or_else(|| "div overflow".into())
+        }
+        "mod" if args.len() == 2 => {
+            let (a, b) = (int(args[0])?, int(args[1])?);
+            if b == 0 {
+                return Err("modulo by zero in model".to_string());
+            }
+            a.checked_rem_euclid(b).map(ModelVal::Int).ok_or_else(|| "mod overflow".into())
+        }
+        "<" | "<=" | ">" | ">=" if args.len() == 2 => {
+            let (a, b) = (int(args[0])?, int(args[1])?);
+            let r = match op {
+                "<" => a < b,
+                "<=" => a <= b,
+                ">" => a > b,
+                _ => a >= b,
+            };
+            Ok(ModelVal::Bool(r))
+        }
+        // `=` is emitted only over integers here, but comparing the resolved
+        // `ModelVal`s directly is correct for either sort.
+        "=" if args.len() == 2 => {
+            let l = eval_sexpr(ctx, args[0], model)?;
+            let r = eval_sexpr(ctx, args[1], model)?;
+            Ok(ModelVal::Bool(l == r))
+        }
+        "and" => {
+            for &a in args {
+                if !boolean(a)? {
+                    return Ok(ModelVal::Bool(false));
+                }
+            }
+            Ok(ModelVal::Bool(true))
+        }
+        "or" => {
+            for &a in args {
+                if boolean(a)? {
+                    return Ok(ModelVal::Bool(true));
+                }
+            }
+            Ok(ModelVal::Bool(false))
+        }
+        "not" if args.len() == 1 => Ok(ModelVal::Bool(!boolean(args[0])?)),
+        "ite" if args.len() == 3 => {
+            if boolean(args[0])? {
+                eval_sexpr(ctx, args[1], model)
+            } else {
+                eval_sexpr(ctx, args[2], model)
+            }
+        }
+        other => Err(format!("unsupported operator `{other}` (arity {})", args.len())),
     }
 }
 
@@ -3958,6 +4316,123 @@ mod tests {
             }
             other => panic!("expected Refuted, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Counterexample validation (deliverable: independently re-check a
+    // solver `sat` model against the live assertion set before reporting
+    // `Refuted`). The first test is end-to-end (a genuine refutation is
+    // re-checked and survives as `Refuted`, not the fail-closed
+    // `SolverError` a bogus model would yield); the rest exercise the
+    // pure-Rust interpreter (`eval_sexpr`) that makes the validation
+    // decision, including the synthetic invalid-model negative.
+    // -----------------------------------------------------------------
+
+    /// End-to-end positive: a real out-of-bounds read (no `x.len() == y.len()`
+    /// assume, so z3 picks `x.len() == 0`) refutes, and the counterexample
+    /// *passes* validation — the verdict is `Refuted`, never turned into a
+    /// `SolverError`. Proves the validation is wired into the bounds path and
+    /// does not reject a genuine counterexample.
+    #[test]
+    fn genuine_refutation_passes_counterexample_validation() {
+        let def = build_axpy();
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[]) {
+            ProveResult::Refuted { .. } => {}
+            ProveResult::SolverError { detail } => {
+                panic!("a genuine counterexample was wrongly rejected by validation: {detail}")
+            }
+            other => panic!("expected a validated Refuted, got {other:?}"),
+        }
+    }
+
+    /// The interpreter evaluates arithmetic and comparisons the same way the
+    /// SMT solver does. `(< (+ x 1) y)` under `x=5,y=7` is `6 < 7` (true) and
+    /// under `x=10,y=7` is `11 < 7` (false).
+    #[test]
+    fn cex_interp_arithmetic_and_comparisons() {
+        let ctx = ContextBuilder::new().build().expect("term-only context");
+        let x = ctx.atom("x");
+        let y = ctx.atom("y");
+        let one = ctx.numeral(1);
+        let sum = ctx.plus(x, one);
+        let term = ctx.lt(sum, y);
+        let mut m = HashMap::new();
+        m.insert("x".to_string(), ModelVal::Int(5));
+        m.insert("y".to_string(), ModelVal::Int(7));
+        assert_eq!(eval_sexpr(&ctx, term, &m), Ok(ModelVal::Bool(true)));
+        m.insert("x".to_string(), ModelVal::Int(10));
+        assert_eq!(eval_sexpr(&ctx, term, &m), Ok(ModelVal::Bool(false)));
+    }
+
+    /// Synthetic invalid-model negative: were the solver ever to return a model
+    /// that does NOT satisfy a live assertion, `eval_sexpr` (the core of
+    /// `validate_counterexample`) evaluates that assertion to `false`, which
+    /// the caller turns into a loud `SolverError` rather than a spurious
+    /// `Refuted`. Here a bounds fact `(and (>= idx 0) (< idx len))` holds under
+    /// a good model and is flagged `false` under a fabricated one where
+    /// `idx == len`.
+    #[test]
+    fn cex_interp_flags_a_model_that_violates_an_assertion() {
+        let ctx = ContextBuilder::new().build().expect("term-only context");
+        let idx = ctx.atom("idx");
+        let len = ctx.atom("len");
+        let zero = ctx.numeral(0);
+        let ge0 = ctx.gte(idx, zero);
+        let lt = ctx.lt(idx, len);
+        let in_bounds = ctx.and(ge0, lt);
+        let mut good = HashMap::new();
+        good.insert("idx".to_string(), ModelVal::Int(3));
+        good.insert("len".to_string(), ModelVal::Int(8));
+        assert_eq!(eval_sexpr(&ctx, in_bounds, &good), Ok(ModelVal::Bool(true)));
+        let mut bad = HashMap::new();
+        bad.insert("idx".to_string(), ModelVal::Int(8));
+        bad.insert("len".to_string(), ModelVal::Int(8));
+        assert_eq!(eval_sexpr(&ctx, in_bounds, &bad), Ok(ModelVal::Bool(false)));
+    }
+
+    /// Euclidean `div`/`mod` (matching SMT-LIB), unary negate, and `ite` — the
+    /// terms the overflow/wrap and div-guard modeling emit — plus the
+    /// division-by-zero guard (a zero divisor in a model is a validation
+    /// failure, not a panic).
+    #[test]
+    fn cex_interp_div_mod_ite_and_negatives() {
+        let ctx = ContextBuilder::new().build().expect("term-only context");
+        let a = ctx.atom("a");
+        let b = ctx.atom("b");
+        let d = ctx.div(a, b);
+        let m = ctx.modulo(a, b);
+        let mut model = HashMap::new();
+        model.insert("a".to_string(), ModelVal::Int(17));
+        model.insert("b".to_string(), ModelVal::Int(5));
+        assert_eq!(eval_sexpr(&ctx, d, &model), Ok(ModelVal::Int(3)));
+        assert_eq!(eval_sexpr(&ctx, m, &model), Ok(ModelVal::Int(2)));
+        let one = ctx.numeral(1);
+        let neg1 = ctx.negate(one);
+        assert_eq!(eval_sexpr(&ctx, neg1, &model), Ok(ModelVal::Int(-1)));
+        let cond = ctx.gt(a, b);
+        let ite = ctx.ite(cond, a, b);
+        assert_eq!(eval_sexpr(&ctx, ite, &model), Ok(ModelVal::Int(17)));
+        let mut zero_div = HashMap::new();
+        zero_div.insert("a".to_string(), ModelVal::Int(4));
+        zero_div.insert("b".to_string(), ModelVal::Int(0));
+        assert!(eval_sexpr(&ctx, d, &zero_div).is_err());
+    }
+
+    /// The interpreter is closed over exactly the emitted vocabulary: an
+    /// unbound constant (no model value) and an operator outside the subset
+    /// (`bvand`) both fail closed with `Err`, which validation surfaces as a
+    /// `SolverError` rather than silently trusting the verdict.
+    #[test]
+    fn cex_interp_rejects_unbound_and_unsupported() {
+        let ctx = ContextBuilder::new().build().expect("term-only context");
+        let z = ctx.atom("z");
+        assert!(eval_sexpr(&ctx, z, &HashMap::new()).is_err());
+        let a = ctx.atom("a");
+        let one = ctx.numeral(1);
+        let bv = ctx.list(vec![ctx.atom("bvand"), a, one]);
+        let mut m = HashMap::new();
+        m.insert("a".to_string(), ModelVal::Int(3));
+        assert!(eval_sexpr(&ctx, bv, &m).is_err());
     }
 
     /// `z3_version` reports something when the binary is on PATH (it is on

@@ -136,12 +136,18 @@ fn main() {
     // so it is deliberately not folded into `all_caught` the same way; each
     // kernel's outcome is printed and reasoned about on its own terms.
     println!("\nSMT bounds proofs (a separate claim from the differential checks above):");
+    println!(
+        "(every REFUTED verdict below is counterexample-validated: the solver's model is \
+         independently re-checked in plain Rust against the obligation's live assertion set before \
+         it is reported — an unvalidated model would fail closed to a solver error, not a \
+         refutation)"
+    );
 
     let ob_def = axpy_off_by_one_vericl::kernel_definition();
     match prove_kernel(&ob_def, axpy_off_by_one_vericl::BUFFER_PARAMS, axpy_off_by_one_vericl::contract().structured_assumes) {
         vericl_ir::ProveResult::Refuted { obligation, counterexample } => {
             println!("  [REFUTED] axpy_off_by_one: {obligation}");
-            println!("    counterexample: {counterexample}");
+            println!("    counterexample (validated in-checker): {counterexample}");
             println!("  -> bounds defect caught (an out-of-bounds access is reachable)");
         }
         other => {
@@ -168,7 +174,10 @@ fn main() {
     ) {
         vericl_ir::ProveResult::Refuted { obligation, counterexample } => {
             println!("  [REFUTED] gather_oob: {obligation}");
-            println!("    counterexample (element symbol at the boundary): {counterexample}");
+            println!(
+                "    counterexample (validated in-checker; element symbol at the boundary): \
+                 {counterexample}"
+            );
             println!(
                 "  -> value-dependent-index defect caught (an offset in [8, 16) reads out of \
                  bounds of the length-8 data array)"
@@ -215,7 +224,7 @@ fn main() {
     match prove_race_kernel(&racy_coop_def, block_sum_reduce_racy_vericl::BUFFER_PARAMS, CUBE_DIM) {
         vericl_ir::ProveResult::Refuted { obligation, counterexample } => {
             println!("  [REFUTED] block_sum_reduce_racy: {obligation}");
-            println!("    two-thread counterexample: {counterexample}");
+            println!("    two-thread counterexample (validated in-checker): {counterexample}");
             println!(
                 "  -> race defect caught by proof (an overlapping `tile[tid] += tile[tid+1]` \
                  reduction stride lets adjacent threads race within one generation; the \
