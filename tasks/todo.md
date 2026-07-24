@@ -249,8 +249,9 @@ caught deterministically.
    `tested`+`proved` claims); `conform demo-defects` exits 0; the stale-evidence cycle (mutate
    `fir3`'s guard → fails naming both hashes → revert → passes) exercised end to end; the
    no-instantiate and unused-instantiate errors demonstrated in the scratchpad (not committed);
-   the private dogfood suite (`mulhilo32_kernel`, `philox4x32_two_kernel`, and a
-   cos/sin synthesis kernel) green end to end, `dogfood-rejects` still fails to build with
+   the private dogfood suite (a widening 32x32->64-bit product-split kernel, a counter-based
+   block-cipher RNG kernel, and a cos/sin synthesis kernel — construct classes only, per the
+   private-codebase policy) green end to end, `dogfood-rejects` still fails to build with
    its generics-blocked kernel now naming the *new* targeted "add instantiate(...)" error
    instead of the old blanket one (confirming the replacement fires correctly) while its
    topology-blocked variant is unaffected.
@@ -590,8 +591,8 @@ caught deterministically.
    **Private dogfood validation** (per the README's private-codebase policy: never committed, described
    here only by construct class): the survey's own "inner-loop-with-single-helper shape"
    candidate — a two-chain FIR-convolution device fn (which the private source itself already calls
-   "the first proof that #[cube] Level-1 composition works") and `inner_loop_kernel` (the
-   `#[cube(launch)]` entry point that calls it exactly once) from the private kernel crate —
+   "the first proof that #[cube] Level-1 composition works") and the single-emitter inner-loop
+   kernel (the `#[cube(launch)]` entry point that calls it exactly once) from the private kernel crate —
    generic (`F: Float`), one `#[comptime]` param, exactly one helper call, no shared memory, per
    the survey's own gap ranking the least-blocked composed shape. Copied UNCHANGED (no adaptation
    needed for either body) and passed differentially on wgpu end-to-end across 5 sizes. Its bounds
@@ -2313,3 +2314,151 @@ story for v0); a `FLOAT_METHOD_CONST_ONLY` distinction if a dogfooded kernel
 needs a runtime `new`/`from_int`; a full QF_BV overflow model as a precision
 upgrade; VeriCL-authored (buffer-named) diagnostics for the two rustc-mediated
 rejections (E0499 aliasing, missing-annotation accessor).
+
+## Coverage re-census (2026-07-24) — both surveys re-run against today's VeriCL
+
+Both original surveys re-scored against today's gates, and — the part that
+makes it a census rather than a paper exercise — **every item the gates said was
+reachable was actually annotated and run**. Full reports in the two survey docs'
+own re-census addenda. All work in the private sibling workspaces; the only
+vericl-repo changes are those two addenda, this record, and three pre-existing
+private-identifier leaks fixed in passing (below). No commits, no evidence
+touched, `cargo test --workspace` green before and after.
+
+**Private codebase (22 kernels): 2/22 → 6/22 faithful; 21/22 with a validated
+artifact.** Faithful = body byte-for-byte the private source, only the contract
+attribute added. Plus 3 at one-named-construct substitution (9/22 near-faithful),
+12 distilled-core validated, 1 with no honest annotation at any fidelity, and
+**0 annotatable-but-unattempted**. Three new evidence manifests, **513
+machine-checked obligations**, all re-verified by a plain `cargo test`;
+composition exercised **four levels deep** (60 obligations through the chain).
+Every Tier-1 and Tier-2 gate in the original table is closed and blocks nothing.
+The survey's own predicted "next wall" (`usize` scalar params) blocks **0/22** in
+the predicted form — no launch kernel takes a runtime `usize` scalar; it
+resurfaced as a `cast_from` *source-type* wall instead.
+
+**Private residual walls (measured):** 1. bare `fma(...)` — 12/22, and cubecl's
+`fma` is **not host-callable**, so the rejection is correct and a helper is no
+escape; the `a*b+c` rewrite is measurably unsound for the shape that needs it
+(fused residual 8.23e-7 → exactly 0). 2. `cast_from` with a `usize` source —
+13/22, sole for 1. 3. `wrapping` on a tuple-returning helper — 3/22, sole for 2.
+4. non-`f32`-target / `bool`-source `cast_from`. 5. **new**: implicit
+*injectivity* of a table used as a write index — no assume form can express it.
+6. 2-D dispatch. Walls 1+2 both live in one ~30-line device helper that is the
+sole gate on 12 of 22; fixing both takes faithful coverage 6/22 → ~18/22.
+
+**Two new private findings.** (a) An implicit host-side reach invariant on four
+kernels: an unbounded anchor underflows, the wrapped value feeds an interleaving
+`*2` whose `checked_mul` side-obligation cannot discharge, the index becomes
+unmodelable → `OutOfSubset`. Adding the guard one production kernel already
+carries flips all four to `Proved{55/60/61/64}`. **VeriCL residual: surface the
+failed `checked_mul` side-obligation instead of the generic out-of-subset text** —
+the same defect yields an actionable counterexample or a bare `OutOfSubset`
+depending only on buffer size. (b) A differential FAILURE that is a genuine
+implicit invariant: a table-loaded output slot collides for ~half of drawn
+inputs (16/32 elements diverge, worst ~2.1e9 ULP); correct upstream only because
+the table is injective.
+
+**Three recorded walls measured as GONE**, each on real private code:
+helper-calling-helper tuple destructuring (the `Pat::Tuple` residual is
+**closed**), `#[comptime]` params in cooperative kernels (shared-memory wall #1
+**lifted** — full oob+race triple), and "cannot bind a free scalar near the cube
+count" (not a macro gate; the constraint is semantic).
+
+**Ecosystem (464 items): denominator and all thirteen v0 counts reproduced
+exactly, then re-scored.** Items with zero blocking gates 103 → 119 (+16) on the
+v0-lineage gate set; 35 → 49 (+14) under a corrected set applied symmetrically.
+Both are reported because the **v0 gate list under-counted blockers** — it never
+looked for struct-typed comptime params, the broad `CubeType` parameter shape, or
+`intrinsic!`, which is why it showed 103 gate-free items while the survey could
+shortlist only 8. Genuinely new annotatable non-test plain `fn`s: **4**, all via
+the `cast_from` shim.
+
+**The re-census adds sole-blocker counts — the honest reach number the original
+lacked** (incidence answers "how common", not "what would removing this
+unlock"). 127 of 464 items have exactly one blocking gate.
+
+**Two shipped gates measured to unlock nothing here.** `match`/Switch (v0 rank
+#4, 119 incidences): of ~270 `match` expressions inside `#[cube]` items, **exactly
+4 have integer-literal arms and all 4 are in cubecl's own conformance suite** —
+zero in cubek's nine crates, zero in cubecl-std, zero in burn-cubecl
+(independently confirmed by a second scan returning 0 hits). `comptime!{}`
+blocks: all 12 lexically admissible items are blocked by something else, 9 of
+them by a struct-typed `#[comptime]` param. Both milestones are correct and
+useful; this corpus does not exercise them. Core `Slice` is the same story.
+
+**Spot-validation: §4 residual #3 is CLOSED, measured.** Six kernels added
+non-destructively to the survey crate (original 8 evidence entries byte-identical,
+per-entry SHA-256 verified), all green on **both** lanes:
+`to_unit_interval_open_map` (`max_ulp=3`, `Proved{2}`), `uniform_value_map`
+(`abs=1e-4`, `Proved{5}` — composition + helper-level `wrapping` + the shim in
+one kernel), `normal_box_muller_map` (`abs=1e-2`, `Proved{6}`),
+`kernel_switch_simple` (`Proved{3}`), `slice_select` (`Proved{2}`), and
+`bernoulli_value_map` cleanly **rejected** (`bool: CastToF32 is not satisfied`).
+Findings: `to_unit_interval_open` is 1 ULP on wgpu (backend lowers `/8388609.0`
+to a reciprocal-multiply; the sibling divides by an exact `2^24`) — the shim is
+not implicated; **new residual: bool-source `cast_from`, 15 sites across cubek,
+GPU ground truth already measured** (`true → 1.0`, `false → 0.0`, both lanes), fix
+is one trait impl per target type; and the upstream slice tests are blocked by the
+single-designated-thread `if UNIT_POS == 0` idiom, **not** by `Slice`.
+
+### The post-re-census frontier ranking — the recorded one is overturned
+
+The Slice milestone recorded (1) `plane_*`, (2) `CubeType`-arg, (3) 2-D, (4)
+`Tensor`+`View`. Measured sole-blocker counts:
+
+| Rank | Gate | Items | **Sole** |
+|---:|---|---:|---:|
+| 1 | struct-typed `#[comptime]` / `comptime_type!` | 243 | **38** |
+| 2 | `View`/`Layout` machinery | 110 | **45** |
+| 3 | custom `CubeType` struct args | 141 | 8 (the only sole bucket that is plain `fn`s) |
+| 4 | cmma / `Matrix` | 62 | 6 |
+| 5 | **`plane_*`** | 88 | **2** |
+| 6 | **2-D topology** | 39 | **1** |
+| 7 | `Tensor` 32 · reinterpret 18 · `select()` 9 · rejected methods 5 · `Atomic` 1 | | **0 each** |
+
+`plane_*` — the recorded #1 next milestone — sole-blocks 2 items. 2-D sole-blocks
+1. `Tensor` sole-blocks 0. Ranking by incidence was ranking by the wrong number.
+
+### RECOMMENDED NEXT MILESTONE (with its measured justification)
+
+**A shim-and-small-gate batch, before any large subset milestone.** Justification,
+all measured this pass:
+
+1. **`fma`/`mul_add` host shim** (GPU-ground-truthed, exactly as `cast_to_f32`
+   and `mul_hi` were): unblocks **12 of the 22** private kernels. cubecl's `fma`
+   is not host-callable, so this is a shim, not a whitelist entry, and the naive
+   `a*b+c` substitution is measurably unsound for the shape that needs it.
+2. **`CastToF32` source/target extension** — `usize` source (sole blocker for 1
+   private kernel, part of the complex blocking 13) and `bool` source
+   (**15 ecosystem sites, GPU ground truth already in hand**, and the only thing
+   between VeriCL and the third of the three cubek-random distribution cores),
+   plus non-`f32` targets.
+3. **`wrapping` on a tuple-of-integers-returning helper** — sole blocker for 2
+   private kernels.
+4. **Prover diagnostic**: surface the undischarged `checked_mul` side-obligation
+   instead of the generic `OutOfSubset`.
+
+Together these take private faithful coverage from **6/22 to ~18-19/22** and close
+the last ecosystem distribution core — for four small, well-understood, already-
+ground-truthed changes. Every one of them was surfaced by running real code, not
+by speculation.
+
+**Then, for ecosystem reach: struct-typed `#[comptime]` params + the `CubeType`
+struct-arg story** (243 items / 38 sole, and 141 / 8-all-plain-`fn`s) — one
+underlying capability: letting a `#[cube]` item take a comptime-known
+struct/enum. **`plane_*` should be de-prioritised** from its recorded #1 slot: 88
+incidences but 2 sole-blockers.
+
+Two further residuals recorded, not scheduled: a permutation/injectivity element
+assume (the private write-index finding above), and accepting the 1-D
+single-designated-thread `if UNIT_POS == 0` idiom outside `cooperative(...)`.
+
+### Policy-gate fix (private-codebase policy, README)
+
+Three pre-existing private-identifier leaks in the public repo were found by a
+sweep and genericized in passing — one private type/field name in
+`docs/dogfood-2026-07.md`, and three private kernel names in this file (build
+record and composition-validation note). Wording only; no claim changed. A
+full-repo sweep for the private project name and its kernel/file identifiers is
+now clean.

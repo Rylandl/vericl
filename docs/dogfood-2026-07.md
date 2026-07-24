@@ -164,7 +164,7 @@ classes only, per the private-codebase policy):
   loaded offset (`base_offsets[i] < source.len()`) but says nothing about `out_idx + base_offsets[i]`,
   so the shape is honestly `Refuted` (counterexample: `out_idx` near `out.len()`, offset near
   `source.len()`, the sum overruns). In the production kernel that sum stays in bounds only because the
-  resident buffer is host-sized with headroom (`ResidentPipeline`'s `shifted_len` contract) — an
+  resident buffer is host-sized with headroom (a host-side pipeline's envelope-length contract) — an
   implicit caller-side invariant nothing in the kernel declares. Exactly the "boundary behavior can be
   implicit" class already found on the div/mod flat-index decode and the cooperative single-writer
   store. The residual: expressing it needs a length *relationship* assume (`out.len() + max_offset <=
@@ -240,3 +240,122 @@ class + the generalized shortlist + the Vector readers**, not the matmul/reduce 
 Deferred with targeted rejections: the `View`/`VirtualLayout`/`Coordinates` strided machinery, reinterpret-
 slice, `Tensor` slice origins, `SharedMemory`-slice race-freedom (cooperative-slice milestone), and
 `split_at_mut`-recognized disjoint mutable slicing (v1.1).
+
+## Addendum — coverage re-census (2026-07-24)
+
+Both original surveys were re-run against today's VeriCL to measure what the milestones since v0
+actually bought. This half re-scores the private 22; the ecosystem half is in
+`docs/ecosystem-survey-2026-07.md`'s own re-census addendum. Method: reclassify all 22 against
+today's gates, then **annotate and run every item the gates said was reachable** — differential on
+wgpu/Metal plus every applicable SMT proof — rather than stopping at a paper classification. All
+work in the private sibling workspace; construct classes only here, per the private-codebase policy.
+
+### Headline: 2/22 → 6/22 faithful, 21/22 with a validated artifact
+
+| Fidelity | v0 | Today | Meaning |
+|---|---:|---:|---|
+| **Faithful** — body byte-for-byte the private source, only the contract attribute added | **2** | **6** | the honest "VeriCL verifies this kernel" number |
+| Verbatim but for exactly **one** named-construct substitution | — | **3** | 9/22 at near-faithful |
+| **Distilled core** validated (separately-gated parts dropped, index/numeric core kept) | — | **12** | a real result about a real shape, not the whole kernel |
+| **No honest annotation at any fidelity** | — | **1** | the extended-precision phasor helper |
+| Annotatable but not attempted | — | **0** | everything reachable was run |
+
+Fresh evidence: three new manifests, **513 machine-checked obligations**, all re-verified by a plain
+`cargo test`. The pre-existing manifests were not regenerated and are byte-unchanged. Composition
+was exercised **four levels deep** (launch → per-emitter → per-tap → convolution primitive), with 60
+bounds obligations discharged through the whole chain.
+
+### Every Tier-1 and Tier-2 gate from the original table is closed
+
+Generic kernels (20/22), composition (16/22), `#[comptime]` params (15/22), shared-memory topology
+(2/22), and all three Tier-2 prover gaps now block **nothing**. What remains is a different, much
+smaller set of walls that the v0 survey did not name — and the wall it *did* predict ("`usize`
+scalar params, the next wall") blocks **0/22** in the predicted form, because no launch kernel among
+the 22 takes a runtime `usize` scalar. It resurfaced instead as a `cast_from` *source-type* wall.
+
+### Residual walls, ranked by the 22 (measured, not inferred)
+
+| Rank | Wall | Blocks | Sole blocker for |
+|---:|---|---:|---:|
+| 1 | **bare `fma(...)`** — a free-fn call, no `uses(...)` escape, and cubecl's `fma` is **not host-callable** | **12/22** | 0 (each also carries #2) |
+| 2 | **`cast_from` with a `usize` source** — the shim's `CastToF32` is a closed set (u32/i32/f32) | 13/22 | 1 |
+| 3 | **`wrapping` rejected on a tuple-returning helper** — the clause requires an integer *scalar* return | 3/22 | 2 |
+| 4 | `cast_from` with a **non-`f32` target** (incl. a `bool` source) | 1/22 | 0 |
+| 5 | **implicit injectivity of a classification table** — no assume form can express it (new, below) | 1/22 | 1 |
+| 6 | 2-D dispatch | 2/22 | 0 |
+
+Walls 1 and 2 are joined: both live in the same ~30-line device helper (an extended-precision
+argument-reduced phasor), and that one function is the sole gate on **12 of 22**. Fixing either
+alone unblocks nothing downstream; fixing both takes faithful coverage from 6/22 to ~18/22 in one
+step, and adding walls 2–4 reaches essentially all of it. This is the measured case for the
+recommended next milestone.
+
+**`fma` is correctly rejected, and the obvious workaround is unsound.** cubecl's `fma` panics on a
+host call (`Unexpanded Cube functions should not be called.`), so a permissive gate would emit a
+twin that panics at runtime — and wrapping it in a helper is no escape, since the helper's own twin
+would make the same call. Rewriting `fma(a,b,c)` to `a*b + c` is *not* a legal distillation here:
+measured on the real value shape, the fused residual is `8.23e-7` and the unfused form collapses it
+to **exactly zero**, silently degrading a Cody–Waite reduction to the naive phasor the private
+codebase explicitly retired. The honest fix is a GPU-ground-truthed `fma`/`mul_add` host shim, built
+exactly the way `cast_to_f32`/`mul_hi` were.
+
+### Two new findings
+
+**1. An implicit host-side reach invariant, found on four kernels — and a prover-diagnostics gap.**
+Four distilled kernels came back `OutOfSubset` ("read index depends on a construct outside the
+subset"). Bisected with six controls: a source anchor `out_idx + offsets[e]` has no *lower* bound, so
+`anchor − i` may underflow; the wrapped result feeds a `* 2` interleaving scale whose `checked_mul`
+no-overflow side-obligation cannot discharge, so the value is tainted and the index becomes
+unmodelable. Adding the explicit reach guard that one production kernel *already* carries flips all
+four to `Proved` (55/60/61/64 obligations); the kernel that keeps its production guards proves
+straight off at 61 — the A/B that isolates the guard as the whole difference. Same
+"boundary behavior can be implicit" class as the div/mod, cooperative-store, and additive-anchor
+findings; a provability fix and a genuine hardening. **VeriCL-side residual:** when the index refutes
+on its upper bound first you get an actionable counterexample, but when the buffer is large enough
+that the upper bound holds you get the weaker `OutOfSubset` for the *same* defect. The prover should
+surface the failed `checked_mul` side-obligation (naming the operand and the undischarged wrap)
+instead of the generic out-of-subset text.
+
+**2. A differential FAILURE that is a genuine implicit invariant — and a new unregistered assume
+form.** One kernel writes to a slot whose index is *loaded from a classification table*. Drawing that
+table uniformly makes two entries collide on one slot — a real write-write race, which the twin (one
+fixed order) and the GPU (nondeterministic) resolve differently. Measured: 16 of 32 elements diverge
+at every size, worst ~2.1e9 ULP. The production kernel is correct only because the table is
+**injective** over the classified set — an invariant nothing in the kernel states and which no
+current clause can express (`LenEq`/`LenEqConst`/`ElemsBelowLen`/`ElemsBelowConst`/`LenPlusConstLe`
+are all quantifier-free element or length facts). Roughly half of drawn inputs violate it, so this is
+not an exotic corner. **New residual: a permutation/injectivity element assume.** The differential
+lane caught it, which is the system working as designed.
+
+### Three recorded walls measured as *gone*
+
+- **Helper-calling-helper tuple destructuring** (`let (a,b) = other_helper(...)`) — the `Pat::Tuple`
+  residual recorded in the composition addendum is **closed**. Confirmed in the hardest real forms: a
+  helper destructuring a `(u32,u32)` return twice per round, and a `(F,F)` produced by an if/else
+  whose two arms are *different* helpers.
+- **`#[comptime]` params in a cooperative kernel** — shared-memory addendum wall #1 is **lifted**; a
+  cooperative kernel with a comptime grid-stride bound compiles, passes differentially, and earns the
+  full triple (oob 7 + race 8, 3 phases, 2 barrier-uniformity checks).
+- **Binding a free scalar near the launch cube count** is not a macro gate at all; the constraint is
+  semantic (the cooperative launch owns `cube_count` while `gen(...)` draws a scalar independently).
+  `CUBE_COUNT` remains the correct idiom, but nothing rejects the scalar.
+
+Also confirmed lifted on real private code: `comptime!{}` blocks (restored verbatim in four
+kernels), helper-level `wrapping` (scalar return), `f32::cast_from(u32)`, and the length-relation
+assume.
+
+### Residual notes
+
+- A helper's `instantiate(...)` cannot pin its `#[comptime]` params (they stay pass-through) — a
+  natural porting mistake with a clear, mechanical error.
+- One `instantiate(...)` per helper means **per-precision helper duplication**: the f64 lane needed a
+  byte-identical second copy of a device helper pinned at f64. For a codebase whose validation story
+  *is* "f32 on GPU vs f64 oracle", every generic device helper must be duplicated. Validated anyway
+  (differential pass + the same 54-obligation proof as the f32 twin).
+- Wrap-intent integer arithmetic inside a *float*-parameter kernel cannot declare `wrapping`
+  (integer-only clause), so a carry path had to be left unexercised by narrowing the generation range
+  — stated rather than papered over.
+- `usize` as a **runtime launch scalar** is rejected (`gen(...) v0 only supports
+  f32/f64/u32/i32/u64/i64 scalar parameters`); a runtime `u32` scalar works end to end, and `#[cube]`
+  helper `usize` params work. The wall is the missing `usize` numeric-kind row, not runtime scalars
+  as a class.

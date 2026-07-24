@@ -287,3 +287,189 @@ verbatim cubek shapes in the survey workspace: `combined_taus_lcg` recomposed wi
 `to_unit_interval_closed_open` with its verbatim `f32::cast_from` body (0-ULP, Proved{2}).
 The dominant remaining ecosystem gaps are unchanged: Line/Vector, View/Slice, and
 struct-typed comptime params (the majority shape among the 120 comptime! incidences).
+
+---
+
+## Re-census (2026-07-24) — the 464 items re-scored against today's gates
+
+Re-run of this survey against today's VeriCL, to measure what the `Vector`, core-`Slice`,
+`match`/Switch, `comptime!`-block and `cast_from`/`mul_hi`-shim milestones actually bought. The
+private-codebase half is in `docs/dogfood-2026-07.md`'s own re-census addendum. Classifier:
+`vericl-ecosystem-survey/classify.py`, updated in place with the v0 gate list retained verbatim as
+`GATES_V0`; both gate sets run on the same item-capture path so the diff is meaningful.
+
+**Denominator and baseline re-verified before any gate change**: 464 device `#[cube]` items (172
+`fn`, 292 impl/trait; 153 `#[cube(comptime)]` host fns excluded), every per-crate and per-launch
+count matching §1, and `GATES_V0` reproducing all thirteen recorded counts exactly — 148 / 128 / 120
+/ 119 / 88 / 82 / 68 / 62 / 39 / 32 / 24 / 9 / 1, zero drift. Two independent implementations of the
+classifier were run and cross-checked; where they disagree, the range is given rather than a
+falsely precise number.
+
+### Before → after
+
+| v0 gate | v0 | Today |
+|---|---:|---|
+| `Line`/`Vector` | 148 | **43 blocking** (still-out shapes) + a supported-class band of 2 (lower) to 91 (upper); the old regex was also carrying 25 core-slice creators and 49 `line_size`/`vector_size` plumbing items |
+| `View`/`Slice` | 128 | **110** View/Layout machinery + **21** `Slice`/`SliceMut` type ident + **18** reinterpret; ~70 of the `ReadOnly`/`ReadWrite` mentions are marker-only and **not** a gate |
+| `comptime!{}` blocks / `comptime_type!` | 120 | **71** out-of-subset `comptime!{}` + **53** `comptime_type!`; only **12** are lexically admissible |
+| `match` / Switch | 119 | **0 blocking — supported** |
+| `plane_*` | 88 | 88 |
+| rejected Float/Numeric methods | 82 | **5** residual + **6** non-`f32`-target `cast_from`; 7 shimmed; 44 generic-target, fate decided by the author's `instantiate(...)` |
+| custom `CubeType` struct params | 68 | 68 on the original name list; **141** on a broad parameter-type check |
+| cmma 62 · 2-D 39 · `Tensor` 32 · `SharedMemory` 24 · `select()` 9 · `Atomic` 1 | | unchanged |
+| *(never measured at v0)* | — | **struct-typed `#[comptime]` param 243** · broad `CubeType` param 141 · `intrinsic!` 7 |
+
+### Sole-blocker counts — the honest reach number
+
+The v0 survey ranked gaps by *incidence*. Incidence is the wrong number for "what would removing
+this unlock", because an item usually trips several gates. The re-census adds the sole-blocker count
+(items where the gate is the only blocking gate tripped); 127 of 464 items have exactly one.
+
+| Gate | Items | **Sole** | Sole non-test `fn` |
+|---|---:|---:|---:|
+| struct-typed `#[comptime]` param | 243 | **38** | 0 |
+| `View`/`Layout` machinery | 110 | **45** | 0 |
+| custom `CubeType` param (broad) | 141 | 8 | **8** |
+| `CubeType`-arg (v0 name list) | 68 | 8 | 1 |
+| cmma / `Matrix` | 62 | 6 | 0 |
+| `comptime_type!` | 53 | 4 | 0 |
+| `SharedMemory` | 24 | 4 | 0 |
+| `Slice`/`SliceMut` type ident | 21 | 4 | 0 |
+| **`plane_*`** | **88** | **2** | 2 |
+| `comptime!{}` out of subset | 71 | 2 | 0 |
+| `Vector` shape still out of subset | 43 | 2 | 0 |
+| 2-D / multi-axis topology | 39 | **1** | 0 |
+| `Tensor` 32 · reinterpret 18 · `select()` 9 · residual rejected methods 5 · `Atomic` 1 | | **0 each** | 0 |
+
+### Two gates that unlock nothing here — measured, not estimated
+
+**`match`/Switch (v0 rank #4, 119 items) unlocks zero ecosystem items.** Of ~270 `match`
+expressions inside `#[cube]` item spans, **exactly 4 have integer-literal arms, and all 4 are in
+cubecl's own language-conformance suite** (`cubecl-core/src/runtime_tests/branch.rs`) — zero in
+cubek's nine crates, zero in cubecl-std, zero in burn-cubecl. An independent scan of the six target
+crates for an integer-literal match arm inside any `#[cube]` device item returned 0 hits. The rest
+scrutinise a comptime-typed enum (`MatrixLayout`, `StageIdent`, `ConvolutionOperation`, …, the
+largest bucket), a `CubeType` enum (`FastDivmod`'s `match self`, the second largest), or
+`Option`/`bool`. `Branch::Switch` modeling is correct and useful; **this corpus does not exercise
+it.**
+
+**`comptime!{}` blocks unlock zero on their own.** All 12 lexically admissible items are blocked by
+something else — 9 of the 12 by a struct-typed `#[comptime]` param, exactly as the 2026-07-23 update
+predicted. That shape is now measured: **243 of 464 items, the single largest blocking gate in the
+corpus.**
+
+Core `Slice` is the same story, and consistent with the Slice milestone's own "necessary but rarely
+sufficient": of ~84 slice-creation sites inside `#[cube]` items, every one in cubek/cubecl-std
+production code is on a `View`/`LinearView`/`StridedStageMemory`, on launch machinery, or internal to
+an abstraction. The bare-`Array`/`SharedMemory` calls in plain `#[cube]` fns are all in cubecl's
+conformance suite.
+
+### Items within reach
+
+| Bucket | v0 | Today | Δ |
+|---|---:|---:|---:|
+| Items with zero blocking gates (v0-lineage gate set) | 103 | **119** | **+16** |
+| …of which non-test `fn` | 18 | **41** | **+23** |
+| Items with zero blocking gates (corrected gate set, applied to both sides) | 35 | **49** | **+14** |
+| …of which non-test `fn` | 10 | 13 | +3 |
+| Genuinely new annotatable non-test plain `fn`s (blocked at v0, clear today) | — | **4** | all four via the `cast_from` shim |
+
+Both rows are reported because the v0 gate list **under-counted blockers** — it never looked for
+struct-typed comptime params, the broad `CubeType` parameter shape, or `intrinsic!`. That is why the
+v0 survey showed 103 gate-free items yet could shortlist only 8. Under the corrected set applied
+symmetrically, the honest movement is 35 → 49.
+
+### Spot-validation — §4 residual #3 is closed, measured not predicted
+
+§4 predicted that a verified runtime `cast_from` "would take the `Uniform`/`Normal`/`Bernoulli`
+`inner_loop` bodies from fully-gated to shortlist". Two of the three now carry the full
+tested+proved pair on **both** differential lanes; the third produced a clean, actionable rejection.
+Six new kernels, added non-destructively to the survey crate (the original 8 evidence entries are
+byte-identical, verified by per-entry canonical-JSON SHA-256):
+
+| Kernel (upstream body) | Source | compare | wgpu/Metal | cubecl-cpu | Proved |
+|---|---|---|---|---|---|
+| `to_unit_interval_open_map` | cubek-random `base.rs:199-206` | `max_ulp = 3` | PASS | PASS | `Proved{2}` |
+| `uniform_value_map` | cubek-random `uniform.rs` per-value core | `abs = 1e-4` | PASS | PASS | `Proved{5}` |
+| `normal_box_muller_map` | cubek-random `normal.rs:65-70` | `abs = 1e-2` | PASS | PASS | `Proved{6}` |
+| `bernoulli_value_map` | cubek-random `bernoulli.rs` per-value core | — | **rejected at compile time** | — | — |
+| `kernel_switch_simple` | cubecl-core `runtime_tests/branch.rs` | `max_ulp = 0` | PASS | PASS | `Proved{3}` |
+| `slice_select` | cubecl-core `runtime_tests/slice.rs` | `max_ulp = 0` | PASS | PASS | `Proved{2}` |
+
+- **`uniform_value_map` is the composite result**: three `taus_step_*` helpers, `lcg_step` as a
+  helper-level `wrapping` helper, the `cast_from` shim (including its f32→f32 identity arm), and the
+  affine map — composition + helper `wrapping` + shim in one kernel. Its negative control shows why
+  helper-level `wrapping` was *necessary* rather than convenient: a **float** kernel cannot carry the
+  integer-only `wrapping` clause, so the survey's original "inline the body into a wrapping kernel"
+  workaround is unavailable here. Measured wgpu worst `|e−a| = 7.63e-6` (FMA contraction, ~⅓ of
+  elements); cpu bit-exact.
+- **`to_unit_interval_open` is not bit-exact, unlike its sibling** — 1 ULP on wgpu, 0 on cpu. The
+  mechanism was identified rather than guessed: the backend lowers `/ 8388609.0` to a
+  reciprocal-multiply. The sibling divides by `2^24` (exact), this one by `2^23 + 1` (inexact). The
+  `cast_from` shim is not implicated.
+- **`normal_box_muller_map`'s open-interval domain invariant** is established *structurally*, not by
+  the differential lane: verified exhaustively over all 2^23 distinct converter outputs
+  (`[1.19e-7, 0.9999999]`, both endpoints excluded). It is load-bearing — the `_closed_open` sibling
+  returns exactly `0.0` for its 256 smallest inputs, giving `ln = -inf` and NaN — but at a density of
+  256/2^32 per draw the suite's ~144k draws would hit it 0.0086 times in expectation. Recorded as a
+  known limit of the lane.
+- **`bernoulli_value_map` rejection** is `bool: CastToF32 is not satisfied` — the shim rewrite fires
+  (the target segment *is* `f32`), and the closed `CastToF32` source set rejects at the twin's own
+  call-site span. Loud and actionable, but rustc-mediated rather than a VeriCL-authored message.
+- **New residual: bool-source `cast_from`.** GPU ground truth already measured (`true → 1.0`,
+  `false → 0.0`, bit-identical on wgpu/Metal *and* cubecl-cpu), so the fix is one trait impl per
+  target type. Not a Bernoulli one-off: **15 bool-source `cast_from` sites** across cubek — branchless
+  masking/predication in cubek-std softmax/rowwise/whitebox, cubek-matmul/convolution async-copy,
+  cubek-reduce, cubek-quant. Most target `u32`/`i32`/a generic `E`, so a full fix needs
+  bool→{u32,i32,f32}.
+- **`slice_select` surfaced a mis-attribution**: the upstream slice tests are not blocked by `Slice`
+  at all. All five use the single-designated-thread idiom `if UNIT_POS == 0`, and the measured
+  rejection names `UNIT_POS` and says nothing about `.slice(2, 3)`. That idiom — not slicing — is the
+  gate, and it is one VeriCL could plausibly accept as a 1-D special case.
+- Discrimination re-proven on the new claims (`annotated/src/bin/recensus_negatives.rs`, exit 0): an
+  off-by-one guard on the 5-buffer composition is `Refuted` with a counterexample while the three
+  honest kernels `Proved{2}/{5}/{6}` on the same run, and a non-wrapping `lcg_step` makes the twin
+  panic at every size.
+
+### The post-re-census frontier ranking (measured)
+
+The Slice milestone's recorded frontier ranking was (1) `plane_*`, (2) `CubeType`-arg, (3) 2-D
+topology, (4) `Tensor` + `View`. **The sole-blocker measurement overturns it.**
+
+1. **struct-typed `#[comptime]` params / `comptime_type!`** — 243 items, 38 sole-blocker. The
+   single largest blocking gate in the corpus, and the thing standing behind the `comptime!`-block
+   support already shipped.
+2. **`View`/`Layout` machinery** — 110 items, **45 sole-blocker**, the largest single-gate unlock.
+3. **custom `CubeType` struct args** — 141 items broad, 8 sole — and those 8 are the **only**
+   sole-blocker bucket that is plain non-test `fn`s rather than impl/trait items.
+4. cmma / `Matrix` — 62 items, 6 sole.
+5. **`plane_*` — 88 items but only 2 sole-blocker.** The #2 gate by incidence is near the bottom by
+   reach. Removing it alone unlocks two functions.
+6. **2-D topology — 39 items, 1 sole-blocker.**
+7. **`Tensor` (32), reinterpret-slice (18), `select()` (9), the residual rejected methods (5), and
+   `Atomic` (1) sole-block *zero* items each.** Removing any of them alone unlocks nothing.
+
+Items 1–3 are one underlying capability — letting a `#[cube]` item take a comptime-known
+struct/enum, and letting the twin model a dispatching view. That, not `plane_*`, is where the
+ecosystem's remaining mass sits.
+
+### Where the classification is honestly imprecise
+
+- The "all-`Vector` elementwise class" is a whole-signature property regex cannot decide: 133–134
+  items name `Vector`/`Line`, 91 avoid the explicitly-deferred shapes (upper bound), 2 trip nothing
+  at all (lower bound), and **0** of those are launch entry points.
+- The broad `CubeType` parameter check parses `fn` signatures only, so the 292 impl/trait items'
+  `&self` receivers go unmeasured — every impl/trait reach number is an over-estimate.
+- `comptime!{}` admissibility is a lexical approximation of the macro's real `syn`-level check;
+  calibrating it against real bodies moved the admissible count from 22 to 12.
+- `cast_from` has three buckets, not two: 7 definitely shimmed, 6 definitely still rejected, and 44
+  with a generic target whose fate depends on the author's `instantiate(...)` — reported separately,
+  never counted as unlocked.
+- Bare free-function calls to undeclared helpers are not gated (that needs whole-crate visibility),
+  so a few items read "clean" while calling something blocked; every reach number assumes callees get
+  annotated or inlined.
+- `SharedMemory` (24) is kept wholly blocking because regex cannot recognise the 1-D cooperative
+  scalar subset — conservative, i.e. reach-understating.
+- The View pure/mixed split does not reproduce the Slice addendum's ~14 pure + 38 mixed; the *mixed*
+  figure lands near 38 in every variant, the *pure* figure is dominated by whether `Coordinates` is in
+  the signal set. Reported as measured with the definition stated, not tuned to match.
