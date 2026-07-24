@@ -524,6 +524,28 @@ crates.io dependency). The honest decision record, and the path to enabling it, 
 `docs/certificates-decision.md`; until then the z3 binary remains trusted for `Proved` claims, and
 is recorded as such in evidence.
 
+**Model fidelity: an independent IR interpreter cross-check (the trusted "CubeCL front-end
+expansion" is now empirically checked).** Everything above is stated over the CubeCL IR, so one
+component is load-bearing and was, until now, unchecked: does VeriCL's *model* of what an IR
+instruction means match what CubeCL actually executes? A concrete **reference interpreter**
+(`crates/vericl-ir/src/interp.rs`) closes that gap empirically. It is a *third, independent*
+implementation of the modeled semantics — the twin rewrites source tokens, the prover encodes the IR
+symbolically, and the interpreter *executes* the same `KernelDefinition` concretely over real inputs
+with true finite-width wrapping arithmetic and IEEE-754 floats, **reporting** (never panicking on)
+any out-of-bounds index or divide-by-zero. Two cross-checks run in `cargo test`: on every honest
+example kernel the interpreter agrees **bit-for-bit** with the twin over the kernel's real
+`kernel_definition()` IR (one kernel, `xorshift_step`, is checked three-way against a live
+wgpu/Metal launch too); and a seeded **fuzz lane** generates random in-subset kernels and cross-checks
+the prover's verdict against concrete execution — a `Proved` kernel that the interpreter can drive out
+of bounds on an assume-satisfying input would be a critical fidelity finding, and a `Refuted` kernel's
+counterexample, replayed, must exhibit the OOB. The full corpus (20,000 random kernels, 320,000
+inputs, prover on) produces **zero** disagreements; a deterministic subset runs by default and the
+full run behind `VERICL_FUZZ=1`. This *shrinks* model-fidelity risk empirically — it is **not** a
+proof and mints no `Proved` claim (agreement is a `Tested` observation, and CubeCL codegen/driver/
+hardware stay Trusted). Injected-bug negative controls confirm the cross-check catches real semantics
+defects. Full scope, exclusions (cooperative/shared-memory kernels are out of the v0 interpreter
+subset), and the exact "what agreement does and does not establish" are in `docs/interpreter.md`.
+
 **Array-value-dependent indices (offset tables / gather).** The prover recognizes two *element-range*
 `assumes(...)` shapes over an integer index array, in addition to the length shapes (`A.len() ==
 B.len()`, `A.len() == N`): `A.iter().all(|v| (*v as usize) < B.len())` and `A.iter().all(|v| *v < N)`

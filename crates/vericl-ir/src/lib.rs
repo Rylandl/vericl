@@ -9,10 +9,14 @@
 //! minimal and self-describing rather than sharing types with the contract
 //! layer; callers (the conformance harness) translate between the two.
 
+mod fuzz;
 mod hash;
+mod interp;
 mod prover;
 
+pub use fuzz::{CorpusReport, Finding, FindingKind, run_corpus};
 pub use hash::kernel_ir_hash;
+pub use interp::{Buffer, Inputs, Oob, Outcome, ScalarBinding, Val, interpret_dispatch};
 pub use prover::{
     Assume, BufferParam, CooperativeObligations, CooperativeProof, ProveResult,
     SMT_OOB_FREEDOM_CHECK, SMT_RACE_FREEDOM_CHECK, prove_bounds_freedom,

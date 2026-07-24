@@ -1984,3 +1984,111 @@ API); **z3's own proof format has no independent QF_LIA checker** (fails the who
 tool present the required round-trip + corrupted-certificate tests cannot be written or run — shipping
 the plumbing would be the half-checked lane the task forbids. z3 stays trusted for `Proved` claims,
 recorded honestly. Path forward enumerated in `docs/certificates-decision.md`.
+
+## Assurance ladder Rung B — IR reference interpreter + fuzz cross-check DONE (2026-07-24)
+
+Rung B attacks the deepest remaining trust gap: **model fidelity** — does VeriCL's model of what a
+CubeCL IR instruction *means* match what CubeCL actually executes? Everything the prover proves and
+the identity hash covers is stated over the IR, so a wrong wrapping rule / off-by-one bound / misread
+div-mod would let the prover certify a property the hardware violates with no test catching it. The
+deliverable is a **third, independent implementation** of the modeled semantics that turns "trust the
+IR model" into an empirically cross-checked, continuously-run property. Full standalone writeup:
+`docs/interpreter.md`; README trusted-base note updated (the model-fidelity risk now has an empirical
+cross-check).
+
+**Architecture choice.** New module `crates/vericl-ir/src/interp.rs` (not a new crate). Rationale:
+the interpreter consumes the same `KernelDefinition` (a cubecl type) the prover consumes, so it must
+live in vericl-ir — the sole cubecl-facing library crate (the locked "isolate all IR-facing code in
+one crate" decision). Independence from the other two implementations is the point and is structural:
+the macro **twin** rewrites source *tokens* (vericl-macros, never sees IR); the **prover** encodes the
+IR *symbolically* into QF_LIA + z3 (prover.rs, never runs the kernel); the **interpreter** *executes*
+the IR concretely over real inputs (interp.rs, separate walk, no shared code with the prover's
+`value_of`/encoding). `interpret_dispatch(def, inputs) -> Outcome` runs `AbsolutePos = 0..num_threads`
+sequentially (threads independent in the non-cooperative subset, exactly as the twin loops), applying
+writes to the buffers.
+
+**Subset covered (v0, non-cooperative scalar 1-D).** Real finite-width semantics — integers wrap
+exactly (`wrapping_add/sub/mul`, width-masked shifts, truncated div/mod), floats are IEEE-754
+`f32`/`f64` (separate `Mul`+`Add` stay strict, explicit `Fma` fuses) — which is what makes it
+bit-exact with the twin and a faithful GPU stand-in. Covers arithmetic (incl. `MulHi` and float
+transcendentals), comparisons, `And`/`Or`/`Not`, bitwise (`&`/`|`/`^`/`<<`/`>>`/`!`/`count_ones`/…),
+`Cast`/`Reinterpret`/`Select`, `Metadata::Length`, checked+unchecked `Index`/`IndexAssign` (bounds
+**reported**, never panicked), `If`/`IfElse`/`Switch`/`RangeLoop`/bare `Loop` (instruction-budget
+guarded), 1-D topology builtins, local + const arrays. **Excluded and reported `Unsupported` (never
+guessed):** all cooperative constructs (`SharedArray`/`Shared`/`sync_cube` — a faithful cooperative
+interpreter needs a lock-step multi-thread phase model; scoped out honestly as future work), atomics,
+plane/warp, cooperative-matrix, TMA, tensor metadata, `Vector<_, N>` indexing, stepped/descending
+loops. `interp.rs` has 11 unit tests over **real `#[cube]`-expanded IR** (via the KernelBuilder recipe
+from docs/ir-research.md §1) per construct — axpy, off-by-one (OOB *reported*, not panicked), xorshift,
+mix (wrap-on-overflow), div/mod decode, gather + out-of-range-offset OOB, switch, forward read, range
+loop, and cooperative-rejection.
+
+**Cross-check harness (deliverable 2).** `crates/vericl-examples/tests/interp_crosscheck.rs`, 15 tests:
+the interpreter runs over each honest kernel's real `kernel_definition()` and is compared **bit-for-bit**
+against the macro twin over many random inputs × 9 sizes — `axpy`, `xorshift_step`, `mix_u32`,
+`flatten_decode_scale`, `gather_copy`, `select_mode`, `offset_window`, `fir3`, `gain_kernel`, `lcg_map`,
+`comptime_shift`, `mul_hi_map`, `unit_interval_map` (mixed u32→f32), plus a guard-boundary case
+(threads ≫ len). One kernel, `xorshift_step` (exact integer, no fma ambiguity), is checked **three-way**
+— interpreter vs twin vs a live wgpu/Metal launch on 1027 elements — all bit-identical. Float kernels
+compare interp↔twin bit-exact (both strict-rounding); interp≈GPU follows transitively (twin≈GPU is the
+conformance suite's job, at the tolerance it records — the fma-contraction reason the float three-way
+isn't asserted bit-exact).
+
+**Fuzz lane (deliverable 3).** `crates/vericl-ir/src/fuzz.rs`. A seeded (dependency-free SplitMix64)
+generator produces random in-subset kernels from a small grammar over the modeled constructs (guarded
+indexing, arithmetic/bitwise chains, div/mod by a nonzero divisor, `if`/`if-else`/`switch`, bounded
+`for` loops with a carried accumulator, gathers through a valid offset table), across 7 shape templates
+(5 safe → expected `Proved`, 2 defective → expected `Refuted`). Each kernel is realized **two ways from
+the same AST**: lowered to hand-built IR (the same instruction shapes `#[cube]` emits — `Index`/
+`IndexAssign`, `Arithmetic`/`Bitwise`/`Comparison`, `Operator::And`, `Branch::{If,Switch,RangeLoop}`,
+`Metadata::Length`) and evaluated directly by an independent tree-walking reference that never touches
+the IR. Two cross-checks per kernel: **(a)** reference ≡ interpreter on valid + adversarial random
+inputs (same output or same OOB); **(b)** prover verdict ⇄ interpreter — a `Proved` kernel probed
+exhaustively over assume-satisfying inputs must never OOB (an OOB = CRITICAL model-fidelity finding),
+a `Refuted` kernel's counterexample (or the shape's minimal witness) replayed must exhibit the OOB.
+Any disagreement is a `Finding` with full reproduction, never silently reconciled. Deterministic subset
+(400 kernels / 4,800 agreement inputs, prover on) is wired into `cargo test` (`deterministic_corpus_
+has_no_critical_findings`, ~2.8s) plus a prover-free 2,000-kernel agreement test; the **full corpus
+(20,000 kernels, 320,000 agreement inputs, 14,285 Proved / 5,715 Refuted, prover on) runs behind
+`VERICL_FUZZ=1` and produced ZERO findings in 215.0s** (`#[ignore]`d `full_corpus`, release).
+As-built lowering fidelity note: the fuzz IR *mirrors* cubecl shapes but is hand-built (random
+structure can't be macro-expanded at runtime) — its primary value is soundness at scale
+(prover↔interpreter, reference↔interpreter); *genuine*-cubecl-IR fidelity is anchored by cross-check 2
+and the interp unit tests, both over real `#[cube]` expansion.
+
+**Two real bugs the cross-check caught during construction (fixed, not patched around).** (1)
+`KernelBuilder`'s `create_local_mut` *pools and reuses* a mutable local once the returned
+`ManagedVariable` `Rc` is dropped — which the hand-lowering did immediately by dereffing to a plain
+`Variable` — so every generated local collapsed to `local(0)`/`local(1)`, clobbering intermediates
+(index resolved to the stored value → phantom OOB). The reference↔interpreter check flagged it at once;
+fixed by using `create_local_restricted` (always a fresh `LocalMut`, never pooled). (2) The
+Refuted-replay allocated `vec![0u32; len]` from the solver's counterexample, but z3 may assign a `len`
+anywhere in the u32 range → a ~16 GB allocation → SIGKILL. Fixed by capping materialized lengths and
+falling back to the shape's minimal OOB witness. Both are harness/lowering bugs, not vericl-model
+findings — but they demonstrate the cross-check's discriminating power on first contact.
+
+**Negative controls (deliberate semantics-bug injection; run + confirmed, not committed).** Three bugs
+injected into `interp.rs`, each caught immediately, then reverted: (i) integer `Add`→`wrapping_sub` —
+caught by the fuzz `InterpVsReference` check (and, tellingly, the *float* axpy public test stayed green,
+correctly, since axpy's `+` is a float op on a different code path — evidence the fuzz lane covers the
+integer arithmetic the float example kernels don't); (ii) float `Add`→`Sub` — caught by the public
+`interp_axpy_matches_twin` bit-exact check; (iii) a bounds check that clamps instead of reporting (hides
+OOB) — caught by both the `gather_out_of_range_offset_reports_oob` unit test and the fuzz
+`RefutedButNoOob` path.
+
+**Findings.** NONE. Across 20,000 fuzz kernels (both prover verdicts, 320k inputs), 13 public example
+kernels bit-exact vs the twin, and a live GPU three-way, no interpreter/twin/prover disagreement
+surfaced in the modeled subset. The task flagged this as the work most likely to surface a real
+model-fidelity discrepancy; it did not — an honest, corroborating null result (the injected-bug
+negatives establish the checks *would* have caught one).
+
+**Verification (zero regressions).** vericl-ir 124 lib tests (111 pre-existing + 11 interp + 2 fuzz;
+`full_corpus` `#[ignore]`d), vericl 36, vericl-macros 60, vericl-examples lib 91 unchanged, conformance
+(wgpu, incl. evidence check — verified WITHOUT `VERICL_UPDATE`, **evidence byte-identical**) 1,
+interp_crosscheck 15, plus cooperative/f64/whitelist/vector/shim suites all green; cpu-lane conformance
++ interp_crosscheck green under `--features cpu`. `cargo clippy --workspace --all-targets` zero warnings
+on both feature sets. `conform demo-defects` exits 0, output unchanged. New files:
+`crates/vericl-ir/src/interp.rs`, `crates/vericl-ir/src/fuzz.rs`,
+`crates/vericl-examples/tests/interp_crosscheck.rs`, `docs/interpreter.md`; `crates/vericl-ir/src/lib.rs`
+gained the two `mod` + re-export lines. No prover/twin/evidence code touched — the interpreter only
+*reads* `KernelDefinition`s the existing machinery already produces.
