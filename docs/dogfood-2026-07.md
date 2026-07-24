@@ -198,3 +198,45 @@ needs `View`/`Slice` (the #2 gap) + `Atomic` + `comptime!` + `match`, a document
 Deferred with targeted rejections: cross-lane reductions (`dot`/`magnitude`/`normalize`, GPU-defined
 summation order), `SharedMemory<Vector>` cooperative reductions, reinterpret-slice (`vector_size≠0`),
 vector `cast_from`/`wrapping`, and a single-clause width sweep.
+
+## Addendum (core `Slice` milestone, July 2026)
+
+The `View`/`Slice` family — the ecosystem survey's **#2 gate incidence (128/464 device items,
+`docs/ecosystem-survey-2026-07.md` §1)** — was delivered for the **core `Slice`** half, per
+`docs/design-view-slice.md`. A core slice is a pure *addressing view*: `arr.slice(a, b)[i]` lowers to a
+checked `origin[a + i]` (§2.1), so bounds proving is the ordinary origin obligation, discharged **by the
+existing prover, unmodified** (deliverable B is a no-op for the walker).
+
+**Survey-count correction (design §3).** The survey's single "View/Slice: 128" regex conflates two very
+different populations, which re-running the classifier split by sub-signal (`scratchpad/viewslice/split.py`)
+separates decisively:
+
+| Signal | Count | Meaning |
+|---|---|---|
+| Items literally calling `.slice()`/`.slice_mut()`/`to_slice()` | **~25** | genuinely *create* a core slice — v1's real target |
+| Items mentioning only core-`Slice` idents (no `View`/layout) | ~90 | inflated by matmul `Stage<ES, ReadOnly>` type-params and reader traits reusing the `ReadOnly`/`ReadWrite` markers |
+| Items using the `View`/`VirtualLayout`/`Coordinates`/strided machinery | ~14 pure + 38 mixed | `Arc<dyn>` dynamic-dispatch tensor views — **a separate, much larger effort, deferred** (§8) |
+| Reinterpret-slice (`with_vector_size`/`into_vectorized`) | ~10 | rejected (§2.6); also unrunnable on wgpu upstream |
+
+So the "128" is **~25 real core-slice creators + a `ReadOnly`/`ReadWrite`-ident tail + the `View`
+machinery** — claiming v1 "unlocks the 128" would be dishonest. Landed as six milestones:
+
+| Row | Status | Notes |
+|---|---|---|
+| **Slice bounds proof** | **supported (unchanged)** | A `slice[i]` access = `Index(origin, Add(offset, i))`, so the walker's obligation is the ordinary `0 ≤ offset+i < Length(origin)`. Every §5.2 verdict reproduced as `crates/vericl-ir` unit tests — `Proved` for `to_slice`/dynamic-offset/const-offset(+origin-len)/**nested**(additive offset)/**iteration**(RangeLoop over origin)/**gather-through-slice** (element assume transfers by origin-id keying, §5.4), and the `Refuted`/`OutOfSubset` negative controls. Net prover change: **zero**. |
+| **Rust-subslice twin** | **supported** | `arr.slice(a,b)` → `&arr[a..b]`, `slice_mut` → `&mut`, `to_slice()` → `&arr[..]`, `for item in slice` → `for &item in …` (a `SliceRewriteFold`, the Vector head-rewrite's sibling). Bit-exact on wgpu **and cpu** (a slice adds no numeric op, §6) — `windowed_slice_sum`/`slice_gather_copy` carry `tested` `max_ulp = 0`. |
+| **Slice-creation validity (twin oracle)** | **supported** | cubecl does **not** bounds-check slice creation; Rust's `&arr[a..b]` **panics**, so the twin is the validity net (§4.4). Round-9 risk-1 control: `windowed_slice_creation_panics_when_x_undersized` — the `tested` twin panics on an over-long slice while the `proved` claim (over the *accesses*) still holds; the two claims' scopes are documented so neither over-claims. |
+| **Mutable-aliasing oracle** | **supported (borrow-checked)** | `slice_mut` → `&mut arr[a..b]`, so the borrow checker IS the aliasing oracle: **sequential** mutable slices compile (the dominant shape), **simultaneously-live overlapping** ones do **not** (round-9 risk-2 control, `scratchpad/slicemut`, `E0499`). Laundering routes (`as_mut_unchecked`/`downcast*`) and reinterpret (`with_vector_size`/`into_vectorized`) are **banned idents/methods** with targeted messages; `View`/`VirtualLayout`/`Coordinates`/`StridedLayout` are banned type idents. |
+| **Composition (slice helper params)** | **supported** | The dominant real usage (§3, §10): a `#[vericl::helper] fn f(w: &Slice<F>)` maps `&Slice<F>` → `&[f32]` (reusing the Array twin representation), called with the idiomatic `&x.slice(a,b)` form (redundant outer `&` collapses). `windowed_helper_kernel` carries `tested` + `proved`. |
+| **Public examples + ecosystem** | **supported** | Three clean-room kernels wired into `vericl::suite!` (`windowed_slice_sum`, `slice_gather_copy`, `windowed_helper_kernel`), each `tested` + `proved`. One real cubek core-`Slice` shape re-annotated end-to-end in the survey workspace (non-destructive). |
+
+Honest reach (design §0.5, §6.3, §12): core `Slice` removes the #2 gate *incidence* but is **necessary
+but rarely sufficient** — of the ~25 core-slice items, only ~10 trip no other gate, and every one is an
+`impl`/`trait`/test-launcher, not a 1-D launch kernel; the rest are co-gated by `plane_*`/`match`/
+`comptime!`/`CubeType`-arg/`cmma`. v1's demonstrable reach is **the slice-carrying elementwise/windowed
+class + the generalized shortlist + the Vector readers**, not the matmul/reduce launch sites. The honest
+**post-Slice frontier ranking** (from the gate histograms, §13): (1) `plane_*` warp/subgroup reductions,
+(2) `CubeType`-arg / custom cube structs, (3) 2-D topology, (4) `Tensor` + the deferred `View` machinery.
+Deferred with targeted rejections: the `View`/`VirtualLayout`/`Coordinates` strided machinery, reinterpret-
+slice, `Tensor` slice origins, `SharedMemory`-slice race-freedom (cooperative-slice milestone), and
+`split_at_mut`-recognized disjoint mutable slicing (v1.1).

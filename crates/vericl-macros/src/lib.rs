@@ -69,7 +69,27 @@ const BANNED_IDENTS: &[&str] = &[
     "comptime",
     "Vector",
     "Line",
+    // Core `Slice` is supported (docs/design-view-slice.md): a slice access is
+    // rewritten to a Rust subslice at the method-call level (`SliceRewriteFold`)
+    // and a `&Slice<E>` helper param is recognized at the type level
+    // (`elem_of_slice`). The bare `Slice`/`SliceMut` *type* ident never appears
+    // in a v1 slice kernel/helper *body* (slices are created via the lowercase
+    // `.slice()`/`.to_slice()` methods and typed only in helper signatures), so
+    // unlike the Vector gate there is nothing to lift here — the ident stays
+    // banned as a conservative guard against a stray `Slice::`/type-annotation
+    // use the twin could not model (design §8.1, reported refinement).
     "Slice",
+    "SliceMut",
+    // The cubecl-std `View`/`VirtualLayout`/`Coordinates` strided-tensor-view
+    // machinery is a separate `Arc<dyn>` dynamic-dispatch abstraction, NOT core
+    // `Slice` — deferred as a much larger milestone (design §1, §8.3).
+    "View",
+    "VirtualLayout",
+    "VirtualView",
+    "LinearView",
+    "Coordinates",
+    "StridedLayout",
+    "ViewOperations",
     // early exit changes meaning between per-thread and sequential execution
     "return",
     // terminate!() is a per-lane early exit; outside #[cube] it expands to an
@@ -1349,6 +1369,142 @@ impl Fold for ShimRewriteFold {
     }
 }
 
+/// Core-`Slice` "laundering" / reinterpret methods rejected outright in the
+/// reference twin (docs/design-view-slice.md §8.3, round-9 risk-2/-3):
+///
+/// - `as_mut_unchecked` / `downcast` / `downcast_unchecked` launder a
+///   `ReadOnly` slice into `ReadWrite` or reinterpret the element type,
+///   defeating the borrow-checker aliasing oracle (§4.3).
+/// - `with_vector_size` / `into_vectorized` are the reinterpret-slice
+///   constructs, the only `vector_size != 0` source (§2.6). The prover also
+///   rejects the resulting IR (`check_trivial_vectorization`), but rejecting at
+///   the macro keeps the twin from even being generated and gives a targeted
+///   message; the construct is additionally unrunnable on wgpu upstream.
+const SLICE_REJECT_METHODS: &[&str] = &[
+    "as_mut_unchecked",
+    "downcast",
+    "downcast_unchecked",
+    "try_cast_slice",
+    "with_vector_size",
+    "into_vectorized",
+];
+
+/// `true` if `e` is a direct core-`Slice` *creation* method call
+/// (`.slice()`/`.slice_mut()`/`.to_slice()`/`.to_slice_mut()`) — the §2.2
+/// `for item in arr.slice(a, b)` iterand shape.
+fn is_slice_creation_call(e: &Expr) -> bool {
+    matches!(e, Expr::MethodCall(mc)
+        if matches!(mc.method.to_string().as_str(),
+            "slice" | "slice_mut" | "to_slice" | "to_slice_mut"))
+}
+
+/// Rewrites core-`Slice` creation methods in the reference twin body to their
+/// exact Rust-subslice equivalents (docs/design-view-slice.md §4.1) — a slice
+/// IS a Rust subslice, introducing zero numeric ops (§4.2):
+///
+/// | kernel construct       | twin                 |
+/// |------------------------|----------------------|
+/// | `x.slice(a, b)`        | `&(x)[(a)..(b)]`     |
+/// | `x.slice_mut(a, b)`    | `&mut (x)[(a)..(b)]` |
+/// | `x.to_slice()`         | `&(x)[..]`           |
+/// | `x.to_slice_mut()`     | `&mut (x)[..]`       |
+/// | `for item in x.slice…` | `for &item in …`     |
+///
+/// Nested `s.slice(a, b)` composes as `&(&…)[a..b]` — relative indexing into
+/// the already-sliced view, matching cubecl's additive offset composition
+/// (§2.5). The mapping makes Rust the soundness oracle for BOTH slice-creation
+/// validity (`&x[a..b]` PANICS in the `tested` twin when `b > x.len()`, §4.4)
+/// and mutable aliasing (two simultaneously-live `&mut` subslices of one origin
+/// do not compile — the borrow checker IS the rejection, §4.3). Runs on the
+/// twin only; the re-emitted `#[cube]` kernel keeps `x.slice(a, b)` verbatim.
+///
+/// Slice laundering / reinterpret methods (`SLICE_REJECT_METHODS`) are rejected.
+struct SliceRewriteFold {
+    errors: Vec<syn::Error>,
+}
+
+impl SliceRewriteFold {
+    fn rewrite_method(&mut self, mc: syn::ExprMethodCall) -> Expr {
+        let name = mc.method.to_string();
+        if SLICE_REJECT_METHODS.contains(&name.as_str()) {
+            let msg = if name == "with_vector_size" || name == "into_vectorized" {
+                format!(
+                    "slice reinterpret method `{name}` (reinterpret-slice / cross-vectorization, \
+                     vector_size != 0) is outside the vericl v0 subset — it is a View/Slice \
+                     reinterpret construct (docs/design-view-slice.md §2.6) and is unrunnable on \
+                     wgpu upstream"
+                )
+            } else {
+                format!(
+                    "slice type-punning method `{name}` (ReinterpretSlice / laundering internals) \
+                     is outside the vericl v0 subset — it can launder a ReadOnly slice into \
+                     ReadWrite or reinterpret element types, defeating the borrow-checker aliasing \
+                     oracle (docs/design-view-slice.md §8.3)"
+                )
+            };
+            self.errors.push(syn::Error::new(mc.method.span(), msg));
+            return Expr::MethodCall(mc);
+        }
+        let recv = mc.receiver.as_ref();
+        match name.as_str() {
+            "slice" if mc.args.len() == 2 => {
+                let a = &mc.args[0];
+                let b = &mc.args[1];
+                parse_quote!(& (#recv)[(#a)..(#b)])
+            }
+            "slice_mut" if mc.args.len() == 2 => {
+                let a = &mc.args[0];
+                let b = &mc.args[1];
+                parse_quote!(&mut (#recv)[(#a)..(#b)])
+            }
+            "to_slice" if mc.args.is_empty() => parse_quote!(& (#recv)[..]),
+            "to_slice_mut" if mc.args.is_empty() => parse_quote!(&mut (#recv)[..]),
+            _ => Expr::MethodCall(mc),
+        }
+    }
+}
+
+impl Fold for SliceRewriteFold {
+    fn fold_expr(&mut self, expr: Expr) -> Expr {
+        // `&x.slice(a, b)` / `&mut x.slice_mut(a, b)` — the idiomatic
+        // `&Slice<F>` / `&mut SliceMut<F>` helper-argument form (§10, matching
+        // real cubek `&smem_slice`). The slice rewrite already yields a
+        // `&[T]` / `&mut [T]`, so the outer `&`/`&mut` is redundant — collapse
+        // `&(x.slice(a, b))` to `&x[a..b]` (NOT `&&x[a..b]`) so the argument
+        // matches the helper twin's `&[T]` param. The slice method decides the
+        // mutability of the resulting reference.
+        if let Expr::Reference(r) = &expr {
+            if is_slice_creation_call(&r.expr) {
+                return self.fold_expr((*r.expr).clone());
+            }
+        }
+        // Post-order: rewrite the receiver (a nested slice) first, then this
+        // node — so `input.slice(1, 10).slice(1, 3)` composes correctly.
+        let expr = syn::fold::fold_expr(self, expr);
+        match expr {
+            Expr::MethodCall(mc) => self.rewrite_method(mc),
+            other => other,
+        }
+    }
+
+    fn fold_expr_for_loop(&mut self, mut i: ExprForLoop) -> ExprForLoop {
+        // `for item in x.slice(a, b)` — a Rust `&[T]` yields `&T`, but cubecl
+        // iterates a slice **by value** (`item: T`, §2.2). Bind the item by
+        // value with a reference pattern (`for &item in …`) so the twin matches,
+        // but only for a direct slice-creation iterand with a plain-ident
+        // pattern (the documented §2.2 shape); anything else is left untouched.
+        if is_slice_creation_call(&i.expr) && matches!(&*i.pat, Pat::Ident(_)) {
+            i.pat = Box::new(Pat::Reference(syn::PatReference {
+                attrs: Vec::new(),
+                and_token: Default::default(),
+                mutability: None,
+                pat: i.pat.clone(),
+            }));
+        }
+        syn::fold::fold_expr_for_loop(self, i)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Kernel composition: uses(...) call rewriting + a best-effort compile-time
 // cycle guard over the declared helper-composition graph.
@@ -1684,10 +1840,24 @@ fn classify_param(arg: &FnArg) -> syn::Result<Param> {
 
     match pt.ty.as_ref() {
         Type::Reference(r) => {
+            // A core-`Slice` helper param maps to a Rust subslice exactly like an
+            // `Array` param (docs/design-view-slice.md §4.1): `&Slice<E, ReadOnly>`
+            // -> `&[E]` (ArrayRef), `&SliceMut<E>` / `&Slice<E, ReadWrite>` /
+            // `&mut Slice<E, ReadWrite>` -> `&mut [E]` (ArrayMut). Reusing the
+            // Array kinds keeps every downstream twin path untouched.
+            if let Some((elem, writable)) = elem_of_slice(&r.elem) {
+                let kind = if writable || r.mutability.is_some() {
+                    ParamKind::ArrayMut(elem)
+                } else {
+                    ParamKind::ArrayRef(elem)
+                };
+                return Ok(Param { name, kind });
+            }
             let elem = elem_of_array(&r.elem).ok_or_else(|| {
                 syn::Error::new(
                     r.span(),
-                    "reference parameters must be &Array<T> or &mut Array<T> in the vericl v0 subset",
+                    "reference parameters must be &Array<T>, &mut Array<T>, or a core \
+                     &Slice<T>/&SliceMut<T> (helper params) in the vericl v0 subset",
                 )
             })?;
             if r.mutability.is_some() {
@@ -1724,6 +1894,52 @@ fn elem_of_array(ty: &Type) -> Option<Type> {
         syn::GenericArgument::Type(t) => Some(t.clone()),
         _ => None,
     }
+}
+
+/// If `ty` is a core-`Slice` element type — `Slice<E>`, `Slice<E, ReadOnly>`,
+/// `Slice<E, ReadWrite>`, or `SliceMut<E>` (with any path prefix) — return
+/// `(E, writable)`. `writable` is `true` for `SliceMut<E>` and
+/// `Slice<E, ReadWrite>`, `false` for `Slice<E>` / `Slice<E, ReadOnly>`
+/// (the 0.10 default visibility is `ReadOnly`, `slice/base.rs:33`).
+///
+/// The twin representation of a core slice IS a Rust slice
+/// (docs/design-view-slice.md §4.1): a read-only slice param maps to `&[E]`
+/// exactly like a `&Array<E>`, and a writable slice to `&mut [E]` exactly like
+/// a `&mut Array<E>`. So a slice param reuses `ParamKind::ArrayRef`/`ArrayMut`
+/// — no new kind is needed, and every downstream twin-signature/body path is
+/// unchanged (slices are helper-only, never launch args, so no launch/gen/
+/// compare path ever sees one; §4.1, §10).
+fn elem_of_slice(ty: &Type) -> Option<(Type, bool)> {
+    let Type::Path(tp) = ty else { return None };
+    let last = tp.path.segments.last()?;
+    let writable_by_name = match last.ident.to_string().as_str() {
+        "SliceMut" => true,
+        "Slice" => false,
+        _ => return None,
+    };
+    let syn::PathArguments::AngleBracketed(ab) = &last.arguments else {
+        return None;
+    };
+    let mut args = ab.args.iter();
+    let elem = match args.next()? {
+        syn::GenericArgument::Type(t) => t.clone(),
+        _ => return None,
+    };
+    // `Slice<E, ReadWrite>` is writable; `Slice<E>` / `Slice<E, ReadOnly>` is not.
+    let writable = writable_by_name
+        || matches!(
+            args.next(),
+            Some(syn::GenericArgument::Type(Type::Path(p)))
+                if p.path.segments.last().is_some_and(|s| s.ident == "ReadWrite")
+        );
+    Some((elem, writable))
+}
+
+/// `true` if `ty` is a reference to a core `Slice`/`SliceMut` (the helper-only
+/// slice param shape). Used by the kernel path to reject a slice as a *launch*
+/// argument with a targeted message (slices are internal / helper-only, §4.1).
+fn is_slice_ref_param(ty: &Type) -> bool {
+    matches!(ty, Type::Reference(r) if elem_of_slice(&r.elem).is_some())
 }
 
 /// If `elem` is a `Vector<P, W>` element type with a concrete integer width `W`
@@ -2241,6 +2457,27 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         .iter()
         .map(|arg| substitute_fn_arg(arg, &plan.generic_subst))
         .collect::<syn::Result<_>>()?;
+    // A core `Slice` is never a launch argument (docs/design-view-slice.md
+    // §4.1): launch entry points take `Array`/`Tensor`, and slices are created
+    // *inside* the kernel via `.slice()` or passed to `#[vericl::helper]`
+    // functions. Reject a slice launch param with a targeted message rather
+    // than letting it fail downstream as an opaque cubecl `LaunchArg`
+    // not-satisfied error. (`classify_param` maps a slice ref to
+    // `ArrayRef`/`ArrayMut`, which is correct for a *helper* — this guard is
+    // kernel-path-only.)
+    for arg in &subst_args {
+        if let FnArg::Typed(pt) = arg {
+            if is_slice_ref_param(pt.ty.as_ref()) {
+                return Err(syn::Error::new(
+                    pt.ty.span(),
+                    "a core `Slice`/`SliceMut` is not a launch argument in the vericl v0 subset — \
+                     launch kernels take `&Array<T>`/`&mut Array<T>`; create slices inside the \
+                     kernel with `.slice()`/`.to_slice()`, or pass them to a `#[vericl::helper]` \
+                     function (docs/design-view-slice.md §4.1)",
+                ));
+            }
+        }
+    }
     let params: Vec<Param> = subst_args.iter().map(classify_param).collect::<syn::Result<_>>()?;
 
     // A kernel is a "vector kernel" (design §11 V3) iff any array parameter's
@@ -2435,6 +2672,20 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     // check below — a recognized call is rewritten away, an unrecognized one
     // (e.g. a non-f32 cast target) survives to be rejected by name.
     ref_block = ShimRewriteFold.fold_block(ref_block);
+
+    // Rewrite core-`Slice` creation methods to Rust subslices (§4.1) BEFORE the
+    // Float-method reject check (so `.slice()`/`.to_slice()` are gone by then)
+    // and before the uses(...) rewrite (so a `f(x.slice(a,b))` arg is already
+    // `&x[a..b]` when its `_vericl_ref` call is formed). Rejects slice
+    // laundering / reinterpret methods (§8.3).
+    let mut slice_rewrite = SliceRewriteFold { errors: Vec::new() };
+    ref_block = slice_rewrite.fold_block(ref_block);
+    if let Some(combined) = slice_rewrite.errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
 
     // Reject any call to a Float/Numeric method whose host-callability isn't
     // verified (see FLOAT_METHOD_REJECT) — a silently panicking or
@@ -2877,7 +3128,11 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         // its inner expression wrapped in `(…)`/`{…}` (see
         // `rewrite_comptime_blocks`), which is redundant in a `let x = …;` RHS
         // but harmless — this is generated twin code, not authored.
-        #[allow(non_snake_case, unused_variables, unused_parens, unused_braces, clippy::all)]
+        // `unused_mut`: a mutable-slice twin binds `let mut a = &mut x[a..b]`
+        // (cubecl's `SliceMut` write needs the `mut` on the kernel side; the twin
+        // preserves it, but NLL makes it unnecessary for `&mut [_]` index writes —
+        // harmless in generated code, docs/design-view-slice.md §4.3).
+        #[allow(non_snake_case, unused_variables, unused_mut, unused_parens, unused_braces, clippy::all)]
         #vis mod #mod_name {
             use super::*;
 
@@ -3411,6 +3666,18 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
     // equivalents before the reject check — same as a kernel twin.
     ref_block = ShimRewriteFold.fold_block(ref_block);
 
+    // Core-`Slice` creation-method rewrite (§4.1) — the same pass a kernel twin
+    // gets, so a `#[vericl::helper] fn f(s: &Slice<F>)` body indexing/iterating
+    // its slice param, and a helper that itself creates a slice, both work.
+    let mut slice_rewrite = SliceRewriteFold { errors: Vec::new() };
+    ref_block = slice_rewrite.fold_block(ref_block);
+    if let Some(combined) = slice_rewrite.errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
+
     // Reject any call to a Float/Numeric method whose host-callability
     // isn't verified — the exact same check a kernel twin gets, now genuinely
     // sound for a helper too because `instantiate(...)` above has already
@@ -3520,7 +3787,11 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
         #[doc = #doc]
         // `unused_parens`/`unused_braces`: see the kernel twin's allow — a
         // stripped `comptime!` block re-emits `(…)`/`{…}` in generated code.
-        #[allow(non_snake_case, unused_variables, unused_parens, unused_braces, clippy::all)]
+        // `unused_mut`: a mutable-slice twin binds `let mut a = &mut x[a..b]`
+        // (cubecl's `SliceMut` write needs the `mut` on the kernel side; the twin
+        // preserves it, but NLL makes it unnecessary for `&mut [_]` index writes —
+        // harmless in generated code, docs/design-view-slice.md §4.3).
+        #[allow(non_snake_case, unused_variables, unused_mut, unused_parens, unused_braces, clippy::all)]
         #vis fn #ref_fn_name(#(#ref_params),*) #ref_output #ref_block
 
         #[doc = "VeriCL identity metadata for the helper function above."]
@@ -5557,6 +5828,117 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Core `Slice` twin rewrite (docs/design-view-slice.md §4.1) — the
+    // method-call -> Rust-subslice mapping and the laundering rejects.
+    // -----------------------------------------------------------------
+
+    fn slice_tw(src: &str) -> String {
+        let expr: Expr = syn::parse_str(src).expect("valid expr");
+        let mut fold = SliceRewriteFold { errors: Vec::new() };
+        let out = fold.fold_expr(expr);
+        assert!(fold.errors.is_empty(), "unexpected slice-rewrite errors for `{src}`");
+        out.to_token_stream().to_string().replace(' ', "")
+    }
+
+    fn slice_tw_err(src: &str) -> String {
+        let expr: Expr = syn::parse_str(src).expect("valid expr");
+        let mut fold = SliceRewriteFold { errors: Vec::new() };
+        let _ = fold.fold_expr(expr);
+        assert!(!fold.errors.is_empty(), "expected a slice-rewrite error for `{src}`");
+        fold.errors[0].to_string()
+    }
+
+    /// The four creation methods map to their exact Rust subslices (§4.1).
+    #[test]
+    fn slice_rewrite_creation_methods() {
+        assert_eq!(slice_tw("x.slice(a, b)"), "&(x)[(a)..(b)]");
+        assert_eq!(slice_tw("x.slice_mut(a, b)"), "&mut(x)[(a)..(b)]");
+        assert_eq!(slice_tw("x.to_slice()"), "&(x)[..]");
+        assert_eq!(slice_tw("x.to_slice_mut()"), "&mut(x)[..]");
+    }
+
+    /// A nested slice composes as relative indexing into the already-sliced
+    /// view (`&(&x[1..10])[1..3]` == `x[2..4]`), matching cubecl's additive
+    /// offset composition (§2.5).
+    #[test]
+    fn slice_rewrite_nested_composes() {
+        assert_eq!(slice_tw("x.slice(1, 10).slice(1, 3)"), "&(&(x)[(1)..(10)])[(1)..(3)]");
+    }
+
+    /// The idiomatic `&Slice<F>` helper-arg form `&x.slice(a, b)` collapses the
+    /// redundant outer `&` (the slice rewrite already yields a `&[T]`), so the
+    /// argument matches the helper twin's `&[T]` param (§10) — NOT `&&[T]`.
+    #[test]
+    fn slice_rewrite_collapses_redundant_outer_ref() {
+        assert_eq!(slice_tw("wsum(&x.slice(a, b))"), "wsum(&(x)[(a)..(b)])");
+        assert_eq!(slice_tw("wstore(&mut x.slice_mut(a, b))"), "wstore(&mut(x)[(a)..(b)])");
+        assert_eq!(slice_tw("wsum(&x.to_slice())"), "wsum(&(x)[..])");
+    }
+
+    /// A dynamic offset expression is preserved inside the range.
+    #[test]
+    fn slice_rewrite_dynamic_offset() {
+        assert_eq!(
+            slice_tw("x.slice(ABSOLUTE_POS, ABSOLUTE_POS + 4usize)"),
+            "&(x)[(ABSOLUTE_POS)..(ABSOLUTE_POS+4usize)]"
+        );
+    }
+
+    /// `for item in x.slice(a, b)` binds the item BY VALUE (`for &item in …`) so
+    /// `item: T` matches cubecl's by-value iteration, not the `&T` a Rust slice
+    /// yields (§2.2). A non-slice iterand (`0..n`) is left untouched.
+    #[test]
+    fn slice_rewrite_for_loop_binds_by_value() {
+        let block: syn::Block =
+            syn::parse_str("{ for item in x.slice(a, b) { sum += item; } }").unwrap();
+        let mut fold = SliceRewriteFold { errors: Vec::new() };
+        let out = fold.fold_block(block).to_token_stream().to_string().replace(' ', "");
+        assert!(out.contains("for&itemin&(x)[(a)..(b)]"), "got: {out}");
+
+        let plain: syn::Block =
+            syn::parse_str("{ for i in 0..n { sum += x[i]; } }").unwrap();
+        let mut fold = SliceRewriteFold { errors: Vec::new() };
+        let out = fold.fold_block(plain).to_token_stream().to_string().replace(' ', "");
+        assert!(out.contains("foriin0..n"), "a non-slice iterand must not gain `&`: {out}");
+    }
+
+    /// Laundering / reinterpret methods are rejected with targeted messages
+    /// (§8.3, round-9 risk-2/-3), not silently rewritten.
+    #[test]
+    fn slice_rewrite_rejects_laundering_and_reinterpret() {
+        assert!(slice_tw_err("s.as_mut_unchecked()").contains("laundering"));
+        assert!(slice_tw_err("s.downcast()").contains("type-punning"));
+        assert!(slice_tw_err("s.downcast_unchecked()").contains("type-punning"));
+        let v = slice_tw_err("s.with_vector_size::<Const<2>>()");
+        assert!(v.contains("reinterpret") && v.contains("vector_size"), "got: {v}");
+        assert!(slice_tw_err("s.into_vectorized()").contains("reinterpret"));
+    }
+
+    /// A core `Slice` helper param maps to the same twin representation as an
+    /// `Array` param (§4.1): `&Slice<f32>` / `&Slice<f32, ReadOnly>` -> `&[f32]`
+    /// (ArrayRef); `&SliceMut<f32>` / `&Slice<f32, ReadWrite>` /
+    /// `&mut SliceMut<f32>` -> `&mut [f32]` (ArrayMut).
+    #[test]
+    fn slice_param_classifies_as_array_ref_or_mut() {
+        fn kind_of(src: &str) -> &'static str {
+            let arg: FnArg = syn::parse_str(src).unwrap();
+            match classify_param(&arg).unwrap().kind {
+                ParamKind::ArrayRef(_) => "ref",
+                ParamKind::ArrayMut(_) => "mut",
+                _ => "other",
+            }
+        }
+        assert_eq!(kind_of("s: &Slice<f32>"), "ref");
+        assert_eq!(kind_of("s: &Slice<f32, ReadOnly>"), "ref");
+        assert_eq!(kind_of("s: &Slice<f32, ReadWrite>"), "mut");
+        assert_eq!(kind_of("s: &SliceMut<f32>"), "mut");
+        assert_eq!(kind_of("s: &mut SliceMut<f32>"), "mut");
+        // Sanity: an ordinary array param is unaffected.
+        assert_eq!(kind_of("x: &Array<f32>"), "ref");
+        assert_eq!(kind_of("y: &mut Array<f32>"), "mut");
+    }
+
     /// End-to-end: a kernel calling `u32::cast_from` (unrecognized target — no
     /// verified shim) is rejected by name at macro time, exactly as before this
     /// feature. The RECOGNIZED `f32::cast_from` path is exercised end-to-end by
@@ -5574,6 +5956,32 @@ mod tests {
             err.to_string().contains("cast_from"),
             "the rejection must name the method: {err}"
         );
+    }
+
+    /// End-to-end: the slice laundering reject (§8.3) propagates through
+    /// `expand` — the `SliceRewriteFold`'s errors reach the caller, not just the
+    /// isolated fold — and the `View` type ident stays banned (the cubecl-std
+    /// strided-view machinery, §1/§8.3).
+    #[test]
+    fn slice_laundering_and_view_machinery_rejected_end_to_end() {
+        // `as_mut_unchecked` laundering in a kernel body.
+        let f: ItemFn = syn::parse_str(
+            "pub fn k(x: &mut Array<f32>) { if ABSOLUTE_POS == 0 { \
+             let s = x.slice_mut(0, 4).as_mut_unchecked(); s[0] = 1.0f32; } }",
+        )
+        .unwrap();
+        let err = expand(quote!(compare(exact)), &f)
+            .expect_err("as_mut_unchecked laundering must be rejected");
+        assert!(err.to_string().contains("laundering"), "got: {err}");
+
+        // A `View` type ident is banned (the strided-tensor-view machinery).
+        let g: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { let v = View::new(x); y[ABSOLUTE_POS] = v[0]; } }",
+        )
+        .unwrap();
+        let err = expand(quote!(compare(exact)), &g).expect_err("View machinery must be rejected");
+        assert!(err.to_string().contains("View"), "got: {err}");
     }
 
     // -----------------------------------------------------------------

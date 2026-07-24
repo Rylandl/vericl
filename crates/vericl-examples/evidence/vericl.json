@@ -1140,6 +1140,195 @@
         "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
         "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
       ]
+    },
+    {
+      "kernel": "windowed_slice_sum",
+      "identity": {
+        "source_hash": "sha256:7ffeecf1df6862bbf282c875eba7b3b417918f602195f6fa2a811a58255b16fc",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:bebca446e76a7425d94ad5f89c3379ce612b6bff1917fc4a12d548bb22dc8e09"
+      },
+      "contract": {
+        "assumes": [
+          "y.len() + 4 <= x.len()"
+        ],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 2,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    },
+    {
+      "kernel": "slice_gather_copy",
+      "identity": {
+        "source_hash": "sha256:89664d7d1229d52fdd4d6e4ea1993f6bbd9091e19f5987148a7862b0133ca950",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:0b8d4b995b06c6641a086017037ec3927ccfa255e5682dafa2fad2b0797c516a"
+      },
+      "contract": {
+        "assumes": [
+          "offsets.len() == y.len()",
+          "offsets.iter().all(| v |(* v as usize) < x.len())"
+        ],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 3,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    },
+    {
+      "kernel": "windowed_helper_kernel",
+      "identity": {
+        "source_hash": "sha256:3f4caa3ced9092f6de720b896e89424e201e1c65858e4e2ad2656f6fae4f3165",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:324350f95ef4de4d48c2702e46d3714d37b62eac593bb8d198baf26862fc89d0"
+      },
+      "contract": {
+        "assumes": [
+          "y.len() + 4 <= x.len()"
+        ],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": [
+          "window_edge_sum"
+        ]
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ]
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 3,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
     }
   ]
 }

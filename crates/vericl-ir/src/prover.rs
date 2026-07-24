@@ -7450,4 +7450,300 @@ mod tests {
             other => panic!("expected OutOfSubset (data-dependent per-lane gather), got {other:?}"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Core `Slice` transparency (docs/design-view-slice.md §5, deliverable B).
+    //
+    // These reproduce `scratchpad/linevec/src/bin/sliceprove.rs` against the
+    // *current, unmodified* walker: a `slice[i]` access lowers to a checked
+    // `Index(origin, Add(offset, i))` on the origin buffer (§2.1), so the
+    // existing origin obligation `0 <= offset + i < Length(origin)` discharges
+    // it with **no prover change** ("B is a no-op for the prover", §11 S1).
+    // Every §5.2 verdict is reproduced, both the `Proved` shortlist and the
+    // `Refuted`/`OutOfSubset` negative controls (round-9 mandatory controls).
+    // -----------------------------------------------------------------------
+
+    const SLICE_BUFFERS: &[BufferParam] = &[
+        BufferParam { name: "input", is_output: false },
+        BufferParam { name: "output", is_output: true },
+    ];
+
+    fn slice_two_buf(expand: impl FnOnce(&mut Scope, ArgIn, ArgOut)) -> KernelDefinition {
+        let mut b = KernelBuilder::default();
+        b.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut b.scope);
+        let i = <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut b);
+        let o = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut b,
+        );
+        expand(&mut b.scope, i, o);
+        b.build(KernelSettings::default())
+    }
+    type ArgIn = <Array<f32> as CubeType>::ExpandType;
+    type ArgOut = <Array<f32> as CubeType>::ExpandType;
+
+    /// `to_slice()` whole-slice read, guarded `ABSOLUTE_POS < s.len()`. The
+    /// slice length folds to `Metadata::Length(input) - 0`, so the guard
+    /// bounds the origin read directly. `Proved{2}` (§5.2, risk-5 pin: the
+    /// obligation binds the *origin* length leaf, not a `Sub`).
+    #[cube(launch)]
+    fn slice_test_to_slice_pos(input: &Array<f32>, output: &mut Array<f32>) {
+        let s = input.to_slice();
+        if ABSOLUTE_POS < s.len() {
+            output[ABSOLUTE_POS] = s[ABSOLUTE_POS];
+        }
+    }
+
+    #[test]
+    fn slice_to_slice_pos_proves() {
+        let def = slice_two_buf(slice_test_to_slice_pos::expand);
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &[Assume::LenEq { a: "input", b: "output" }])
+        {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved{{2}}, got {other:?}"),
+        }
+    }
+
+    /// Negative control: the same whole-slice read with NO guard reads
+    /// `s[ABSOLUTE_POS]` out of bounds. `Refuted` (§5.2).
+    #[cube(launch)]
+    fn slice_test_to_slice_oob(input: &Array<f32>, output: &mut Array<f32>) {
+        let s = input.to_slice();
+        output[ABSOLUTE_POS] = s[ABSOLUTE_POS];
+    }
+
+    #[test]
+    fn slice_to_slice_oob_refutes() {
+        let def = slice_two_buf(slice_test_to_slice_oob::expand);
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &[Assume::LenEq { a: "input", b: "output" }])
+        {
+            ProveResult::Refuted { .. } => {}
+            other => panic!("expected Refuted, got {other:?}"),
+        }
+    }
+
+    /// Dynamic offset: `input.slice(p, p+4)` with `p = ABSOLUTE_POS`, but only
+    /// `s[0] = input[p]` is accessed. `Proved{2}` under `LenEq`. This is
+    /// itself the round-9 risk-1 demonstration on the prover side: the slice
+    /// is *created* with end `p+4` (which may exceed the origin), yet the
+    /// prover proves only the concrete guarded **accesses** (`input[p]`),
+    /// never slice-creation validity — that is the twin's job (§4.4, §12.1).
+    #[cube(launch)]
+    fn slice_test_slice_dyn(input: &Array<f32>, output: &mut Array<f32>) {
+        let p = ABSOLUTE_POS;
+        let s = input.slice(p, p + 4);
+        if ABSOLUTE_POS < output.len() {
+            output[ABSOLUTE_POS] = s[0];
+        }
+    }
+
+    #[test]
+    fn slice_dyn_offset_proves() {
+        let def = slice_two_buf(slice_test_slice_dyn::expand);
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &[Assume::LenEq { a: "input", b: "output" }])
+        {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved{{2}}, got {other:?}"),
+        }
+    }
+
+    /// Constant-offset slice `input.slice(2, 3)`, guarded by a *modeled*
+    /// condition (`ABSOLUTE_POS == 0`). `slice[0] = input[2]`; the obligation
+    /// `2 < input.len()` needs the origin length constrained. With
+    /// `input.len() == 5`: `Proved{2}`. Without: `Refuted` — the origin
+    /// length is load-bearing (§5.3, risk-5: the bound keys off the origin's
+    /// own `Metadata::Length`, not the derived `slice.len()`).
+    #[cube(launch)]
+    fn slice_test_select_ap(input: &Array<f32>, output: &mut Array<f32>) {
+        if ABSOLUTE_POS == 0 {
+            let slice = input.slice(2, 3);
+            output[0] = slice[0];
+        }
+    }
+
+    #[test]
+    fn slice_const_offset_proves_under_origin_len() {
+        let def = slice_two_buf(slice_test_select_ap::expand);
+        let len5 = [
+            Assume::LenEqConst { a: "input", value: 5 },
+            Assume::LenEqConst { a: "output", value: 5 },
+        ];
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &len5) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved{{2}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_const_offset_refutes_without_origin_len() {
+        let def = slice_two_buf(slice_test_select_ap::expand);
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &[]) {
+            ProveResult::Refuted { .. } => {}
+            other => panic!("expected Refuted (origin length is load-bearing), got {other:?}"),
+        }
+    }
+
+    /// Nested slice: `input.slice(1, 10).slice(1, 3)[0]` composes offsets
+    /// **additively** to `input[1 + 1 + 0] = input[2]` (§2.5). `Proved{2}`
+    /// under `input.len() == 5` — the walker sees only the composed origin
+    /// access, never a distinct nested-slice construct.
+    #[cube(launch)]
+    fn slice_test_nested_ap(input: &Array<f32>, output: &mut Array<f32>) {
+        if ABSOLUTE_POS == 0 {
+            let a = input.slice(1, 10);
+            let b = a.slice(1, 3);
+            output[0] = b[0];
+        }
+    }
+
+    #[test]
+    fn slice_nested_additive_offset_proves() {
+        let def = slice_two_buf(slice_test_nested_ap::expand);
+        let len5 = [
+            Assume::LenEqConst { a: "input", value: 5 },
+            Assume::LenEqConst { a: "output", value: 5 },
+        ];
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &len5) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved{{2}}, got {other:?}"),
+        }
+    }
+
+    /// Gather **through** a slice of an element-assumed array (§5.4). The
+    /// slice read lowers to a read of the *origin* buffer id, and the
+    /// `ElemsBelowLen{offsets, x}` assume keys off that same id, so the loaded
+    /// index is modeled `< x.len()` with **no slice-specific code**.
+    /// `Proved{3}`. Without the element assume, the gather index taints:
+    /// `OutOfSubset` (never a false `Proved`).
+    #[cube(launch)]
+    fn slice_test_gather(offsets: &Array<u32>, x: &Array<f32>, output: &mut Array<f32>) {
+        if ABSOLUTE_POS < output.len() {
+            let s = offsets.to_slice();
+            let idx = s[ABSOLUTE_POS];
+            output[ABSOLUTE_POS] = x[idx as usize];
+        }
+    }
+
+    fn build_slice_gather() -> KernelDefinition {
+        let mut b = KernelBuilder::default();
+        b.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut b.scope);
+        let off =
+            <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut b);
+        let x = <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut b);
+        let o = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut b,
+        );
+        slice_test_gather::expand(&mut b.scope, off, x, o);
+        b.build(KernelSettings::default())
+    }
+
+    const SLICE_GATHER_BUFFERS: &[BufferParam] = &[
+        BufferParam { name: "offsets", is_output: false },
+        BufferParam { name: "x", is_output: false },
+        BufferParam { name: "output", is_output: true },
+    ];
+
+    #[test]
+    fn slice_gather_with_element_assume_proves() {
+        let def = build_slice_gather();
+        let assumes = [
+            Assume::ElemsBelowLen { arr: "offsets", len_of: "x" },
+            Assume::LenEq { a: "offsets", b: "output" },
+        ];
+        match prove_bounds_freedom(&def, SLICE_GATHER_BUFFERS, &assumes) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved{{3}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_gather_without_element_assume_is_out_of_subset() {
+        let def = build_slice_gather();
+        match prove_bounds_freedom(
+            &def,
+            SLICE_GATHER_BUFFERS,
+            &[Assume::LenEq { a: "offsets", b: "output" }],
+        ) {
+            ProveResult::OutOfSubset { .. } => {}
+            ProveResult::Proved { .. } => {
+                panic!("VACUOUS: a slice gather with no element assume must never prove")
+            }
+            other => panic!("expected OutOfSubset (tainted gather index), got {other:?}"),
+        }
+    }
+
+    /// Iteration over a slice (§2.2) lowers to a `RangeLoop(0 .. length)`
+    /// reading `origin[offset + i]`, which the walker already models. Windowed
+    /// sum `for v in x.slice(pos, pos+4) { acc += v }`, guarded `pos <
+    /// y.len()`, proves under `y.len() + 4 <= x.len()` (the same length
+    /// relationship the indexed `offset_window` uses). This is the positive
+    /// control for the §2.2 "slice iteration is a RangeLoop over origin
+    /// accesses" claim.
+    #[cube(launch)]
+    fn slice_test_windowed_iter(input: &Array<f32>, output: &mut Array<f32>) {
+        if ABSOLUTE_POS < output.len() {
+            let mut acc = f32::new(0.0);
+            for v in input.slice(ABSOLUTE_POS, ABSOLUTE_POS + 4) {
+                acc += v;
+            }
+            output[ABSOLUTE_POS] = acc;
+        }
+    }
+
+    #[test]
+    fn slice_windowed_iteration_proves() {
+        let def = slice_two_buf(slice_test_windowed_iter::expand);
+        let assumes = [Assume::LenPlusConstLe { a: "output", k: 4, b: "input" }];
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &assumes) {
+            ProveResult::Proved { obligations } => {
+                println!("windowed-iter proved with {obligations} obligations")
+            }
+            other => panic!("expected Proved, got {other:?}"),
+        }
+    }
+
+    /// Reinterpret-slice (`with_vector_size`) is the ONLY `vector_size != 0`
+    /// source (§2.6) and the round-9 risk-3 standing negative control. The
+    /// unmodified walker rejects it via `check_trivial_vectorization` with the
+    /// message pre-written for exactly this — asserted **verbatim** so a future
+    /// edit that weakened the check would fail this test. Independently, the
+    /// construct is unrunnable on wgpu (`base.rs:87`), so it can never appear
+    /// in a passing differential kernel.
+    #[cube(launch, launch_unchecked)]
+    fn slice_test_reinterp(input: &Array<Vector<f32, Const<4>>>, output: &mut Array<f32>) {
+        let s = input.slice(0, 4);
+        let s2 = s.with_vector_size::<Const<2>>();
+        let v = s2[0];
+        output[0] = v[0];
+    }
+
+    #[test]
+    fn slice_reinterpret_is_out_of_subset_verbatim() {
+        let mut b = KernelBuilder::default();
+        b.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut b.scope);
+        let i = <Array<Vector<f32, Const<4>>> as LaunchArg>::expand(
+            &ArrayCompilationArg { inplace: None },
+            &mut b,
+        );
+        let o = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut b,
+        );
+        slice_test_reinterp::expand(&mut b.scope, i, o);
+        let def = b.build(KernelSettings::default());
+        match prove_bounds_freedom(&def, SLICE_BUFFERS, &[]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert_eq!(
+                    reason,
+                    "reinterpret-vectorized indexing (vector_size=2, unroll_factor=1) is a \
+                     View/Slice reinterpret-slice construct outside the vericl v0 subset"
+                );
+            }
+            other => panic!("expected OutOfSubset (reinterpret-slice), got {other:?}"),
+        }
+    }
 }

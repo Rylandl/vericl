@@ -1746,3 +1746,81 @@ bit-faithful. Coverage nuances recorded, not defects: the two gather attack-shap
 are saved by register-lane taint rather than the guard (only the predicate test
 discriminates guard removal); powi/clamp/is_nan derive from GT'd primitives rather than
 carrying dedicated GT rows (same posture as the scalar whitelist).
+
+## Core `Slice` element milestone — S1–S6 DONE (2026-07-23)
+
+Delivered core `Slice` support per `docs/design-view-slice.md` — the ecosystem survey's **#2 gate
+(128/464 device items)**, whose tractable half is the core `Slice` (an *addressing view* over a base
+buffer, distinct from the deferred `View`/`VirtualLayout` strided machinery). Headline: a `slice[i]`
+access lowers to a checked `origin[offset + i]` (frontend-only, no buffer/metadata/id), so **the prover
+change is ZERO** — B is a no-op; the work is the twin + macro gate. Six milestones, each with a negative
+control (round-9 will attack this).
+
+**S1 — prover confirmation (prover, no production change).** Reproduced every
+`scratchpad/linevec/src/bin/sliceprove.rs` §5.2 verdict as `crates/vericl-ir/src/prover.rs::tests` (+10):
+`to_slice`/dynamic-offset/const-offset(+origin-len)/**nested**(additive offset, §2.5)/**iteration**
+(RangeLoop over `origin[offset+i]`, §2.2)/**gather-through-slice**(element assume transfers by origin-id
+keying, §5.4) all `Proved`; `to_slice_oob`/const-offset-without-origin-len `Refuted`; gather-without-
+assume `OutOfSubset`; and the reinterpret-slice (`with_vector_size`) `OutOfSubset` with the
+`check_trivial_vectorization` message asserted **verbatim** (the standing risk-3 control). Confirms
+"slices are transparent to the walker" on the unmodified prover.
+
+**S2 — Rust-subslice twin + slice gate (macro).** `SliceRewriteFold` (`crates/vericl-macros/src/lib.rs`,
+the `ShimRewriteFold`/vector-head-rewrite sibling) rewrites on the twin only: `x.slice(a,b)` →
+`&(x)[(a)..(b)]`, `slice_mut` → `&mut …`, `to_slice()`/`to_slice_mut()` → `&(x)[..]`/`&mut (x)[..]`,
+`for item in slice` → `for &item in …` (by-value iteration), nested slices compose relatively. A
+`&Slice<F,ReadOnly>` helper param maps to `&[F]` (ArrayRef) and `&SliceMut<F>`/`&Slice<F,ReadWrite>` to
+`&mut [F]` (ArrayMut) — `elem_of_slice`, reusing the Array twin representation (no new `ParamKind`, so
+zero downstream match-arm churn — a reported refinement of the design's `SliceRef`/`SliceMut` variants).
+Slices are helper-only, never launch args (kernel-path targeted reject). The bare `Slice` type ident
+stays in `BANNED_IDENTS` (a v1 slice body never contains it), alongside the newly-banned `View`/
+`VirtualLayout`/`Coordinates`/`StridedLayout`/`LinearView`/`VirtualView`/`ViewOperations` idents.
+Tests (+8 macro): the four creations, nested, dynamic offset, for-loop by-value, the `&x.slice(a,b)`
+redundant-outer-ref collapse (the idiomatic `&Slice` helper-arg form), param classification, laundering
+rejects, and an end-to-end `expand` reject.
+
+**S3 — aliasing + laundering (macro).** `slice_mut` → `&mut x[a..b]` makes **the borrow checker the
+aliasing oracle**: sequential mutable slices compile (the dominant shape), two simultaneously-live
+overlapping `&mut` subslices of one origin do **not** (`E0499`). Laundering (`as_mut_unchecked`/
+`downcast`/`downcast_unchecked`/`try_cast_slice`) and reinterpret (`with_vector_size`/`into_vectorized`)
+methods are rejected with targeted messages. `unused_mut` added to the twin allow-list so the sequential
+mutable-slice twin is warning-clean. Negative control: `scratchpad/slicemut` (overlap `E0499` vs
+sequential compiles), `scratchpad/viewslice/slicemut_aliasing_out.txt`.
+
+**S4/S5 — public examples + suite (examples).** Three clean-room kernels wired into `vericl::suite!`
+(`crates/vericl-examples`), each carrying `tested` (bit-exact, `max_ulp=0`) + `proved`: `windowed_slice_sum`
+(dynamic-offset creation + `for v in slice` iteration + length, `Proved{2}`), `slice_gather_copy`
+(gather through a `to_slice()` of an element-assumed table, the assume transfers free, `Proved{3}`),
+`windowed_helper_kernel` (the dominant composition — a `#[vericl::helper] fn window_edge_sum(w: &Slice<F>)`
+called `&x.slice(a,b)`, `Proved{3}`). Lib tests (+7) pin the twins value-for-value, the prover obligation
+counts, and the no-relationship backstop. Evidence regenerated: only the 3 new entries added, existing 17
+byte-identical (cpu-first, default-last — committed wgpu-only format).
+
+**S6 — round-9 risk-1 twin-validity control.** cubecl does NOT bounds-check slice creation; Rust's
+`&arr[a..b]` panics, so the twin is the slice-creation validity oracle (§4.4). Test
+`windowed_slice_creation_panics_when_x_undersized`: with `x.len() == y.len()` (violating the
+`y.len()+4<=x.len()` contract) the `tested` twin **panics** on the out-of-range `&x[pos..pos+4]` while the
+`proved` claim (over the *accesses*, `x[pos..pos+4)`) still holds — the two claims' scopes are documented
+so neither over-claims. The prover side is `slice_dyn_offset_proves` (proves the guarded access though the
+created slice may exceed the origin).
+
+**Survey-count correction + honest coverage.** `docs/dogfood-2026-07.md` (new addendum) + README (new
+"Core `Slice`" section) record that the "128" is really **~25 real core-slice creators + a `ReadOnly`/
+`ReadWrite`-ident tail + the deferred `View` machinery** (`scratchpad/viewslice/split.py`): core `Slice`
+is **necessary but rarely sufficient** — only ~10 of the ~25 trip no other gate, all impls/traits/test-
+launchers, not 1-D launch kernels. Post-`Slice` frontier ranking: `plane_*` → custom cube structs
+(`CubeType`-arg) → 2-D topology → `Tensor`/`View`.
+
+**Ecosystem validation (non-destructive).** `slice_window_read` — the `x.slice(start,end)[j]` addressing
+view the cubek attention (`reader/query.rs`) and convolution (`async_copy.rs`) readers build over their
+inputs, isolated to a 1-D glue kernel (its real callers are co-gated by `View`/`downcast`/2-D/matmul) —
+annotated in `vericl-ecosystem-survey/annotated`, confirmed end-to-end (`tested` wgpu + cpu, `proved`
+`{2}`, clean append), then the survey workspace **restored byte-identical** (the V6 convention).
+
+**Deferred with targeted rejections:** the `View`/`VirtualLayout`/`Coordinates` strided machinery,
+reinterpret-slice (`vector_size≠0`, also unrunnable on wgpu), `Tensor` slice origins, `SharedMemory`-slice
+race-freedom (a cooperative-slice milestone), and `split_at_mut`-recognized disjoint mutable slicing (v1.1).
+
+**Counts:** vericl-ir 104 (+10), vericl-macros 59 (+8), vericl-examples lib 88 (+7). Clippy 0 (default +
+cpu). conform demo-defects exit 0. Full `cargo test --workspace` green; evidence append-only, existing
+entries byte-identical.

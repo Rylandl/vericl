@@ -83,6 +83,26 @@ vericl::suite! {
         // width is recorded in the claim config (§9). Generalizes the scalar
         // elementwise shortlist to its true vector element type.
         vec_add,
+        // --- Core `Slice` (docs/design-view-slice.md) ---
+        // The #2 ecosystem gap's tractable half. A slice access lowers to a
+        // checked `origin[offset + i]`, so bounds proving is the ordinary
+        // origin obligation, UNMODIFIED (deliverable B is a no-op for the
+        // prover, §5). The twin maps a slice to a Rust subslice (`&arr[a..b]`) —
+        // bit-exact (a slice adds no numeric op, §6) with Rust as the soundness
+        // oracle for slice-creation validity and mutable aliasing (§4.3/§4.4).
+        //
+        // `windowed_slice_sum`: dynamic-offset slice creation + `for v in slice`
+        // iteration (`RangeLoop` over `x[i+j]`, §2.2) + length. Bit-exact
+        // windowed sum + proved bounds.
+        windowed_slice_sum,
+        // `slice_gather_copy`: gather through a `to_slice()` of an element-
+        // assumed offset table — the element assume transfers through the slice
+        // via origin-id keying, for free (§5.4). Exact + proved (3 obligations).
+        slice_gather_copy,
+        // `windowed_helper_kernel`: the dominant composition usage — a
+        // `#[vericl::helper]` taking a `&Slice<F>` param (§10), called with the
+        // idiomatic `&x.slice(a, b)` form. Exact + proved.
+        windowed_helper_kernel,
     ],
     evidence: "evidence/vericl.json",
     extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime),

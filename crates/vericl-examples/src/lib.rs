@@ -401,6 +401,105 @@ pub fn offset_window(x: &Array<f32>, y: &mut Array<f32>) {
 }
 
 // ---------------------------------------------------------------------------
+// Core `Slice` (docs/design-view-slice.md) — the #2 ecosystem gap's tractable
+// half. A slice is a pure *addressing view*: `arr.slice(a, b)[i]` lowers to a
+// checked `origin[a + i]` (§2.1), so bounds proving is the ordinary origin
+// obligation, unchanged (§5, deliverable B). The twin maps a slice to a Rust
+// subslice (`&arr[a..b]`), which is bit-exact (a slice adds no numeric op,
+// §4.2/§6) and makes Rust the soundness oracle for slice-creation validity
+// (an out-of-range `&arr[a..b]` PANICS in the tested twin, §4.4) and for
+// mutable aliasing (overlapping live `&mut` subslices do not compile, §4.3).
+// ---------------------------------------------------------------------------
+
+/// Windowed sum through a slice: `y[i] = Σ x.slice(i, i+4)`, guarded `i <
+/// y.len()`. Exercises the whole core-slice surface end to end — dynamic-offset
+/// slice **creation**, **iteration** (`for v in slice`, a `RangeLoop` over
+/// `x[i + j]`, §2.2), and **length** — proving that the addressing view is
+/// transparent to both lanes. The reads `x[i .. i+4)` are bounded by the same
+/// `y.len() + 4 <= x.len()` length relationship the indexed `offset_window`
+/// uses, combined with the `i < y.len()` guard; `gen(... len(x = n + 4))` sizes
+/// `x` four longer so every window is in range and the twin's `&x[i..i+4]`
+/// never panics. The window sum is a fixed left-to-right sequence of exact f32
+/// adds (no fma contraction), bit-exact vs the backend (`max_ulp = 0`, the
+/// design's §6 `windowed_sum` ground-truth result). Wired into `vericl::suite!`
+/// — carries `tested` (differential) + `proved` (SMT bounds) claims.
+#[vericl::kernel(
+    assumes(y.len() + 4 <= x.len()),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, len(x = n + 4))
+)]
+#[cube(launch)]
+pub fn windowed_slice_sum(x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let mut acc = f32::new(0.0);
+        for v in x.slice(ABSOLUTE_POS, ABSOLUTE_POS + 4) {
+            acc += v;
+        }
+        y[ABSOLUTE_POS] = acc;
+    }
+}
+
+/// Gather **through** a slice of an element-assumed array: `y[i] =
+/// x[offsets.to_slice()[i]]` — the `gather_copy` shape, but reading the offset
+/// table through a whole-buffer `to_slice()` (offset 0). Because the slice read
+/// lowers to a read of the **origin** buffer id, the `offsets.iter().all(...)`
+/// element assume keys off that same id and transfers **for free** (§5.4), so
+/// the loaded index is modeled `< x.len()` with no slice-specific prover code.
+/// A slice adds no numeric op, so the copy is bit-exact (`max_ulp = 0`). Wired
+/// into `vericl::suite!` — carries `tested` + `proved` (3-obligation SMT
+/// bounds: `offsets[i]` read, `x[·]` read, `y[i]` write). This doubles as the
+/// "re-annotate an already-provable kernel to read through a `to_slice()`"
+/// demonstration (the addressing view is transparent to the gather machinery).
+#[vericl::kernel(
+    assumes(
+        offsets.len() == y.len(),
+        offsets.iter().all(|v| (*v as usize) < x.len()),
+    ),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn slice_gather_copy(x: &Array<f32>, offsets: &Array<u32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let s = offsets.to_slice();
+        y[ABSOLUTE_POS] = x[s[ABSOLUTE_POS] as usize];
+    }
+}
+
+/// Reads the edges of a slice window — the composition boundary probe for
+/// slices, analogous to `tap_pair` for arrays. The array access lives inside
+/// the helper's own body (`w[0] + w[3]`), over a `&Slice<F>` param (the
+/// idiomatic real-cubek helper-param form; the twin maps `&Slice<F>` -> `&[f32]`,
+/// §10). Pins that the SMT bounds prover, walking the caller's inlined IR,
+/// discharges the origin obligation that only exists because of what a composed
+/// slice helper does.
+#[vericl::helper(instantiate(F = f32))]
+#[cube]
+pub fn window_edge_sum<F: Float>(w: &Slice<F>) -> F {
+    w[0] + w[3]
+}
+
+/// Composed slice kernel: `y[i] = window_edge_sum(&x.slice(i, i+4))` — the
+/// dominant real slice-composition usage (a `#[vericl::helper]` taking a slice,
+/// §3, §10). The idiomatic `&x.slice(a, b)` argument's redundant outer `&`
+/// collapses in the twin so it matches the helper twin's `&[f32]` param. Under
+/// the same `y.len() + 4 <= x.len()` relationship, both edge reads (`x[i]`,
+/// `x[i+3]`) prove in the caller's inlined IR. Bit-exact single-add sum
+/// (`max_ulp = 0`). Wired into `vericl::suite!` — carries `tested` + `proved`.
+#[vericl::kernel(
+    assumes(y.len() + 4 <= x.len()),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, len(x = n + 4)),
+    uses(window_edge_sum)
+)]
+#[cube(launch)]
+pub fn windowed_helper_kernel(x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = window_edge_sum::<f32>(&x.slice(ABSOLUTE_POS, ABSOLUTE_POS + 4));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Kernel composition: #[vericl::helper] + uses(...) — the milestone this
 // section demonstrates (docs/dogfood-2026-07.md Tier-1 gap #2, blocking
 // 16/22 dogfooded kernels). See README "Kernel composition" for the design.
@@ -2177,6 +2276,133 @@ mod tests {
         {
             panic!("offset window must NOT prove without the length relationship");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Core `Slice` (docs/design-view-slice.md).
+    // -----------------------------------------------------------------
+
+    /// The derived slice twin performs the windowed sum its body says —
+    /// `y[i] = Σ x.slice(i, i+4)` — via the Rust-subslice `&x[i..i+4]` mapping
+    /// and `for &v in slice` by-value iteration (§4.1). Pins the slice twin
+    /// derivation at the value level (the `*_twin_matches_hand_computed`
+    /// precedent).
+    #[test]
+    fn windowed_slice_sum_twin_matches_hand_computed() {
+        let x = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]; // len 8 >= 4 + 4
+        let mut y = vec![0.0f32; 4];
+        windowed_slice_sum_vericl::reference(&x, &mut y, 4);
+        // y[i] = x[i] + x[i+1] + x[i+2] + x[i+3]
+        assert_eq!(y, vec![10.0, 14.0, 18.0, 22.0]);
+    }
+
+    /// Round-9 risk-1 mandatory negative control (docs/design-view-slice.md
+    /// §4.4, §12.1): the twin is the slice-**creation** validity oracle cubecl
+    /// lacks. If a caller violates the `y.len() + 4 <= x.len()` contract (here
+    /// `x.len() == y.len()`), the twin's `&x[pos..pos+4]` slice creation is
+    /// out of range for the largest `pos` and **PANICS** — even though each
+    /// individual origin *access* the `proved` claim covers is in bounds. The
+    /// two claims' scopes are deliberately split: `proved` is over the
+    /// accesses, `tested` independently catches invalid creation. (The prover
+    /// side of this same risk — proving guarded accesses while the created
+    /// slice may exceed the origin — is `slice_dyn_offset_proves` in
+    /// crates/vericl-ir.)
+    #[test]
+    fn windowed_slice_creation_panics_when_x_undersized() {
+        let x = vec![1.0f32; 8]; // == y.len(): violates y.len() + 4 <= x.len()
+        let mut y = vec![0.0f32; 8];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            windowed_slice_sum_vericl::reference(&x, &mut y, 8);
+        }));
+        assert!(
+            r.is_err(),
+            "the twin MUST panic on the out-of-range slice creation — Rust's \
+             slice-validity is the soundness net cubecl does not provide (§4.4)"
+        );
+    }
+
+    /// The windowed-slice bounds prove (2 obligations: the `RangeLoop` origin
+    /// read `x[i+j]` and the `y[i]` write) only because the `y.len() + 4 <=
+    /// x.len()` relationship is declared — the slice access is the ordinary
+    /// origin obligation, discharged UNMODIFIED (deliverable B, §5).
+    #[test]
+    fn windowed_slice_sum_definition_is_provably_in_bounds() {
+        let def = windowed_slice_sum_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = windowed_slice_sum_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenPlusConstLe { a: "y", k: 4, b: "x" }];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("expected Proved (windowed slice), got {other:?}"),
+        }
+    }
+
+    /// Backstop: without the length relationship, the window read is unbounded
+    /// — a slice does not launder a bound the origin cannot service (§5.3).
+    #[test]
+    fn windowed_slice_sum_not_provable_without_relationship() {
+        let def = windowed_slice_sum_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = windowed_slice_sum_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+        if let vericl_ir::ProveResult::Proved { .. } =
+            vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes)
+        {
+            panic!("windowed slice must NOT prove without the length relationship");
+        }
+    }
+
+    /// The gather-through-slice twin reads `y[i] = x[offsets.to_slice()[i]]`
+    /// via the `&offsets[..]` whole-slice mapping.
+    #[test]
+    fn slice_gather_copy_twin_matches_hand_computed() {
+        let x = vec![10.0f32, 20.0, 30.0, 40.0];
+        let offsets = vec![3u32, 1, 0, 2];
+        let mut y = vec![0.0f32; 4];
+        slice_gather_copy_vericl::reference(&x, &offsets, &mut y, 4);
+        assert_eq!(y, vec![40.0, 20.0, 10.0, 30.0]);
+    }
+
+    /// The element assume transfers **through** the slice via origin-id keying
+    /// (§5.4): the gather proves (3 obligations) only with the element bound.
+    #[test]
+    fn slice_gather_copy_definition_is_provably_in_bounds() {
+        let def = slice_gather_copy_vericl::kernel_definition();
+        let buffers: Vec<vericl_ir::BufferParam> = slice_gather_copy_vericl::BUFFER_PARAMS
+            .iter()
+            .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+            .collect();
+        let assumes = [
+            vericl_ir::Assume::LenEq { a: "offsets", b: "y" },
+            vericl_ir::Assume::ElemsBelowLen { arr: "offsets", len_of: "x" },
+        ];
+        match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+            vericl_ir::ProveResult::Proved { obligations } => assert_eq!(obligations, 3),
+            other => panic!("expected Proved (slice gather), got {other:?}"),
+        }
+    }
+
+    /// The slice-param helper twin maps `&Slice<F>` -> `&[f32]` and computes
+    /// what its body says (`w[0] + w[3]`) — composition support at the twin
+    /// level (§10).
+    #[test]
+    fn window_edge_sum_helper_twin_maps_slice_to_host_slice() {
+        assert_eq!(window_edge_sum_vericl_ref(&[10.0f32, 1.0, 2.0, 40.0]), 50.0);
+    }
+
+    /// The composed slice kernel's twin calls the helper twin on the collapsed
+    /// `&x[i..i+4]` argument, computing `x[i] + x[i+3]`.
+    #[test]
+    fn windowed_helper_kernel_twin_matches_hand_computed() {
+        let x = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut y = vec![0.0f32; 4];
+        windowed_helper_kernel_vericl::reference(&x, &mut y, 4);
+        // y[i] = x[i] + x[i+3]
+        assert_eq!(y, vec![1.0 + 4.0, 2.0 + 5.0, 3.0 + 6.0, 4.0 + 7.0]);
     }
 
     // -----------------------------------------------------------------

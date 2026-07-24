@@ -392,6 +392,56 @@ already-provable scalar shortlist to its true vector element type (e.g. an f32 `
 (the #2 gap), `Atomic`, `comptime!`, and `match` — the documented, non-silent follow-on. Design:
 `docs/design-line-vector.md`.
 
+### Core `Slice` (addressing views): `arr.slice(a, b)`
+
+```rust
+#[vericl::kernel(
+    assumes(y.len() + 4 <= x.len()),      // the window fits: x is 4 longer than y
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, len(x = n + 4))
+)]
+#[cube(launch)]
+pub fn windowed_slice_sum(x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let mut acc = f32::new(0.0);
+        for v in x.slice(ABSOLUTE_POS, ABSOLUTE_POS + 4) {   // a slice window
+            acc += v;
+        }
+        y[ABSOLUTE_POS] = acc;
+    }
+}
+```
+
+A core `Slice<E, IO>` is a pure **addressing view** `(origin, offset, length)`, not a buffer:
+`arr.slice(a, b)[i]` lowers to a checked `origin[a + i]` — the slice emits no buffer, no metadata, no
+separate id (the prover cannot even distinguish `arr.slice(2,5)[i]` from a hand-written `arr[2+i]`). So
+**bounds proving is the ordinary origin obligation, discharged by the existing walker unmodified**:
+`to_slice()`, dynamic and constant offsets, **nested** slices (offsets compose additively),
+**iteration** (a `RangeLoop` over `origin[offset+i]`), and a **gather through a slice** of an
+element-assumed array (the assume transfers for free by origin-id keying) all `Proved`; unguarded or
+under-constrained variants `Refuted`/`OutOfSubset`.
+
+The reference twin maps a slice to a **Rust subslice** — `arr.slice(a, b)` → `&arr[a..b]`,
+`slice_mut` → `&mut arr[a..b]`, `to_slice()` → `&arr[..]`, `for item in slice` → `for &item in …`. A
+slice introduces **zero numeric ops**, so the twin is **bit-exact** on wgpu and cubecl-cpu. Two Rust
+guarantees become the soundness net that cubecl itself lacks: an out-of-range `&arr[a..b]` **panics** in
+the tested twin (cubecl does *not* bounds-check slice creation), and the **borrow checker is the
+aliasing oracle** — sequential mutable slices compile, but two simultaneously-live overlapping `&mut`
+subslices of one origin do not. Slice type-punning (`as_mut_unchecked`/`downcast*`), reinterpret-slice
+(`with_vector_size`, `vector_size ≠ 0` — also unrunnable on wgpu upstream), and the `View`/`VirtualLayout`/
+`Coordinates` strided-tensor machinery (a separate `Arc<dyn>` abstraction, **not** core `Slice`) are
+rejected with targeted errors. Slices are helper-only, not launch args; a `#[vericl::helper]` taking a
+`&Slice<F>` param (the dominant real usage) maps it to `&[f32]`.
+
+**Honest coverage.** Core `Slice` is the tractable half of the survey's #2 gate — whose "128" is really
+**~25 real core-slice creators + a `ReadOnly`/`ReadWrite`-ident tail + the deferred `View` machinery**
+(the single regex conflated them). It is **necessary but rarely sufficient**: of the ~25 creators, only
+~10 trip no other gate, and every one is an `impl`/`trait`/test-launcher, not a 1-D launch kernel. v1's
+reach is the **slice-carrying elementwise/windowed class + the generalized shortlist + the Vector
+readers**, not the matmul/reduce launch sites. The honest post-`Slice` frontier: `plane_*` reductions,
+then custom cube structs (`CubeType`-arg), then 2-D topology, then `Tensor` + the deferred `View`
+machinery. Design: `docs/design-view-slice.md`.
+
 ### Suites: `vericl::suite!`
 
 ```rust
