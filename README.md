@@ -40,7 +40,7 @@ instead of accumulated.
 | Decision | Choice |
 |---|---|
 | Implementation language | Rust |
-| Kernel substrate | CubeCL (`#[cube]` kernels) |
+| Kernel framework | CubeCL (`#[cube]` kernels) |
 | Authoring experience | Plain CubeCL kernels plus a `#[vericl(...)]` attribute for contracts — no new notation |
 | Point of custody | The annotated Rust kernel function; every other artifact is derived from or checked against it |
 | Kernel identity | Content hash of the expanded CubeCL IR plus the contract plus the toolchain versions |
@@ -58,7 +58,7 @@ point of custody, and a scalar reference implementation can be derived from the 
 rather than hand-maintained alongside it. CubeCL also compiles one kernel through its own IR to
 multiple backends (wgpu/WGSL, CUDA, ROCm/HIP, SPIR-V), so cross-target differential comparison
 falls out of the design rather than being engineered per backend. Its IR is accessible from Rust,
-which gives static checking a well-defined substrate.
+which gives static checking a well-defined foundation.
 
 The cost is coupling to a young, fast-moving project. Mitigations: pin the CubeCL version,
 isolate all IR-facing code in one crate, and treat "survives a CubeCL upgrade" as a recurring
@@ -689,9 +689,9 @@ and evidence. It is done when:
 3. **One proved property** — out-of-bounds freedom is machine-checked for a defined kernel subset
    (affine index expressions, bounded loops, known launch dimensions), with kernels outside the
    subset rejected explicitly rather than silently approximated.
-4. **Honest examples** — at least two example kernels (one Substrate-motivated but independently
-   written, one generic, e.g. a counter-based RNG or prefix sum), each paired with a deliberately
-   defective twin whose defect the appropriate check catches and reports usefully.
+4. **Honest examples** — at least two example kernels (one motivated by a private production kernel
+   but independently written, one generic, e.g. a counter-based RNG or prefix sum), each paired with a
+   deliberately defective twin whose defect the appropriate check catches and reports usefully.
 
 Breadth — more backends, more property classes, richer numeric models, proof assistants — is
 explicitly deferred. A narrow path with honest claims is sufficient.
@@ -712,17 +712,16 @@ explicitly deferred. A narrow path with honest claims is sufficient.
   languages; VeriCL instead meets CubeCL developers in the language they already use and checks
   after the fact.
 
-## Relationship to Substrate
+## Private dogfooding
 
-Substrate is an early adopter supplying kernels with real demands around determinism, indexing,
-replay, and numerical comparison. VeriCL contains no RF-specific concepts, does not require
-Substrate, and must demonstrate its value on at least one unrelated example before claiming
-general usefulness. Substrate-specific policy lives in Substrate or an integration layer.
-
-Substrate kernels inform requirements and are dogfooded against VeriCL privately; proprietary
-Substrate kernel implementations are never committed to this repository. Every example in the
-public validation suite is generic or independently written — "Substrate-motivated" means a
-re-derived kernel exercising the same shape, never a copy.
+VeriCL was developed and validated against a private production RF/signal-processing codebase whose
+kernels place real demands on determinism, indexing, replay, and numerical comparison. That codebase
+is where the requirements came from and where VeriCL is exercised against non-toy kernels — but its
+kernel implementations never enter this repository. Every example in the public validation suite is
+generic or independently written from scratch; a "dogfood-motivated" example is a clean-room kernel
+that re-derives the same *shape*, never a copy. VeriCL itself carries no domain-specific concepts,
+does not depend on that codebase, and must demonstrate its value on unrelated examples before
+claiming general usefulness.
 
 ## Non-goals
 
@@ -750,7 +749,7 @@ Material choices get recorded with their alternatives and the claim boundary the
 
 ## Naming
 
-**VeriCL** = verification for CubeCL. The `-CL` suffix deliberately ties the name to the substrate
+**VeriCL** = verification for CubeCL. The `-CL` suffix deliberately ties the name to the foundation
 this project committed to rather than staying backend-neutral; it was chosen only after the
 CubeCL-only scope (see "Locked decisions") was locked in. The tagline — *one kernel contract,
 equivalent implementations* — is now literal: one annotated CubeCL kernel, with its reference

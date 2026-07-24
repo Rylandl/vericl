@@ -229,7 +229,7 @@ caught deterministically.
    design. `Contract`/`ContractRecord` gained `instantiate: &[&str]`/`Vec<String>`
    (`#[serde(default)]` on the record field so evidence written before this feature still
    loads).
-   Private validation (per the README's Substrate policy: never committed, described here only
+   Private validation (per the README's private-codebase policy: never committed, described here only
    by construct class): one real generic + `#[comptime]` production launch kernel, blocked
    *only* by the generics/comptime gate (no composition, no shared-memory topology) per the
    survey, passed differentially on wgpu end-to-end across 5 sizes after `instantiate(...)`
@@ -249,8 +249,8 @@ caught deterministically.
    `tested`+`proved` claims); `conform demo-defects` exits 0; the stale-evidence cycle (mutate
    `fir3`'s guard → fails naming both hashes → revert → passes) exercised end to end; the
    no-instantiate and unused-instantiate errors demonstrated in the scratchpad (not committed);
-   the private dogfood suite (`mulhilo32_kernel`, `philox4x32_two_kernel`,
-   `synth_freqshift_cw_kernel`) green end to end, `dogfood-rejects` still fails to build with
+   the private dogfood suite (`mulhilo32_kernel`, `philox4x32_two_kernel`, and a
+   cos/sin synthesis kernel) green end to end, `dogfood-rejects` still fails to build with
    its generics-blocked kernel now naming the *new* targeted "add instantiate(...)" error
    instead of the old blanket one (confirming the replacement fires correctly) while its
    topology-blocked variant is unaffected.
@@ -425,7 +425,7 @@ caught deterministically.
    (both lanes: wgpu, and cpu feature); a cooperative defective twin `block_sum_reduce_racy` (the
    overlapping `tile[tid] += tile[tid+1]` stride) REFUTES `smt-race-freedom` with a two-thread
    counterexample (`t1 == t2 + 1`) in `conform demo-defects`, exit 0. Private dogfood: the
-   production `Σ|iq|²` reduction shape (`reduce_rssi`) annotated cooperative + instantiate + full
+   production `Σ|iq|²` reduction shape annotated cooperative + instantiate + full
    contract lands the whole triple on the real shape (5 documented adaptations, 2 new walls —
    comptime loop bound, caller-supplied grid width — and the predicted fma tolerance finding; see
    `docs/dogfood-2026-07.md` shared-memory addendum, and `vericl-dogfood`). Resolves the README
@@ -587,11 +587,11 @@ caught deterministically.
    (prover-only positive/negative pair above, not suite-wired — mirrors the existing
    `stepped_loop_*` precedent for a kernel that exists purely to pin a prover finding).
 
-   **Private dogfood validation** (per the README's Substrate policy: never committed, described
+   **Private dogfood validation** (per the README's private-codebase policy: never committed, described
    here only by construct class): the survey's own "inner-loop-with-single-helper shape"
-   candidate — `fir_conv_two_chain` (a `#[cube]` device fn Substrate's own source already calls
+   candidate — a two-chain FIR-convolution device fn (which the private source itself already calls
    "the first proof that #[cube] Level-1 composition works") and `inner_loop_kernel` (the
-   `#[cube(launch)]` entry point that calls it exactly once) from `substrate-kernels/src/lib.rs` —
+   `#[cube(launch)]` entry point that calls it exactly once) from the private kernel crate —
    generic (`F: Float`), one `#[comptime]` param, exactly one helper call, no shared memory, per
    the survey's own gap ranking the least-blocked composed shape. Copied UNCHANGED (no adaptation
    needed for either body) and passed differentially on wgpu end-to-end across 5 sizes. Its bounds
@@ -611,7 +611,7 @@ caught deterministically.
    device-fn-calling-device-fn cubecl limitation, not a general composition one; noted for a
    future README update if a public helper-calling-helper example ever wants the more natural
    form. Separately, and NOT a composition finding: running the full private dogfood suite
-   surfaced that `instantiate_subset.rs`'s `synth_freqshift_cw_kernel_bounds_proof_is_out_of_subset_div_mod`
+   surfaced that `instantiate_subset.rs`'s cos/sin-synthesis-kernel div/mod bounds-proof-out-of-subset
    test (written for roadmap item 5's div/mod prover milestone, before div/mod modeling existed)
    now returns `Refuted` instead of its hardcoded `OutOfSubset`-or-`Proved` expectation, because
    that milestone's div/mod modeling has since landed and this specific test passes zero
@@ -638,7 +638,7 @@ caught deterministically.
    hardening) — DONE. One CRITICAL confirmed bug, one MEDIUM, one LOW, plus a docs-only finding
    pair; all four fixed and regression-tested. Same posture as the round-1 review above: every
    fix closes a real, demonstrated hole rather than a hypothetical one — the reviewer's scratch
-   repro crate (path-deps on this repo, never committed here per the Substrate-scratch precedent)
+   repro crate (path-deps on this repo, never committed here per the private-scratch precedent)
    reproduced each bug against the pre-fix build and was re-run against the fixed build to confirm
    the new verdict.
 
@@ -986,9 +986,9 @@ caught deterministically.
     `GPU_HARDWARE_TRUST` for `HOST_HARDWARE_TRUST` + `shared_frontend_lane_trust` on the primary lane).
 
     **Private dogfood** (`vericl-dogfood`, never committed; reported by construct class only): the
-    production `synth_freqshift_cw` pure-cos/sin shape — whose Substrate validation story IS f64-based
-    (`substrate-kernels/tests/cubecl_cpu_f64_proof.rs`: cos/sin bit-exact to host libm at f64 on
-    cubecl-cpu) — annotated `instantiate(F = f64)` as `synth_freqshift_cw_kernel_f64` (identical body
+    production pure-cos/sin synthesis shape — whose private validation story IS f64-based
+    (a private cubecl-cpu f64 proof: cos/sin bit-exact to host libm at f64 on
+    cubecl-cpu) — annotated `instantiate(F = f64)` as a pinned-f64 instance (identical body
     to the existing f32 clean-room kernel; only the pinned type changed). `tests/f64_cpu.rs` (new
     `cpu` feature) validates three ways: (1) differential on cubecl-cpu vs the f64 twin passes across
     sizes; (2) bounds PROVED with declared comptime-implied lengths (4 obligations); (3) the twin is
@@ -1045,7 +1045,7 @@ caught deterministically.
     composition control); `gather_oob` (stale const bound `< 16` vs `x.len() == 8`, a `conform`
     demo-defect that REFUTES with `elem == x.len()`).
 
-    **Private dogfood** (Substrate policy — construct classes only). The offset-table source-anchor
+    **Private dogfood** (private-codebase policy — construct classes only). The offset-table source-anchor
     shape from a production coherent-accumulate primitive: the pure gather core `source[offsets[i]]`
     PROVES (3 obligations, no adaptation beyond the assume); the faithful additive anchor
     `out_idx + offsets[e]` is honestly REFUTED (the element assume bounds the offset but not the
@@ -1207,7 +1207,7 @@ caught deterministically.
     vs the pre-change 53 in 0.12s — the added `ite`s and side-obligations are cheap; z3 collapses the
     wrap `ite` under path facts. No kernel proof approaches a second.
 
-    **Private dogfood spot-check** (Substrate policy: `~/code/substrate` READ ONLY, `~/code/vericl-dogfood`
+    **Private dogfood spot-check** (private-codebase policy: the private source READ ONLY, `~/code/vericl-dogfood`
     writable-private, construct classes only): reran the production kernels' bounds/race/cooperative
     proofs against the overflow-model prover. **No production kernel flipped verdict** — the
     counter-RNG, div/mod-index, offset-table-gather, composition, and cooperative-reduction shapes all
@@ -1324,10 +1324,10 @@ caught deterministically.
     byte-identical** — `git status` shows only `prover.rs` modified, no `evidence/*.json` touched
     (`ir_hash`/`source_hash` are macro/IR-derived, untouched by a prover change), and the suite's
     evidence-verify lanes pass without `VERICL_UPDATE`. **Private dogfood re-verified unchanged**
-    (`vericl-dogfood`, path-dep on this checkout; Substrate IP rules — construct classes only, no
-    committed IP): the cooperative `reduce_rssi` still `Proved` bounds(oob)=8 race=8 (ww=3 rw=4
+    (`vericl-dogfood`, path-dep on this checkout; private-codebase IP rules — construct classes only, no
+    committed IP): the cooperative grid-stride reduction still `Proved` bounds(oob)=8 race=8 (ww=3 rw=4
     intercube=1) uniformity=2 phases=3, whole `dogfood-kernels` suite green (composition, instantiate,
-    prover_subset, shmem_probe/min/conformance/reduce_rssi); `dogfood-rejects` still fails `cargo
+    prover_subset, shmem_probe/min/conformance/reduction); `dogfood-rejects` still fails `cargo
     build` by design (compile-fail fixtures, unaffected by a prover-runtime change). All five rounds'
     regression tests green.
 
@@ -1348,7 +1348,7 @@ suite degrades to the labeled assumed-race-freedom tier, never a false Proved.
 
 ## Ecosystem survey (2026-07-23) — tracel-ai's own CubeCL kernel libraries
 
-Public-code counterpart to the private Substrate dogfood — full report in
+Public-code counterpart to the private dogfood — full report in
 `docs/ecosystem-survey-2026-07.md`. Ran VeriCL against tracel-ai's open-source kernel
 libraries at VeriCL's pinned `cubecl = "=0.10.0"`. Work in a sibling workspace
 (`/Users/ryland/code/vericl-ecosystem-survey`); no vericl-repo source changes beyond the
@@ -1370,11 +1370,11 @@ the "proven this shape before" premise — it is `xorshift_step`/`mix_u32`-shape
 (cubek-random 1, cubek-reduce 2, cubek-matmul 4, cubek-std 0, cubek-conv 0) and all maximally gated
 — the annotatable content is the reusable scalar device helpers underneath, not the dispatch sites.
 
-**THE HEADLINE — the frontier flipped vs Substrate.** Substrate found *zero* `Line`/`Vector`/
-`Slice`/`plane_*`/`Atomic`/`Tensor` and withdrew Tensor/2-D speculation (correct for Substrate). The
+**THE HEADLINE — the frontier flipped vs the private codebase.** The private dogfood found *zero* `Line`/`Vector`/
+`Slice`/`plane_*`/`Atomic`/`Tensor` and withdrew Tensor/2-D speculation (correct for that codebase). The
 ecosystem's own libraries are the mirror image: `Line`/`Vector` is the #1 gap, `View`/`Slice` #2. The
-two disagree because they occupy different layers (Substrate: 1-D scalar app kernels; cubek/cubecl:
-the vectorized tensor-algebra substrate). **Recommended next milestone: `Line`/`Vector` element
+two disagree because they occupy different layers (private codebase: 1-D scalar app kernels; cubek/cubecl:
+the vectorized tensor-algebra layer). **Recommended next milestone: `Line`/`Vector` element
 support (twin = length-N lane array; per-lane compare; bounds over the outer index), scoped first to
 1-D vectorized elementwise + reduction shapes where the topology/proof machinery already exists, with
 `View`/`Slice` as the immediate follow-on.** This is the change that converts "VeriCL proves the

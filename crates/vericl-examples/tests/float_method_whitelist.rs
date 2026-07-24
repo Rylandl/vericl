@@ -135,7 +135,7 @@ fn rejected_methods_panic_on_host() {
     assert!(panics(|| x.dot(y)), "dot did not panic on host");
 
     // Found by dogfooding against a real generic kernel
-    // (substrate-kernels::synth_freqshift_cw's `F::cast_from(index)` idiom):
+    // (a production kernel's `F::cast_from(index)` idiom):
     // `Cast::cast_from`'s only impl is a blanket `unexpanded!()`, so it
     // panics for every type, not just f32 — same for `Reinterpret::reinterpret`.
     let idx: usize = 3;

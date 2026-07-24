@@ -71,7 +71,7 @@
     {
       "kernel": "xorshift_step",
       "identity": {
-        "source_hash": "sha256:b748fe8701dde5ce7bc99e85c3930cb3763be310b936436193e08d8feb520e24",
+        "source_hash": "sha256:f10134cbf67aaebd55baa8e294951a8b9fcfda9ce82a24ca3688be3084a0bb91",
         "vericl_version": "0.1.0",
         "ir_hash": "sha256:f50e7a60fcfbe74466759a79523d1a0ddc038ad1c86fd07bb1a09afe2aedcb64"
       },
@@ -985,7 +985,7 @@
     {
       "kernel": "emitter_reduce",
       "identity": {
-        "source_hash": "sha256:9fd23f32071e53674a54caddb40d6b320921857d8d9e272d6a4861c5164e9d12",
+        "source_hash": "sha256:efe4e93161949330e154bdd8497ea65c81baa925d6a1e210fc6e6d554da78d5f",
         "vericl_version": "0.1.0",
         "ir_hash": "sha256:0ed442448daa16a3d738ef5def27a22dc8c6b8b41053754fff200bf6ca9833b3"
       },

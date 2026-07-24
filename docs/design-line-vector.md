@@ -18,7 +18,7 @@ Probe sources are preserved in the scratchpad
 (`scratchpad/linevec/src/bin/{ir,gt,dbg,prove,tycheck}.rs`, `scratchpad/linevec/smt/*.smt2`) and were
 built against a clean `cubecl =0.10.0` crate plus a path-dep on `vericl-ir`. Reference kernels are
 **clean-room / upstream-public** only (cubecl-core's own `runtime_tests/vector.rs`, cubek v0.2.0,
-MIT/Apache-2.0, attributed) — no Substrate source was probed, per the README policy.
+MIT/Apache-2.0, attributed) — no private source was probed, per the README policy.
 
 File:line citations to `crates/vericl-ir/src/prover.rs`, `crates/vericl-macros/src/lib.rs`, and the
 `cubecl-{core,ir}-0.10.0` / `cubek-0.2.0` source trees are current as of `3a0803d`.

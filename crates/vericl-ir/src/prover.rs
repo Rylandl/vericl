@@ -6306,7 +6306,7 @@ mod tests {
         }
     }
 
-    /// `grid_stride_reduce` (guarded store) — the reduce_rssi-shaped reduction:
+    /// `grid_stride_reduce` (guarded store) — the production reduction shape:
     /// a non-cooperative accumulation loop feeding the same tree reduction.
     #[cube(launch)]
     fn prover_test_race_grid_stride_reduce(

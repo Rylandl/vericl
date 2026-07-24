@@ -2,6 +2,10 @@
 
 > One kernel contract. Equivalent implementations.
 
+*Archived historical document from the project's early, backend-neutral ideation phase (working name
+"Equik", since renamed VeriCL). Project names from the private ideation phase have been genericized
+for publication; the content is otherwise left as originally written.*
+
 ## Status
 
 Equik is an exploratory project. This document defines the problem, intended outcomes, boundaries,
@@ -18,9 +22,9 @@ easy for them to disagree while each artifact still appears reasonable in isolat
 give developers one place to express the intended computation and the properties that matter, then
 produce or check the artifacts needed to support clearly bounded claims about the resulting kernel.
 
-Equik is not specific to Substrate, RF simulation, CubeCL, a proof assistant, a programming
-language, or a hardware vendor. Substrate is a motivating consumer and a source of realistic use
-cases, not part of Equik's core domain.
+Equik is not specific to a private production codebase, RF simulation, CubeCL, a proof assistant, a
+programming language, or a hardware vendor. That private production RF/signal-processing codebase is a
+motivating consumer and a source of realistic use cases, not part of Equik's core domain.
 
 ## Vision
 
@@ -185,20 +189,20 @@ not because they permanently define Equik's supported domain. Useful candidates 
 - kernels with boundary-sensitive reads or writes;
 - kernels with exact integer behavior alongside kernels with numerical tolerances.
 
-At least one example should come from outside Substrate before the project claims to be generally
+At least one example should come from outside the private codebase before the project claims to be generally
 useful.
 
-## Relationship to Substrate
+## Relationship to the private codebase
 
-Substrate can act as an early adopter and provide kernels with real demands around determinism,
+The private codebase can act as an early adopter and provide kernels with real demands around determinism,
 indexing, replay, portability, and numerical comparison. An Equik integration may eventually be
-used by Substrate, but:
+used by that codebase, but:
 
 - Equik must not contain RF-specific concepts;
-- Equik must not require Substrate to function;
+- Equik must not require the private codebase to function;
 - Equik's public vocabulary must make sense to unrelated compute projects;
-- Substrate-specific policy should remain in Substrate or an integration layer;
-- success must be demonstrated with at least one non-Substrate use case.
+- domain-specific policy should remain in the private codebase or an integration layer;
+- success must be demonstrated with at least one unrelated use case.
 
 ## Non-goals
 
@@ -213,7 +217,7 @@ Unless the scope is deliberately revised, Equik is not intended to:
 - automatically recover complete intent from arbitrary existing source code;
 - support every execution target, programming language, or verification method;
 - hide assumptions in order to present a simpler correctness badge;
-- become coupled to Substrate's release process or application model.
+- become coupled to the private codebase's release process or application model.
 
 ## First-release outcomes
 
@@ -229,7 +233,7 @@ an executable artifact and its supporting evidence. It is successful when:
 - both successful and intentionally defective examples produce useful reports;
 - the report distinguishes assumptions, proofs, tests, and trusted components;
 - the workflow can be enforced automatically;
-- one Substrate-motivated example and one unrelated example use the same core concepts.
+- one example motivated by the private codebase and one unrelated example use the same core concepts.
 
 The first release does not need broad language, backend, numeric, or proof coverage. A narrow path
 with honest claims is sufficient.
@@ -283,7 +287,7 @@ Before committing to a design, the implementing agent should answer:
 5. How will users see assumptions and unsupported behavior?
 6. How will the prototype demonstrate that its evidence becomes invalid when an artifact drifts?
 7. What would be required to add a second execution target without changing kernel meaning?
-8. What example outside Substrate will challenge the same core abstractions?
+8. What example outside the private codebase will challenge the same core abstractions?
 9. Which apparent guarantees must the project explicitly decline to make?
 10. What evidence would justify proceeding beyond the exploratory release?
 

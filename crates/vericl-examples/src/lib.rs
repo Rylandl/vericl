@@ -156,7 +156,7 @@ pub fn fir3_alt<F: Float>(x: &Array<F>, y: &mut Array<F>, #[comptime] taps: u32)
 }
 
 /// One xorshift32 step per element — integer, bit-exact, RNG-flavored
-/// (the non-Substrate-shaped example).
+/// (the generic, non-dogfood-shaped example).
 #[vericl::kernel(
     assumes(x.len() == y.len()),
     compare(exact)
@@ -1023,7 +1023,7 @@ pub fn composed_sq_reduce(input: &Array<f32>, output: &mut Array<f32>) {
 }
 
 /// `emitter_reduce` — the acceptance example for the cooperative v1.1
-/// extensions, the `emitter_powers_multi_rx` shape (docs/design-shared-memory.md
+/// extensions, the multi-receiver reduction shape (docs/design-shared-memory.md
 /// §3, minus its 2-D dispatch) reduced to 1-D: it exercises **all three v1.1
 /// cooperative extensions at once**, plus shared memory.
 ///
@@ -1043,7 +1043,7 @@ pub fn composed_sq_reduce(input: &Array<f32>, output: &mut Array<f32>) {
 /// sums in the identical order; padding cubes leave the zero-initialised output
 /// untouched on both lanes. Bounds prove (the store keeps its explicit
 /// `CUBE_POS < output.len()` guard) and the shape is race-free. The only
-/// `emitter_powers` feature left out is 2-D dispatch (per the milestone scope).
+/// multi-receiver-reduction feature left out is 2-D dispatch (per the milestone scope).
 #[vericl::kernel(
     assumes(input.iter().all(|v| v.abs() <= 100.0)),
     compare(max_ulp = 0),
@@ -1083,7 +1083,7 @@ pub fn emitter_reduce(input: &Array<f32>, output: &mut Array<f32>, #[comptime] n
     }
 }
 
-/// `grid_stride_reduce` — the `reduce_rssi`-shaped reduction (docs/design-
+/// `grid_stride_reduce` — the production reduction shape (docs/design-
 /// shared-memory.md §3): a *non-cooperative* grid-stride accumulation loop
 /// (`while k < data.len()`, no barrier inside — the shape §4 requires be
 /// transformable, appearing before the first barrier) squares and sums a
@@ -1095,7 +1095,7 @@ pub fn emitter_reduce(input: &Array<f32>, output: &mut Array<f32>, #[comptime] n
 /// NOT wired into `vericl::suite!` (unlike `block_sum_reduce`): the cubecl-cpu
 /// backend does not support the `CUBE_COUNT` builtin ("Unsupported builtin was
 /// used: CubeCount"), so this kernel cannot run on the suite's `--features cpu`
-/// lane — exactly the portability reason the production `reduce_rssi` passes the
+/// lane — exactly the portability reason the production reduction kernel passes the
 /// grid width as an explicit runtime scalar rather than reading `CUBE_COUNT`.
 /// It remains fully covered: bit-exact vs wgpu in `tests/cooperative.rs`, and
 /// race-free + in-bounds proved in `grid_stride_reduce_definition_is_race_free`.

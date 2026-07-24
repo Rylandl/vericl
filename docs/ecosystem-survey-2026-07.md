@@ -1,9 +1,10 @@
 # Ecosystem survey — tracel-ai's own CubeCL kernel libraries (July 2026)
 
 VeriCL was run against tracel-ai's **open-source** CubeCL kernel libraries — the same
-rigor as the private Substrate dogfood (`docs/dogfood-2026-07.md`), but on public code, so
+rigor as the private dogfood against a production RF/signal-processing codebase
+(`docs/dogfood-2026-07.md`), but on public code, so
 findings and construct citations are public with attribution. This survey answers one
-strategic question the Substrate dogfood could not: **when VeriCL meets the CubeCL
+strategic question the private dogfood could not: **when VeriCL meets the CubeCL
 ecosystem's own kernels (not one private RF codebase), which gap is the real frontier?**
 
 Method: map every `#[cube]`/`#[cube(launch)]` function in the targets against VeriCL's v0
@@ -108,17 +109,17 @@ handful of maximally-gated generic launch sites — not a catalogue of standalon
   (`CubeMapping`, `Sequence<FastDivmod>`), not plain arrays/scalars, so they are not
   annotatable. (Counted, not fought, per the brief.)
 
-### The headline: the frontier flipped relative to Substrate
+### The headline: the frontier flipped relative to the private codebase
 
-The private Substrate dogfood found **zero** uses of `Line`/`Vector`, `Slice`, `plane_*`,
+The private dogfood found **zero** uses of `Line`/`Vector`, `Slice`, `plane_*`,
 `Atomic`, `Tensor`, and explicitly *withdrew* Tensor/2-D roadmap speculation as demand-driven
 scoping. tracel-ai's own libraries are the **mirror image**: `Line`/`Vector` is the single
 most common gate (148), `View`/`Slice` second (128), `plane_*` and `Tensor` and cmma all
 heavily present. The two codebases disagree about the frontier because they occupy different
-layers: Substrate writes 1-D application kernels over scalar arrays; cubek/cubecl write the
-*vectorized tensor-algebra substrate* underneath a framework. **For ecosystem reach, the next
+layers: the private codebase writes 1-D application kernels over scalar arrays; cubek/cubecl write the
+*vectorized tensor-algebra layer* underneath a framework. **For ecosystem reach, the next
 frontier is `Line`/`Vector` (+ `View`/`Slice`) support — not the 1-D scalar expansions the
-Substrate survey implied.** See §4.
+private survey implied.** See §4.
 
 ## 2. The shortlist — provable today
 
@@ -205,7 +206,7 @@ One implicit-invariant *observation* outside the annotatable set, worth recordin
 `shared_sum` (`routines/shared_sum.rs:22-27`) documents in prose that *"This doesn't set the
 value of output to 0 before computing… It is the responsibility of the caller"* — a genuine
 undocumented-in-the-type caller obligation, the same "boundary behavior can be implicit" class
-the Substrate dogfood hit. It is not annotatable today (the kernel is `Atomic` + `Vector` +
+the private dogfood hit. It is not annotatable today (the kernel is `Atomic` + `Vector` +
 `View` + generic), so this is a note, not a proof.
 
 ### 3c. Real upstream bugs
@@ -236,7 +237,7 @@ cleanly at macro time with actionable messages, never silently approximated.
 
 ## 4. Recommendation: the next frontier is `Line`/`Vector` (with `View`)
 
-The Substrate dogfood's demand-driven scoping was correct *for Substrate* and drove the right
+The private dogfood's demand-driven scoping was correct *for that codebase* and drove the right
 milestones (generics, composition, div/mod, cooperative reductions) — all of which this survey
 confirms landing cleanly on public code (composition and `instantiate` in particular ran on real
 cubek/cubecl bodies with zero adaptation). But the ecosystem's own libraries send a different,

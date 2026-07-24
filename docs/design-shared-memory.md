@@ -13,8 +13,9 @@ Everything below marked "validated" was checked empirically against the pinned `
 (z3 4.x on PATH), the same posture as [docs/ir-research.md](ir-research.md). Probe sources are
 preserved in the scratchpad (`shmem_probe.rs`, `*.smt2`, `ir_dumps.txt`) and were run in the
 private `vericl-dogfood` workspace (cubecl already compiled there). **Clean-room kernels only** —
-no Substrate source was probed; the two motivating Substrate kernels (`reduce_rssi`,
-`emitter_powers_multi_rx`) are described here by *shape* only, per the README Substrate policy.
+no private source was probed; the two motivating private kernels (a grid-stride sum-of-squares
+reduction and a multi-receiver row-per-workgroup reduction) are described here by *shape* only,
+per the README private-codebase policy.
 
 File:line citations to `crates/vericl-ir/src/prover.rs`, `crates/vericl-macros/src/lib.rs`, and the
 `cubecl-ir-0.10.0` / `cubecl-core-0.10.0` source trees are current as of `397cd60`.
@@ -172,7 +173,7 @@ prover on `grid_stride_reduce` returns `OutOfSubset { reason: "\`Branch::Loop\`
 (unbounded/break-terminated loop) is outside the vericl v0 subset" }` (it hits the grid-stride loop
 before reaching shared memory).
 
-### 2.5 `terminate!()` (used by the second Substrate kernel, deferred)
+### 2.5 `terminate!()` (used by the second private kernel, deferred)
 
 `terminate!()` → `Branch::Return` nested inside a structured `if` (validated):
 
@@ -191,8 +192,8 @@ terminate condition is cube-uniform (else it is barrier divergence). **Deferred 
 
 ## 3. The two motivating shapes (generic description)
 
-Both Substrate kernels — `reduce_rssi` (`resident.rs`) and `emitter_powers_multi_rx` (`truth.rs`) —
-are the **identical reduction skeleton**, which the clean-room probes reproduce faithfully:
+Both private kernels — a grid-stride sum-of-squares reduction and a multi-receiver row-per-workgroup
+reduction — are the **identical reduction skeleton**, which the clean-room probes reproduce faithfully:
 
 ```
 tid = UNIT_POS
@@ -216,13 +217,13 @@ if tid == 0 { out[CUBE_POS] = tile[0] }
 
 Differences that scope the milestone tiers:
 
-- `reduce_rssi` is the **v1 target**: grid-stride over `CUBE_DIM*num_cubes`, one partial per cube,
+- The grid-stride reduction is the **v1 target**: grid-stride over `CUBE_DIM*num_cubes`, one partial per cube,
   no `terminate!()`. `block_sum_reduce`/`grid_stride_reduce` clean-room probes match it.
-- `emitter_powers_multi_rx` adds **v1.1** features: one workgroup per row (`row = CUBE_POS`,
+- The multi-receiver reduction adds **v1.1** features: one workgroup per row (`row = CUBE_POS`,
   block-stride by `CUBE_DIM`), a **workgroup-uniform `terminate!()`** padding guard (its own doc
   argues the guard is workgroup-uniform and precedes every `sync_cube`, so barrier-safe — exactly
   the property B must *prove*, not assume), **2-D dispatch** padding, and **helper composition** in
-  phase 0 (`single_emitter_sample` → `single_tap_sample`, which cube-expansion already inlines into
+  phase 0 (a per-row sample helper calling a per-tap sample helper, which cube-expansion already inlines into
   the scope, so the walker sees it — the existing composition story, README "Kernel composition").
 
 Neither kernel writes shared memory under a non-uniform barrier; both are intra-phase race-free by
@@ -370,7 +371,7 @@ grid_stride_reduce cube_count∈{1,2,4,8,16}, cube_dim=256, n=4096:
 order the GPU does, so at equal precision (f32) it reproduces the value exactly. This is the
 strongest possible evidence that the phase model is faithful: the derived sequential reference is
 not an approximation of the reduction, it *is* the reduction, re-associated in the same order. (A
-kernel whose GPU backend contracts to FMA or reorders — e.g. `reduce_rssi` at `F=f32` vs an `f64`
+kernel whose GPU backend contracts to FMA or reorders — e.g. the grid-stride reduction at `F=f32` vs an `f64`
 reference lane — would need the usual `compare(abs=…)` tolerance, README "First finding"; the
 phase model itself introduces no additional divergence.)
 
@@ -561,12 +562,12 @@ single-writer global store guarded by `tid==0`. Helper composition in phase 0 (a
 
 Workgroup-uniform `terminate!()` (needs a proved-uniform terminate condition + twin "skip cube");
 2-D dispatch padding; barriers inside helpers; multiple shared tiles; inter-cube global races beyond
-the two provable-by-construction cases; the `emitter_powers_multi_rx` full shape (composition +
+the two provable-by-construction cases; the multi-receiver reduction's full shape (composition +
 terminate + 2-D). Each widens an axis of the same design without changing the phase model or the
 two-thread encoding.
 
 > **Status (cooperative v1.1 extensions — IMPLEMENTED).** Three of these axes
-> now land, together, on the `emitter_powers_multi_rx` shape (minus 2-D):
+> now land, together, on the multi-receiver reduction shape (minus 2-D):
 > - **`#[comptime]` parameters** in a cooperative kernel — cube-uniform by
 >   construction, threaded through the phase-split twin as `let` consts and baked
 >   into the IR (the easiest uniformity case; no phase-splitter interaction).
@@ -584,11 +585,11 @@ two-thread encoding.
 >   guard, un-banned in cooperative mode only). The twin models it as a cube-level
 >   `continue`; the prover as a `!cond` path condition (uniformity verified by the
 >   thread-varying taint machinery, before-any-barrier enforced), which is
->   **load-bearing** for the single-writer store bound in `emitter_powers`
+>   **load-bearing** for the single-writer store bound in the multi-receiver reduction
 >   (`powers[CUBE_POS]` with no explicit guard). Non-uniform or post-barrier
 >   terminate stays rejected on both lanes.
 >
-> Still deferred: **2-D dispatch padding** (the one `emitter_powers_multi_rx`
+> Still deferred: **2-D dispatch padding** (the one multi-receiver-reduction
 > feature this round does not lift — the kernel body is 1-D in `CUBE_POS`, so a
 > 1-D launch annotates it; 2-D only raises the workgroup ceiling), multiple
 > shared tiles, barriers inside helpers, and wider inter-cube races.
@@ -645,7 +646,7 @@ kernel evidence entry shows the `proved`+`tested`(+discharged-dependency) triple
 declared-reference kernel records the weaker check string.
 
 **M7 — Public example + private dogfood.** A clean-room `block_sum_reduce` public example wired into
-`vericl::suite!` carrying `tested`+`proved`(race-freedom)+`proved`(bounds); dogfood `reduce_rssi`
+`vericl::suite!` carrying `tested`+`proved`(race-freedom)+`proved`(bounds); dogfood the grid-stride reduction
 privately (construct-class only, per README policy) to confirm the real shape lands. *Verify*: suite
 green, evidence regenerated last; dogfood differential + both proofs pass on the real reduction
 shape.
@@ -714,6 +715,6 @@ shape.
   (`differential-declared-reference`) for the author-supplied-reference fallback — kept strictly
   distinct from the derived twin.
 - **Does not** need QF_BV, the `f64` tier, or 2-D dispatch — all obligations are QF_LIA, and the v1
-  subset is 1-D f32, matching everything else in vericl v0. The `emitter_powers_multi_rx` full shape
+  subset is 1-D f32, matching everything else in vericl v0. The multi-receiver reduction's full shape
   (composition + `terminate!()` + 2-D) is a well-scoped v1.1 that widens axes without touching the
   phase model or the two-thread encoding.

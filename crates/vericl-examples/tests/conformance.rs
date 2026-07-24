@@ -42,7 +42,7 @@ vericl::suite! {
         // `grid_stride_reduce` is deliberately NOT suite-wired: it reads the
         // `CUBE_COUNT` builtin for its grid stride, which the cubecl-cpu backend
         // does not support ("Unsupported builtin was used: CubeCount") — exactly
-        // why the production `reduce_rssi` passes the grid width as a runtime
+        // why the production reduction kernel passes the grid width as a runtime
         // scalar instead. It stays a fully-tested clean-room example (bit-exact
         // vs wgpu in `tests/cooperative.rs`; race-free + in-bounds proved in the
         // lib unit tests), just outside the multi-LANE suite so the cpu lane
@@ -64,7 +64,7 @@ vericl::suite! {
         // evaluated at expansion (extra is #[comptime]-pinned) and used as a
         // shift amount. Exact u32 + proved bounds.
         comptime_shift,
-        // Cooperative v1.1 acceptance example — the `emitter_powers_multi_rx`
+        // Cooperative v1.1 acceptance example — the multi-receiver reduction
         // shape (minus 2-D dispatch): a #[comptime] `n_emitters`, a `uses(...)`
         // helper in phase 0 (`square_sample`), and a workgroup-uniform
         // `terminate!()` padding guard, all at once. Carries the full triple

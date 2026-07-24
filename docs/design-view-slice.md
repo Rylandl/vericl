@@ -20,7 +20,7 @@ Probe sources are preserved in the scratchpad
 (`scratchpad/linevec/src/bin/{sliceir,sliceprove,reinterp,slicegt}.rs`,
 `scratchpad/viewslice/{slice_tile_offset*.smt2,split.py}`), built against a clean `cubecl =0.10.0`
 crate plus a path-dep on `vericl-ir`. Reference kernels are **clean-room / upstream-public** only
-(cubecl-core's own `runtime_tests/slice.rs`, MIT/Apache-2.0, attributed) — no Substrate source was
+(cubecl-core's own `runtime_tests/slice.rs`, MIT/Apache-2.0, attributed) — no private source was
 probed, per the README policy.
 
 File:line citations to `crates/vericl-ir/src/prover.rs`, `crates/vericl-macros/src/lib.rs`, and the

@@ -1,7 +1,7 @@
 # Dogfood findings — July 2026
 
 VeriCL was run against a private production CubeCL codebase (22 kernels, RF signal-processing
-domain; implementations stay private per the Substrate policy in the README — this document
+domain; implementations stay private per the private-codebase policy (README) — this document
 records only generic construct classes and counts). Method: survey every kernel's shape against
 VeriCL's v0 gates; annotate a coverage-selected subset in a private sibling workspace; run the
 full suite (differential on wgpu/Metal + SMT bounds proofs) where possible; record exact
@@ -109,7 +109,7 @@ write-write, 4 read-write, 1 inter-cube single-writer; 3 phases, 2 barrier-unifo
 real acceptance test for the milestone passing on the real shape, not just the clean-room example.
 
 Five adaptations were needed, each a genuine subset boundary the exercise surfaced (construct
-classes only, per the Substrate policy):
+classes only, per the private-codebase policy):
 
 1. **Comptime loop bound → buffer-derived.** The cooperative subset rejects `#[comptime]`
    parameters; a comptime element-count loop bound had to become `let n = buf.len() / K` derived
@@ -149,7 +149,7 @@ classes only, per the Substrate policy):
 
 The array-value-dependent-index gap was closed with element-range `assumes(...)` (this table's own
 suggestion), and validated against a real offset-table shape from the private workspace (construct
-classes only, per the Substrate policy):
+classes only, per the private-codebase policy):
 
 - **Pure offset-table gather PROVES.** A production coherent-accumulate primitive reads a per-emitter
   source anchor out of a `&Array<u32>` offset table and uses it as a source index. Distilled to its
