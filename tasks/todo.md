@@ -1652,3 +1652,80 @@ subset`, `add_overflow_guard_refutes`, `cooperative_abspos_guard_cubepos_index_r
 `shifted_read_selfguard_refutes_at_type_max`, `elem_assume_truncating_cast_chain_is_string_only`,
 `uses_rewrite_fold_rewrites_parenthesised_helper_call`, `gather_copy_is_not_provable_without_
 element_assume`).
+
+## Line/Vector element milestone — V1–V6 DONE (2026-07-23)
+
+Delivered `Vector<P, N>` support for the **vectorized elementwise class** per
+`docs/design-line-vector.md` (the ecosystem survey's #1 gate, 148/464 device items). At the pins it is
+`Vector<P, N>` with a **comptime** width (not the pre-0.10 launch-dynamic `Line<T>`), so it pins per
+contract via `instantiate(N = W)` exactly as a generic float pins via `instantiate(F = f32)`. Six
+milestones; round-8 will attack this work, so every positive has a negative control.
+
+**V1 — soundness guard + prover confirmation (prover).** `is_modeled_int` now requires
+`ty.vector_size() == 1` (`crates/vericl-ir/src/prover.rs`): `Type::Vector(u32,N).is_int()` is `true`
+(a vector's *storage* is integer), so without the guard a 4-lane vector was eligible to be modeled as
+ONE scalar SMT `Int` — the design's pre-registered round-8 risk 1. Whole-vector indexing lowers to
+`vector_size: 0` (width in the list's `Type`) and `.len()` is line-granular, so the bounds obligation
+is the scalar one unmodified — `N` never enters it. Tests: `is_modeled_int_rejects_vector_integers`
+(predicate), `whole_vector_vec_add_proves`/`..._unguarded_refutes`, `vector_offsets_gather_is_out_of_
+subset` (a `Vector<u32,N>` value under `ElemsBelowConst` lands `OutOfSubset`, never a vacuous per-lane
+bound).
+
+**V2 — the `vericl::Line<T,W>` shim + GPU ground truth (core + test).** `crates/vericl/src/line.rs`:
+`Line<T, W>` = `[T; W]`, every op a per-lane map, the full v1 op surface (arith/bitwise, splat/ctor,
+per-lane compare → `Line<bool,W>`, `count_ones`, width query, lane index, the per-lane float-math
+whitelist). Every op **GPU-ground-truth-verified** bit-exact against a real `Vector<_,N>` kernel on
+wgpu (+cpu) — `crates/vericl-examples/tests/line_shim_gpu_ground_truth.rs`. Finding: Metal `f32 /` is
+not correctly-rounded (≤1 ULP), reclassified to the vec==scalar tier (GPU vec op == GPU per-lane
+scalar op, bit-exact) with a ≤2-ULP twin bound — the same legitimate float gap `compare(abs=…)` covers.
+
+**V3 — vector recognition + `instantiate(N=W)` (macro).** `Array<Vector<F,N>>` params recognized;
+twin element mapped to `&[::vericl::Line<F,W>]`; the `Vector` head rewritten to `::vericl::Line` in
+twin bodies (so `Vector::new(s)` splat → `Line::new(s)`); the IR face uses `Vector<F, Const<W>>`; the
+`Vector` ban lifted only under the vector gate. Cross-lane reduces (`dot`/`magnitude`/`normalize`)
+rejected by name; unpinned width rejected with the targeted "add `instantiate(N = W)`" message.
+
+**V4 — vectorized launch/I/O + gen + compare (macro + core).** `build_vector_conformance_items`
+(`crates/vericl-macros/src/lib.rs`): scalar I/O throughout (design §4.4) — `gen` draws `lines*W` flat
+scalars per array reshaped to `Line`s, buffers sized `lines*W`, the `launch` splices `W` as the
+vectorization `usize` after `cube_dim` (a `Size` generic is monomorphized OUT of the launch turbofish,
+unlike `expand` — the `launch_generic_types` field), readback flat, twin `Line` output flattened, the
+flat-scalar compare reports a divergence per lane `(line = i/W, lane = i%W)`. New evidence config
+`differential_vector_config` records `vector_width` + `sizes_unit: "lines"`; the kernel module exposes
+`VECTOR_WIDTH`, which `suite!` reads to select it. Conformance element-type gate: only f32/f64 vector
+outputs (§8.3); mixed scalar/vector-array kernels rejected. Examples: clean-room `vec_add`,
+`vec_scale` (splat), `vec_madd` (`a*a+b`, the explicit FMA-contraction `compare(abs=…)` tolerance
+example — probe: 259/1028 lanes diverge bit-exact, covered by abs). Tests
+(`crates/vericl-examples/tests/vector_conformance.rs`): `vec_add`/`vec_scale`/`vec_madd` conformance
+passes on wgpu (+cpu) across sizes; `vec_add_off_by_one` (`<= out.len()`) caught (reference panic);
+`vec_madd_bitexact` (`compare(max_ulp=0)`) caught with the lane NAMED (`out[line=244, lane=0]`).
+Macro-gate tests: integer-vector output rejected, mixed-array rejected, `gen` on a vector kernel now
+accepted.
+
+**V5 — per-lane comptime-unroll acceptance + public example (prover + suite).** The prover now accepts
+a comptime-unrolled `for j in 0..W` affine-in-lane write into a **register** vector: `register_vector_
+lane` + `constant_lane_index` route a `LocalConst`/`LocalMut` `Vector` list with a `Constant` lane
+index to `process_register_lane`, which carries NO buffer obligation and taints the lane value (model
+(b), lane contents unmodeled) — the only per-lane shape the 148 use (IR validated: the unrolled `v[j]`
+lowers to `index: Constant(UInt(j))`). A **data-dependent** (runtime) register-vector lane index is
+`OutOfSubset` with the §8.3 "only comptime-unrolled lane loops" message; a per-lane loaded value used
+to index another array (`x[v[j]]`) refuses at the global index — never a bound minted from a vector
+value. Tests: `lane_unroll_comptime_pattern_proves` (`Proved{1}`), `lane_runtime_index_is_out_of_
+subset_with_targeted_message`, `lane_divergent_gather_is_out_of_subset`. `vec_add` wired into
+`vericl::suite!` at `N=4`: `tested` (bit-exact per-lane differential) + `proved` (3-obligation
+line-granular bounds), width recorded in the claim config; suite green, evidence regenerated (only the
+`vec_add` entry added — existing 16 entries byte-identical).
+
+**V6 — survey-kernel generalization (dogfood).** The shortlist's already-provable f32 elementwise
+`to_degrees_map` re-annotated at its real `Vector<f32, 4>` element type in the survey workspace
+(`vericl-ecosystem-survey/annotated`, non-destructive: modified in place, generated/confirmed, then
+restored byte-identical). `to_degrees_map_vec` carries the full pair — `tested` (per-lane differential,
+`vector_width=4`) + `proved` (2-obligation bounds), `instantiate: N=4`; the scalar `to_degrees_map`
+still proves. "Proves the scalar core" becomes "proves the vectorized kernel" for the elementwise class.
+
+**Honest reach (design §0.5, §12, non-soundness).** Vector is the #1 *gate incidence* but only 13/148
+items trip it ALONE (mostly framework impls). v1 generalizes the provable elementwise shortlist to its
+true vector element type; the whole-kernel unlock (reductions/matmul launch sites) needs `View`/`Slice`
+(#2 gap) + `Atomic` + `comptime!` + `match` — a documented, non-silent boundary. Deferred with targeted
+rejections: cross-lane reductions, `SharedMemory<Vector>`, reinterpret-slice (`vector_size≠0`), vector
+`cast_from`/`wrapping`, single-clause width sweep.

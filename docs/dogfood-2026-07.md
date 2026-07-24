@@ -42,7 +42,11 @@ Tier 2 — prover gates (twin + differential fine; proof honestly unavailable):
 
 Notable non-findings: zero uses of `Tensor`, `Line`/`Vector`, `Slice`, `plane_*`, or `Atomic`;
 all dispatch is 1-D in-kernel. Earlier roadmap speculation about Tensor/2D support is
-**withdrawn** — demand-driven scoping working as intended.
+**withdrawn** — demand-driven scoping working as intended. **[Vector superseded, 2026-07]** the
+broader ecosystem survey (`docs/ecosystem-survey-2026-07.md` §1) later found `Vector<P, N>` to be the
+**#1 gate incidence** across tracel-ai's own kernel libraries (148/464 device items), so it graduated
+from non-finding to a delivered milestone — see the Line/Vector addendum below and
+`docs/design-line-vector.md`.
 
 Latent soundness gap found and fixed: `terminate!()` was absent from the banned-construct list;
 outside `#[cube]` it expands to an empty block, so a twin would silently fall through a
@@ -169,3 +173,28 @@ classes only, per the Substrate policy):
 - **Gen ergonomics validated.** Neither distilled kernel needed a `gen(offsets in …)` clause: the
   element bound derives the offset table's generation range (`[0, source.len())`) automatically, so the
   differential lane draws satisfying tables from the single `assumes(...)` statement.
+
+## Addendum (Line/Vector element milestone, July 2026)
+
+The `Vector<P, N>` SIMD element type — the ecosystem survey's #1 gate incidence (148/464 device items,
+`docs/ecosystem-survey-2026-07.md` §1) — was delivered for the **vectorized elementwise class**, per
+`docs/design-line-vector.md` (V1–V6). At the pinned versions it is `Vector<P, N>` with a **comptime**
+width `N` (not the pre-0.10 launch-dynamic `Line<T>`), so it pins per contract exactly as `instantiate`
+already pins a generic float. Landed as six milestones:
+
+| Row | Status | Notes |
+|---|---|---|
+| **Whole-vector 1-D bounds** | **supported** | Proved *unmodified*: whole-vector indexing lowers to `vector_size: 0` (width in the list's `Type`) and `.len()` is line-granular, so the obligation is the scalar one — `N` never enters it. Plus the **one** soundness guard: `is_modeled_int` now requires `vector_size() == 1`, so a `Vector<u32, N>` value (whose *storage* `is_int()`) can never be modeled as a single scalar SMT `Int` (round-8 risk 1). |
+| **Pinned lane-array twin** | **supported** | `vericl::Line<T, W>` = `[T; W]`, every op a per-lane map, each **GPU-ground-truth-verified** bit-exact against a real `Vector<_, N>` kernel on wgpu (+cpu) — `tests/line_shim_gpu_ground_truth.rs`. Finding: Metal `f32 /` is not correctly-rounded (≤1 ULP), the same legitimate float divergence a scalar `/` has, covered by `compare(abs=…)`. |
+| **Vectorized launch / I/O + gen + compare** | **supported** | Scalar I/O throughout: `gen` draws `lines*W` flat scalars per array, buffers sized `lines*W`, the launch splices `W` as the vectorization, the flat-scalar compare reports a divergence per lane `(line = i/W, lane = i%W)`. `vec_madd` (`a*a+b`) is the explicit FMA-contraction tolerance example. |
+| **Per-lane comptime-unroll** | **supported** | A comptime-unrolled `for j in 0..W` affine-in-lane write into a *register* vector proves (constant lane index into a register vector carries no buffer obligation, lane contents tainted). A **data-dependent** (runtime) register-vector lane index, and a per-lane value used to index another array, stay `OutOfSubset` — the only per-lane shape the 148 use is the comptime-unrolled one. |
+| **Public example** | **supported** | Clean-room `vec_add` wired into `vericl::suite!` at `N = 4`: `tested` (bit-exact per-lane differential) + `proved` (3-obligation line-granular bounds), the pinned width recorded in the claim config. |
+| **Survey-kernel generalization (V6)** | **validated** | The shortlist's already-provable f32 elementwise `to_degrees_map` re-annotated at its real `Vector<f32, 4>` element type in the survey workspace: the full `tested` (per-lane, width 4) + `proved` (2-obligation bounds) pair — "proves the scalar core" becomes "proves the vectorized kernel" for the elementwise class. |
+
+Honest reach (design §0.5, §12): Vector is the #1 *gate incidence* but rarely the *only* gate — only
+13/148 items trip it alone, mostly framework impls. v1's value is **generalizing the already-provable
+elementwise shortlist to its true vector element type**; the whole-kernel unlock (reductions/matmul)
+needs `View`/`Slice` (the #2 gap) + `Atomic` + `comptime!` + `match`, a documented, non-silent boundary.
+Deferred with targeted rejections: cross-lane reductions (`dot`/`magnitude`/`normalize`, GPU-defined
+summation order), `SharedMemory<Vector>` cooperative reductions, reinterpret-slice (`vector_size≠0`),
+vector `cast_from`/`wrapping`, and a single-clause width sweep.

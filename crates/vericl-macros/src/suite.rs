@@ -469,11 +469,19 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
                 }
             } else {
                 // ---- Ordinary (non-cooperative) pipeline ----
+                // A vector kernel records its pinned lane width in the config
+                // (design-line-vector.md §9) so the `sizes` read as line counts
+                // and a re-run at a different width is a visibly different claim.
+                let __config = if let ::core::option::Option::Some(__w) = #kmod::VECTOR_WIDTH {
+                    ::vericl::differential_vector_config(__vericl_sizes, __vericl_seed, __vericl_cube_dim, __w)
+                } else {
+                    ::vericl::differential_config(__vericl_sizes, __vericl_seed, __vericl_cube_dim)
+                };
                 __claims.push(::vericl::Claim {
                     kind: ::vericl::ClaimKind::Tested,
                     check: "differential".to_string(),
                     backend: Some(__vericl_backend.clone()),
-                    config: ::vericl::differential_config(__vericl_sizes, __vericl_seed, __vericl_cube_dim),
+                    config: __config,
                     result: __result,
                 });
 
@@ -641,11 +649,16 @@ fn extra_lane_kernel_block(kernel: &Ident) -> TokenStream2 {
                         result: __result,
                     }
                 } else {
+                    let __config = if let ::core::option::Option::Some(__w) = #kmod::VECTOR_WIDTH {
+                        ::vericl::differential_vector_config(&__extra_sizes, __vericl_seed, __vericl_cube_dim, __w)
+                    } else {
+                        ::vericl::differential_config(&__extra_sizes, __vericl_seed, __vericl_cube_dim)
+                    };
                     ::vericl::Claim {
                         kind: ::vericl::ClaimKind::Tested,
                         check: "differential".to_string(),
                         backend: Some(__vericl_extra_backend.clone()),
-                        config: ::vericl::differential_config(&__extra_sizes, __vericl_seed, __vericl_cube_dim),
+                        config: __config,
                         result: __result,
                     }
                 };

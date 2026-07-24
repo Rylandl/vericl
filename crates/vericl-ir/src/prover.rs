@@ -2038,6 +2038,45 @@ impl<'a, 'b> Prover<'a, 'b> {
         }
     }
 
+    /// A per-lane access into a *register* (local) vector — `v[j]` read or
+    /// `v[j] = …` write where `v` is a `LocalConst`/`LocalMut` `Vector<_, W>`
+    /// (design §2.4). This is **not** a global-buffer access, so it carries no
+    /// buffer-bounds obligation; soundness turns entirely on the lane index:
+    ///
+    /// - **Comptime-unrolled lane** (`j` a `Constant`, `0 <= j < W`) — the design
+    ///   §3 affine-in-lane pattern, the only per-lane shape the surveyed 148 use
+    ///   (§5.4): **in-subset**. The lane *value* is not modeled (model (b) taints
+    ///   lane contents, §5.4), so a read is tainted and a write binds nothing —
+    ///   either way no obligation. A tainted lane value that later reaches a
+    ///   *global* index fails honestly there (`value_of` = `None` ⇒ `OutOfSubset`),
+    ///   never minting a per-lane bound (round-8 risk 1).
+    /// - **Data-dependent lane** (a runtime index) — outside the outer-index-only
+    ///   model (§5.4): rejected with the §8.3 wording. Its counterexample cannot
+    ///   be expressed without lane-content modeling, so `OutOfSubset` is the
+    ///   honest answer, never a `Proved`.
+    fn process_register_lane(
+        &mut self,
+        inst: &Instruction,
+        index: &Variable,
+        width: usize,
+    ) -> Result<(), Stop> {
+        match constant_lane_index(index) {
+            Some(c) if (c as u128) < width as u128 => {
+                self.taint_out(inst);
+                Ok(())
+            }
+            Some(c) => Err(Stop::OutOfSubset(format!(
+                "constant lane index {c} is out of range for a width-{width} register vector — \
+                 outside the vericl v0 subset"
+            ))),
+            None => Err(Stop::OutOfSubset(format!(
+                "per-lane indexing into a register vector with a data-dependent (non-constant) \
+                 lane index is outside the vericl v0 subset; only comptime-unrolled lane loops \
+                 (`for j in 0..{width}`) are supported"
+            ))),
+        }
+    }
+
     fn process_index(
         &mut self,
         inst: &Instruction,
@@ -2045,6 +2084,12 @@ impl<'a, 'b> Prover<'a, 'b> {
         list: Variable,
     ) -> Result<(), Stop> {
         self.check_trivial_vectorization(io.vector_size, io.unroll_factor)?;
+        // A per-lane read of a register (local) vector `v[j]` is not a buffer
+        // access (design §2.4): accept a comptime-unrolled constant lane (tainted
+        // value), reject a data-dependent lane (§5.4, §8.3).
+        if let Some(width) = register_vector_lane(&list) {
+            return self.process_register_lane(inst, &io.index, width);
+        }
         let aref = self.array_ref(&list)?;
         let (len, name) = self.array_len_and_name(&aref)?;
         let idx = self.value_of(&io.index).ok_or_else(|| {
@@ -2109,6 +2154,12 @@ impl<'a, 'b> Prover<'a, 'b> {
         list: Variable,
     ) -> Result<(), Stop> {
         self.check_trivial_vectorization(io.vector_size, io.unroll_factor)?;
+        // A per-lane write into a register (local) vector `v[j] = …` is not a
+        // buffer access (design §2.4, the `RuntimeCell::store_at` form): accept a
+        // comptime-unrolled constant lane, reject a data-dependent lane (§8.3).
+        if let Some(width) = register_vector_lane(&list) {
+            return self.process_register_lane(inst, &io.index, width);
+        }
         let aref = self.array_ref(&list)?;
         let (len, name) = self.array_len_and_name(&aref)?;
         let idx = self.value_of(&io.index).ok_or_else(|| {
@@ -3245,6 +3296,30 @@ impl<'a, 'b> Prover<'a, 'b> {
             ConstantValue::UInt(v) => Some(self.smt.numeral(v)),
             ConstantValue::Bool(_) | ConstantValue::Float(_) => None,
         }
+    }
+}
+
+/// If `list` is a **register** (local) vector — a `LocalConst`/`LocalMut` whose
+/// type is a `Vector<_, W>` — return its lane width `W`. A per-lane access `v[j]`
+/// indexes such a register vector, not a global buffer (design §2.4): the width
+/// lives in the local's `Type`. `None` for a global/shared array (the ordinary
+/// buffer path) or a scalar local.
+fn register_vector_lane(list: &Variable) -> Option<usize> {
+    let is_local =
+        matches!(list.kind, VariableKind::LocalConst { .. } | VariableKind::LocalMut { .. });
+    (is_local && list.ty.vector_size() > 1).then(|| list.ty.vector_size())
+}
+
+/// The constant lane index of a per-lane access if it is a compile-time integer
+/// constant (the shape a comptime-unrolled `for j in 0..W` loop produces —
+/// validated: each unrolled `v[j]` lowers to `index: Constant(UInt(j))`, design
+/// §3/§5.4). `None` for a runtime index (e.g. a non-unrolled loop counter, a
+/// `LocalMut`) — the data-dependent per-lane case v1 rejects (§8.3).
+fn constant_lane_index(index: &Variable) -> Option<u64> {
+    match index.kind {
+        VariableKind::Constant(ConstantValue::UInt(n)) => Some(n),
+        VariableKind::Constant(ConstantValue::Int(n)) if n >= 0 => Some(n as u64),
+        _ => None,
     }
 }
 
@@ -7240,6 +7315,139 @@ mod tests {
                  (round-8 risk 1)"
             ),
             other => panic!("expected OutOfSubset (vector value out of subset), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Vector<P, N> — per-lane comptime-unroll acceptance (design §3, §5.4,
+    // §11 V5). A comptime-unrolled `for j in 0..W` affine-in-lane write into a
+    // LOCAL register vector is in-subset (the only per-lane shape the surveyed
+    // 148 use); a data-dependent (runtime) register-vector lane index, and a
+    // per-lane value used to index another array, stay OutOfSubset. All three
+    // shapes' IR was validated directly (the unrolled lane lowers to
+    // `index: Constant(UInt(j))`, the runtime lane to a `LocalMut` loop counter).
+    // -----------------------------------------------------------------
+
+    /// Positive control: the comptime-unrolled affine-in-lane local pattern
+    /// proves. `Vector::new` splat + four `#[unroll]`ed `v[j] = f(ABSOLUTE_POS +
+    /// j)` writes (constant lane indices into a register vector) + a whole-vector
+    /// `out[ABSOLUTE_POS] = v` store: exactly one obligation (the guarded global
+    /// store), because the register-vector lane writes carry none (design §5.4).
+    #[cube(launch)]
+    fn prover_test_lane_unroll<N: Size>(out: &mut Array<Vector<f32, N>>) {
+        if ABSOLUTE_POS < out.len() {
+            let mut v = Vector::<f32, N>::new(0.0);
+            #[unroll]
+            for j in 0..4usize {
+                v[j] = f32::cast_from(ABSOLUTE_POS + j);
+            }
+            out[ABSOLUTE_POS] = v;
+        }
+    }
+
+    /// Negative control (the targeted §8.3 message): the SAME body without
+    /// `#[unroll]` — the lane index `j` is a runtime loop counter, so `v[j] = …`
+    /// is a data-dependent per-lane register index, outside the outer-index-only
+    /// model. Must be `OutOfSubset` naming the "only comptime-unrolled lane loops"
+    /// rule, never a proof.
+    #[cube(launch)]
+    fn prover_test_lane_nounroll<N: Size>(out: &mut Array<Vector<f32, N>>) {
+        if ABSOLUTE_POS < out.len() {
+            let mut v = Vector::<f32, N>::new(0.0);
+            for j in 0..4usize {
+                v[j] = f32::cast_from(ABSOLUTE_POS + j);
+            }
+            out[ABSOLUTE_POS] = v;
+        }
+    }
+
+    /// Negative control (lane-divergent data-dependent gather into another
+    /// array): each lane loads `idx[p][j]` and gathers `x[that]`. The register
+    /// lane read `v[j]` (constant `j`) is accepted-but-tainted, so the *global*
+    /// index `x[v[j]]` has no modeled value and refuses — `OutOfSubset`, never a
+    /// per-lane bound minted from a `Vector<u32,N>` value (round-8 risk 1).
+    #[cube(launch)]
+    fn prover_test_lane_gather<N: Size>(
+        idx: &Array<Vector<u32, N>>,
+        x: &Array<f32>,
+        out: &mut Array<f32>,
+    ) {
+        if ABSOLUTE_POS < out.len() {
+            let v = idx[ABSOLUTE_POS];
+            let mut acc = 0f32;
+            #[unroll]
+            for j in 0..4usize {
+                acc += x[v[j] as usize];
+            }
+            out[ABSOLUTE_POS] = acc;
+        }
+    }
+
+    #[test]
+    fn lane_unroll_comptime_pattern_proves() {
+        let mut b = KernelBuilder::default();
+        b.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut b.scope);
+        let out = <Array<Vector<f32, Const<4>>> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut b,
+        );
+        prover_test_lane_unroll::expand::<Const<4>>(&mut b.scope, 4, out);
+        let def = b.build(KernelSettings::default());
+        match prove_bounds_freedom(&def, &[BufferParam { name: "out", is_output: true }], &[]) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 1),
+            other => panic!("expected Proved {{ obligations: 1 }} for the unrolled lane pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lane_runtime_index_is_out_of_subset_with_targeted_message() {
+        let mut b = KernelBuilder::default();
+        b.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut b.scope);
+        let out = <Array<Vector<f32, Const<4>>> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut b,
+        );
+        prover_test_lane_nounroll::expand::<Const<4>>(&mut b.scope, 4, out);
+        let def = b.build(KernelSettings::default());
+        match prove_bounds_freedom(&def, &[BufferParam { name: "out", is_output: true }], &[]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(
+                    reason.contains("register vector") && reason.contains("comptime-unrolled"),
+                    "expected the targeted data-dependent-lane rejection (§8.3): {reason}"
+                );
+            }
+            other => panic!("expected OutOfSubset (runtime register-vector lane index), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lane_divergent_gather_is_out_of_subset() {
+        let mut b = KernelBuilder::default();
+        b.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut b.scope);
+        let idx = <Array<Vector<u32, Const<4>>> as LaunchArg>::expand(
+            &ArrayCompilationArg { inplace: None },
+            &mut b,
+        );
+        let x = <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut b);
+        let out =
+            <Array<f32> as LaunchArg>::expand_output(&ArrayCompilationArg { inplace: None }, &mut b);
+        prover_test_lane_gather::expand::<Const<4>>(&mut b.scope, 4, idx, x, out);
+        let def = b.build(KernelSettings::default());
+        let buffers = [
+            BufferParam { name: "idx", is_output: false },
+            BufferParam { name: "x", is_output: false },
+            BufferParam { name: "out", is_output: true },
+        ];
+        match prove_bounds_freedom(&def, &buffers, &[Assume::LenEq { a: "idx", b: "out" }]) {
+            ProveResult::OutOfSubset { .. } => {}
+            ProveResult::Proved { .. } => panic!(
+                "VACUOUS PROOF: a data-dependent per-lane gather must never mint a bound \
+                 (round-8 risk 1)"
+            ),
+            other => panic!("expected OutOfSubset (data-dependent per-lane gather), got {other:?}"),
         }
     }
 }

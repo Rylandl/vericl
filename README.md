@@ -343,6 +343,55 @@ store); anything else — a barrier under a thread-varying condition (barrier di
 non-uniform tree loop, multiple tiles — is rejected with a targeted error, never mis-modelled.
 Design: `docs/design-shared-memory.md`.
 
+### Vector (SIMD) element support: `Array<Vector<P, N>>`
+
+```rust
+#[vericl::kernel(
+    assumes(a.len() == out.len(), b.len() == out.len()),
+    compare(abs = 1e-6),
+    gen(a in -100.0..=100.0, b in -100.0..=100.0, out in 0.0..=0.0),
+    instantiate(N = 4)          // pin the lane width, exactly as instantiate(F = f32)
+)]
+#[cube(launch)]
+pub fn vec_add<N: Size>(
+    a: &Array<Vector<f32, N>>,
+    b: &Array<Vector<f32, N>>,
+    out: &mut Array<Vector<f32, N>>,
+) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] + b[ABSOLUTE_POS];
+    }
+}
+```
+
+`Vector<P, N>` is CubeCL's SIMD element type — a length-`N` lane vector. Its width `N` is a
+**compile-time** generic (`N: Size`), so it pins per contract via `instantiate(N = W)` just as a
+generic float pins via `instantiate(F = f32)`; one width per contract. The reference twin maps
+`Array<Vector<P, N>>` → `&[vericl::Line<P, W>]`, a host lane-array shim whose every op is a **per-lane**
+map — and a vector-`W` op *is* `W` independent scalar ops with no cross-lane coupling or reordering, so
+at equal precision the twin reproduces the GPU value **bit-for-bit** for the correctly-rounded
+elementwise ops. Every lane op is GPU-ground-truth-verified bit-exact on wgpu (and cubecl-cpu) —
+nothing reaches the twin surface unverified. I/O stays scalar throughout: `gen` draws `lines*W` flat
+scalars (the range applies per lane), the launch is spliced at the pinned vectorization `W`, and a
+divergence is reported per lane `(line, lane)`. A fusable expression like `a*a + b` (`vec_madd`) gets
+the same `compare(abs = …)` an ordinary scalar `a*a+b` would — the one legitimate float divergence (an
+FMA the backend contracts, or Metal's not-correctly-rounded `f32 /`), never a vector-model error.
+
+Bounds are proved by the existing walker unmodified: whole-vector indexing lowers to a `vector_size: 0`
+access whose width lives in the element `Type`, and `.len()` is **line**-granular, so the obligation
+`0 <= ABSOLUTE_POS < out.len()` is the scalar one — `N` never enters it. The one soundness guard is
+that a `Vector<u32, N>` value (whose *storage* is integer) can never be modeled as a single scalar
+integer. A comptime-unrolled `for j in 0..W` affine-in-lane write into a register vector is accepted;
+data-dependent per-lane indexing, cross-lane reductions (`dot`/`magnitude`/`normalize`),
+reinterpret-slice, and `SharedMemory<Vector>` are rejected with targeted errors.
+
+**Honest coverage.** This is the **vectorized elementwise class** — the immediate generalization of the
+already-provable scalar shortlist to its true vector element type (e.g. an f32 `to_degrees` map at
+`Vector<f32, 4>`). `Vector` is the #1 gate incidence in tracel-ai's kernel libraries, but rarely the
+*only* gate: whole-kernel reach for the reduction/matmul launch sites additionally needs `View`/`Slice`
+(the #2 gap), `Atomic`, `comptime!`, and `match` — the documented, non-silent follow-on. Design:
+`docs/design-line-vector.md`.
+
 ### Suites: `vericl::suite!`
 
 ```rust

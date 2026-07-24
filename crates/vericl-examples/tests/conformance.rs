@@ -72,6 +72,17 @@ vericl::suite! {
         // lanes — the cooperative v1.1 extensions landing together on the real
         // reduction shape (docs/design-shared-memory.md §7.4).
         emitter_reduce,
+        // --- Vector<P, N> elementwise (design-line-vector.md §11 V5) ---
+        // Clean-room vectorized elementwise add over `Array<Vector<f32, 4>>`
+        // (width pinned via `instantiate(N = 4)`). The vectorized differential
+        // path (flat-scalar gen of `lines*4` scalars, launch spliced at
+        // vectorization 4, flat-scalar per-lane compare) + the whole-vector
+        // line-granular bounds proof carry `tested` (bit-exact — a vec-4 add is 4
+        // correctly-rounded scalar adds) + `proved` (3-obligation SMT bounds, N
+        // absent from the obligation). The `sizes` are line counts; the pinned
+        // width is recorded in the claim config (§9). Generalizes the scalar
+        // elementwise shortlist to its true vector element type.
+        vec_add,
     ],
     evidence: "evidence/vericl.json",
     extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime),

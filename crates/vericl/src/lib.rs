@@ -34,7 +34,8 @@ pub use contract::{
 pub use evidence::{
     CaseOutcome, Claim, ClaimKind, ClaimResult, Entry, Manifest, RaceDependency,
     RACE_FREEDOM_ASSUMPTION_CHECK, SMT_RACE_FREEDOM_CHECK, cooperative_differential_config,
-    describe_case_outcome, differential_config, proved_bounds_cooperative_config,
+    describe_case_outcome, differential_config, differential_vector_config,
+    proved_bounds_cooperative_config,
     proved_config, proved_race_config, race_freedom_assumption_claim, verify,
 };
 pub use line::Line;

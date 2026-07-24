@@ -155,6 +155,29 @@ pub fn differential_config(sizes: &[usize], seed: u64, cube_dim: u32) -> serde_j
     })
 }
 
+/// `config` JSON for a *vectorized* differential (`Tested`) claim
+/// (design-line-vector.md §9). Identical to [`differential_config`] but records
+/// the pinned lane width `W`, so a re-run at a different width is a visibly
+/// different claim, and the `sizes` are documented as **line** counts (each
+/// line is `W` scalars — the buffer is `sizes[i] * W` scalars). The twin
+/// operates on `Line<P, W>` lane arrays, front-end-independently of the GPU's
+/// SIMD `Vector<P, W>`, so the reference wording is width-aware.
+pub fn differential_vector_config(
+    sizes: &[usize],
+    seed: u64,
+    cube_dim: u32,
+    vector_width: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "sizes": sizes,
+        "sizes_unit": "lines",
+        "seed": seed,
+        "cube_dim": cube_dim,
+        "vector_width": vector_width,
+        "reference": "vericl-macros sequential Line<P, W> lane-array twin",
+    })
+}
+
 /// `config` JSON for a `Proved`/`smt-oob-freedom` claim.
 pub fn proved_config(solver: &str, obligations: usize) -> serde_json::Value {
     serde_json::json!({

@@ -1860,6 +1860,12 @@ struct InstantiatePlan {
     /// `Size` generic — so an ordinary type-generic kernel's call site is
     /// unchanged.
     width_args: Vec<TokenStream2>,
+    /// The generic *type* turbofish `launch::<...>` takes — `generic_types_in_
+    /// order` minus the `Size`/width generics cubecl folds into the runtime
+    /// width argument (see the field's construction). Used for the vectorized
+    /// `conformance_case`'s `launch` call; equals `generic_types_in_order` for a
+    /// kernel without a `Size` generic.
+    launch_generic_types: Vec<Type>,
     /// `"F = f32"`, `"taps = 3"`, ... — pretty-printed, in clause order, for
     /// `Contract::instantiate`.
     pretty: Vec<String>,
@@ -1905,6 +1911,7 @@ fn resolve_instantiate(
             comptime_values: HashMap::new(),
             generic_types_in_order: Vec::new(),
             width_args: Vec::new(),
+            launch_generic_types: Vec::new(),
             pretty: Vec::new(),
         });
     };
@@ -2053,12 +2060,25 @@ fn resolve_instantiate(
         .iter()
         .filter_map(|g| width_vals.get(&g.to_string()).map(|li| quote!(#li as usize)))
         .collect();
+    // The generic turbofish `launch::<...>` takes — the *type* generics only.
+    // cubecl's generated `launch` monomorphizes a `Size` (`Vector` width) generic
+    // away into the runtime `usize` width argument (`width_args`), so — unlike
+    // `expand`, which keeps `Const<W>` in its turbofish — `launch` does NOT list
+    // it (validated: `vec_add::launch` takes exactly `__R`). A `Float`/type
+    // generic stays. Empty ⇒ `launch::<R>`; equals `generic_types_in_order` for
+    // any kernel with no `Size` generic (the scalar path, unchanged).
+    let launch_generic_types: Vec<Type> = generic_params
+        .iter()
+        .filter(|g| !width_vals.contains_key(&g.to_string()))
+        .map(|g| turbofish[&g.to_string()].clone())
+        .collect();
 
     Ok(InstantiatePlan {
         generic_subst,
         comptime_values,
         generic_types_in_order,
         width_args,
+        launch_generic_types,
         pretty: pretty_entries,
     })
 }
@@ -2232,23 +2252,20 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         ParamKind::ArrayRef(e) | ParamKind::ArrayMut(e) => is_vector_elem(e),
         _ => false,
     });
-
-    // The vectorized launch / input-generation / per-lane comparison path is
-    // delivered in V4 (design §11). Until then a `Vector` kernel generates its
-    // reference twin, `kernel_definition()` (for bounds proving), and contract,
-    // but not the differential `conformance_case`/`generate_case` — so a
-    // `gen(...)` clause on a vector kernel would be silently unused. Reject it by
-    // name rather than record a contract clause that does nothing.
-    if is_vector_kernel && !spec.gen_entries.is_empty() {
-        return Err(syn::Error::new(
-            func.sig.span(),
-            format!(
-                "kernel `{fn_name_str}`: gen(...) input generation for `Vector<_, N>` kernels is \
-                 delivered in a later milestone (the vectorized launch/I/O path); remove the \
-                 gen(...) clause for now — the reference twin and bounds proof do not need it"
-            ),
-        ));
-    }
+    // The pinned lane width `W` shared by every `Vector<P, W>` array of this
+    // kernel — recorded in the `VECTOR_WIDTH` module const so `vericl::suite!`
+    // (a separate macro invocation that cannot see the element types) can tag
+    // the differential claim's config with the width (design §9), and re-used by
+    // `build_vector_conformance_items`. `None` for a non-vector kernel. All
+    // vector arrays carry the same pinned `N`, so the first one fixes `W`.
+    let vector_width: Option<LitInt> = params.iter().find_map(|p| match &p.kind {
+        ParamKind::ArrayRef(e) | ParamKind::ArrayMut(e) => vector_elem_parts(e).map(|(_, w)| w),
+        _ => None,
+    });
+    let vector_width_const = match &vector_width {
+        Some(w) => quote!(::core::option::Option::Some((#w) as u32)),
+        None => quote!(::core::option::Option::None),
+    };
 
     // instantiate(...) namespace-collision gate (see
     // `check_instantiate_local_collisions`'s doc): must run on the
@@ -2788,15 +2805,24 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 for __vericl_abs_pos in 0..num_threads #ref_body
             }
         };
-        // The vectorized differential path (flat-scalar gen, `lines*W` buffer
-        // sizing, launch vectorization, per-lane compare) is V4 (design §11). A
-        // vector kernel therefore ships its twin + `kernel_definition()` (for
-        // bounds proving) + contract, but no `conformance_case`/`generate_case`
-        // yet — the scalar codegen here assumes the element type is both a
-        // `CubeElement` and directly comparable, which `Line<_, W>` is not. The
-        // scalar path is byte-for-byte unchanged.
+        // The vectorized differential path (flat-scalar gen of `lines*W`
+        // scalars, `lines*W`-scalar buffer sizing, launch vectorization spliced
+        // as `W`, flat-scalar compare with per-lane `(line, lane)` reporting) is
+        // V4 (design §4.4, §9, §11). It is a separate builder from the scalar
+        // one because the twin's element type is `Line<P, W>` (not a
+        // `CubeElement`) while I/O stays in scalar-`P` land: the two share no
+        // upload/readback/compare code, so the scalar path is byte-for-byte
+        // unchanged.
         let conformance = if is_vector_kernel {
-            quote! {}
+            build_vector_conformance_items(
+                &params,
+                &spec.gen_entries,
+                fn_name,
+                &fn_name_str,
+                &plan.comptime_values,
+                &plan.launch_generic_types,
+                &plan.width_args,
+            )?
         } else {
             build_conformance_items(
                 &params,
@@ -2872,6 +2898,13 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             /// the differential/race-freedom coupling of §6); `None` selects
             /// the ordinary bounds-only pipeline.
             pub const COOPERATIVE_CUBE_DIM: ::core::option::Option<u32> = #coop_cube_dim_const;
+
+            /// `Some(W)` iff this kernel has a `Vector<P, W>` array element — the
+            /// pinned lane width (design-line-vector.md §1, §9). `vericl::suite!`
+            /// reads this to tag the differential claim's config with
+            /// `vector_width = W`, so a re-run at a different width is a visibly
+            /// different claim; `None` selects the ordinary scalar config.
+            pub const VECTOR_WIDTH: ::core::option::Option<u32> = #vector_width_const;
 
             /// The phase-split twin's top-level `sync_cube()` barrier count —
             /// the prover checks the (helper-inlined) IR contains exactly this
@@ -4565,6 +4598,302 @@ fn build_conformance_items(
     })
 }
 
+/// The `Vector<P, W>` counterpart of [`build_conformance_items`] — the V4
+/// vectorized differential path (design-line-vector.md §4.4, §9, §11 V4).
+///
+/// The reference twin operates on `&[::vericl::Line<P, W>]`, but I/O stays in
+/// scalar-`P` land throughout (design §4.4): inputs are drawn as `lines * W`
+/// flat scalars (each lane in the declared `gen(...)` range), reshaped into
+/// `W`-lane `Line`s for the twin; the GPU buffer is the flat `lines * W`
+/// scalars, uploaded with `<P as CubeElement>::as_bytes`, launched at the pinned
+/// vectorization `W` (the `usize` cubecl's generated `launch` takes per `Size`
+/// generic, spliced right after `cube_dim`); the readback is flat scalars and
+/// the twin's `Line` output is flattened back to scalars, so the comparison is
+/// flat-scalar-vs-flat-scalar via the *same* `compare_{f32,f64}_with` the scalar
+/// path uses. A divergence's flat index `i` is reported per lane as
+/// `(line = i / W, lane = i % W)` (§9).
+///
+/// `n` is the **line** count (= number of `Vector` elements = number of threads
+/// = twin array length); the buffer is `n * W` scalars and the launch dispatches
+/// `ceil(n / cube_dim)` cubes — the units the §6 probe pinned (obligations in
+/// lines, launch length in scalars).
+///
+/// v1 scope (design §8.2, §8.3): every `Vector` **array** element must be
+/// `f32`/`f64` (the compared elementwise class) — a non-float or integer-vector
+/// element, and a mixed scalar-`Array`/`Vector`-array kernel, are rejected by
+/// name here rather than mis-generated.
+fn build_vector_conformance_items(
+    params: &[Param],
+    gen_entries: &[GenEntry],
+    fn_name: &Ident,
+    fn_name_str: &str,
+    comptime_values: &HashMap<String, TokenStream2>,
+    generic_types: &[Type],
+    width_args: &[TokenStream2],
+) -> syn::Result<TokenStream2> {
+    let (ranges, lens) = resolve_gen_entries(params, gen_entries, fn_name_str)?;
+
+    // Per-field accumulators (non-comptime params only, in declaration order).
+    let mut owned_tys: Vec<TokenStream2> = Vec::new();
+    let mut field_names: Vec<Ident> = Vec::new();
+    let mut gen_stmts: Vec<TokenStream2> = Vec::new();
+    let mut check_args: Vec<TokenStream2> = Vec::new();
+    let mut reference_args: Vec<TokenStream2> = Vec::new();
+    let mut ref_clone_stmts: Vec<TokenStream2> = Vec::new();
+    let mut upload_stmts: Vec<TokenStream2> = Vec::new();
+    let mut readback_stmts: Vec<TokenStream2> = Vec::new();
+    let mut compare_stmts: Vec<TokenStream2> = Vec::new();
+
+    for p in params {
+        let name = &p.name;
+        let name_str = name.to_string();
+        match &p.kind {
+            ParamKind::Comptime(_) => { /* spliced at the launch site, not generated */ }
+            ParamKind::Scalar(_) => {
+                // Scalar value params (e.g. the `s` of `out[p] = a[p] * splat(s)`)
+                // draw exactly as in the scalar path — reuse its field builder so
+                // the range/float-range rules are identical.
+                let field = build_gen_field(p, &ranges, &lens, fn_name_str, None)?;
+                owned_tys.push(field.owned_ty.clone());
+                field_names.push(name.clone());
+                gen_stmts.push(field.stmt.clone());
+                check_args.push(quote!(#name));
+                reference_args.push(quote!(#name));
+            }
+            ParamKind::ArrayRef(elem) | ParamKind::ArrayMut(elem) => {
+                let Some((p_ty, w)) = vector_elem_parts(elem) else {
+                    return Err(syn::Error::new(
+                        elem.span(),
+                        format!(
+                            "kernel `{fn_name_str}` has a `Vector` array parameter and a plain \
+                             scalar-`Array<{}>` parameter `{name_str}`; the v1 vectorized \
+                             differential path is the all-`Vector` elementwise class — mixed \
+                             scalar/vector array kernels are outside the vericl v0 subset",
+                            elem.to_token_stream()
+                        ),
+                    ));
+                };
+                let Some(kind) = NumKind::of(&p_ty).filter(|k| k.is_float()) else {
+                    return Err(syn::Error::new(
+                        elem.span(),
+                        format!(
+                            "conformance_case v1 compares f32/f64 vector outputs; \
+                             `{name_str}: Array<Vector<{}, {}>>` is outside that set — an \
+                             integer/non-float vector element has no differential compare yet \
+                             (design-line-vector.md §8.3)",
+                            p_ty.to_token_stream(),
+                            w.to_token_stream(),
+                        ),
+                    ));
+                };
+                let (lo, hi) = ranges.get(&name_str).ok_or_else(|| {
+                    syn::Error::new(
+                        elem.span(),
+                        format!(
+                            "kernel `{fn_name_str}`: parameter `{name_str}` is a float vector \
+                             array with no declared gen(...) range — declare `gen({name_str} in \
+                             lo..=hi)` (the range applies per lane); unbounded float generation \
+                             produces NaN/inf-adjacent garbage and un-provable tolerances"
+                        ),
+                    )
+                })?;
+                let len_lines = match lens.get(&name_str) {
+                    Some(e) => quote!((#e) as usize),
+                    None => quote!(n),
+                };
+                // Draw `lines * W` flat scalars in [lo, hi] and reshape into
+                // `W`-lane `Line`s (the twin element). `fill_f{32,64}` is the same
+                // per-element float draw the scalar path uses.
+                let fill = match kind {
+                    NumKind::F64 => quote!(__vericl_rng.fill_f64(#len_lines * (#w as usize), (#lo) as f64, (#hi) as f64)),
+                    _ => quote!(__vericl_rng.fill_f32(#len_lines * (#w as usize), (#lo) as f32, (#hi) as f32)),
+                };
+                gen_stmts.push(quote! {
+                    let #name: ::std::vec::Vec<::vericl::Line<#p_ty, #w>> = {
+                        let __vericl_flat = #fill;
+                        __vericl_flat
+                            .chunks_exact(#w as usize)
+                            .map(|__c| ::vericl::Line(<[#p_ty; #w]>::try_from(__c).unwrap()))
+                            .collect()
+                    };
+                });
+                owned_tys.push(quote!(::std::vec::Vec<::vericl::Line<#p_ty, #w>>));
+                field_names.push(name.clone());
+                check_args.push(quote!(&#name));
+
+                let handle = format_ident!("__vericl_{}_handle", name);
+                let flat = format_ident!("__vericl_{}_flat", name);
+                // Flatten the (repr-transparent) `Line`s to scalar `P` for upload.
+                upload_stmts.push(quote! {
+                    let #flat: ::std::vec::Vec<#p_ty> =
+                        #name.iter().flat_map(|__l| __l.0).collect();
+                    let #handle = client.create_from_slice(
+                        <#p_ty as ::cubecl::prelude::CubeElement>::as_bytes(&#flat),
+                    );
+                });
+
+                if matches!(p.kind, ParamKind::ArrayMut(_)) {
+                    let ref_name = format_ident!("__vericl_{}_ref", name);
+                    let gpu_flat = format_ident!("__vericl_{}_gpu", name);
+                    ref_clone_stmts.push(quote! {
+                        let mut #ref_name: ::std::vec::Vec<::vericl::Line<#p_ty, #w>> = #name.clone();
+                    });
+                    reference_args.push(quote!(&mut #ref_name));
+                    readback_stmts.push(quote! {
+                        let #gpu_flat: ::std::vec::Vec<#p_ty> =
+                            <#p_ty as ::cubecl::prelude::CubeElement>::from_bytes(
+                                &client.read_one(#handle).unwrap(),
+                            )
+                            .to_vec();
+                    });
+                    let compare_call = match kind {
+                        NumKind::F64 => quote!(::vericl::compare_f64_with),
+                        _ => quote!(::vericl::compare_f32_with),
+                    };
+                    compare_stmts.push(quote! {
+                        let #ref_name: ::std::vec::Vec<#p_ty> =
+                            #ref_name.iter().flat_map(|__l| __l.0).collect();
+                        let __vericl_report = #compare_call(contract().compare, &#ref_name, &#gpu_flat);
+                        // Per-lane divergence reporting (design §9): a failing flat
+                        // scalar index `i` names its `(line = i / W, lane = i % W)`.
+                        let __vericl_label = match &__vericl_report.worst {
+                            ::core::option::Option::Some(__w) => format!(
+                                "{}[line={}, lane={}]",
+                                #name_str, __w.index / (#w as usize), __w.index % (#w as usize),
+                            ),
+                            ::core::option::Option::None => #name_str.to_string(),
+                        };
+                        __vericl_reports.push((__vericl_label, __vericl_report));
+                    });
+                } else {
+                    reference_args.push(quote!(&#name));
+                }
+            }
+        }
+    }
+
+    // `launch_args`: every parameter in declared order (incl. #[comptime], whose
+    // instantiate(...) value is spliced at its position — the same rule the
+    // scalar path uses). A vector array passes its flat handle + `flat.len()`
+    // (`= lines * W`, the scalar count).
+    let launch_args: Vec<TokenStream2> = params
+        .iter()
+        .map(|p| {
+            let name = &p.name;
+            match &p.kind {
+                ParamKind::Scalar(_) => quote!(#name),
+                ParamKind::ArrayRef(_) => {
+                    let handle = format_ident!("__vericl_{}_handle", name);
+                    let flat = format_ident!("__vericl_{}_flat", name);
+                    quote! { unsafe { ::cubecl::prelude::ArrayArg::from_raw_parts(#handle, #flat.len()) } }
+                }
+                ParamKind::ArrayMut(_) => {
+                    let handle = format_ident!("__vericl_{}_handle", name);
+                    let flat = format_ident!("__vericl_{}_flat", name);
+                    quote! {
+                        unsafe {
+                            ::cubecl::prelude::ArrayArg::from_raw_parts(#handle.clone(), #flat.len())
+                        }
+                    }
+                }
+                ParamKind::Comptime(_) => comptime_values[&name.to_string()].clone(),
+            }
+        })
+        .collect();
+
+    let launch_turbofish = if generic_types.is_empty() {
+        quote!(<R>)
+    } else {
+        quote!(<#(#generic_types,)* R>)
+    };
+
+    let generate_case_fn = quote! {
+        /// Generate one vectorized differential case: per array, `lines * W`
+        /// flat scalars in the declared per-lane `gen(...)` range, reshaped into
+        /// `W`-lane `Line`s (the twin element); scalar value params drawn as in
+        /// the scalar path. Resamples up to 64 times if `check_assumes` rejects
+        /// the draw, then panics naming the kernel (an authoring-time
+        /// gen/assumes inconsistency, not a runtime condition).
+        fn generate_case(n: usize, seed: u64) -> ( #(#owned_tys,)* ) {
+            let mut __vericl_rng = ::vericl::SplitMix64::new(seed);
+            for _vericl_attempt in 0..64u32 {
+                #(#gen_stmts)*
+                if check_assumes(#(#check_args),*) {
+                    return ( #(#field_names,)* );
+                }
+            }
+            panic!(
+                "kernel `{}`: gen(...) could not produce inputs satisfying assumes(...) after \
+                 64 resample attempts — the declared gen(...) ranges are inconsistent with this \
+                 kernel's assumes(...) clauses",
+                #fn_name_str,
+            );
+        }
+    };
+
+    let conformance_case_fn = quote! {
+        /// Run one vectorized differential case (design §4.4): draw inputs,
+        /// run the `Line`-array reference twin (catching a panic as a finding),
+        /// launch the real kernel at the pinned vectorization `W` with standard
+        /// 1-D dispatch over `n` lines (`CubeCount = ceil(n/cube_dim)`,
+        /// `num_threads = count*cube_dim`), and compare every `&mut Array<Vector>`
+        /// output flat-scalar-vs-flat-scalar, naming the divergent lane.
+        pub fn conformance_case<R: ::cubecl::prelude::Runtime>(
+            client: &::cubecl::prelude::ComputeClient<R>,
+            n: usize,
+            seed: u64,
+            cube_dim: u32,
+        ) -> ::vericl::CaseOutcome {
+            let ( #(#field_names,)* ) = generate_case(n, seed);
+
+            #(#ref_clone_stmts)*
+
+            let __vericl_count = (n as u32).div_ceil(cube_dim).max(1);
+            let __vericl_cube_count = ::cubecl::prelude::CubeCount::Static(__vericl_count, 1, 1);
+            let __vericl_cube_dim = ::cubecl::prelude::CubeDim::new_1d(cube_dim);
+            let __vericl_num_threads = (__vericl_count * cube_dim) as usize;
+
+            let __vericl_ref_outcome = ::vericl::catch_reference_panic(|| {
+                reference(#(#reference_args,)* __vericl_num_threads);
+            });
+
+            match __vericl_ref_outcome {
+                Err(__vericl_panic_msg) => ::vericl::CaseOutcome {
+                    case: format!("n={n}"),
+                    reports: ::std::vec::Vec::new(),
+                    reference_panic: Some(__vericl_panic_msg),
+                },
+                Ok(()) => {
+                    #(#upload_stmts)*
+                    #fn_name::launch::#launch_turbofish(
+                        client,
+                        __vericl_cube_count,
+                        __vericl_cube_dim,
+                        #(#width_args,)*
+                        #(#launch_args,)*
+                    );
+                    #(#readback_stmts)*
+
+                    let mut __vericl_reports: ::std::vec::Vec<(::std::string::String, ::vericl::CompareReport)> =
+                        ::std::vec::Vec::new();
+                    #(#compare_stmts)*
+
+                    ::vericl::CaseOutcome {
+                        case: format!("n={n}"),
+                        reports: __vericl_reports,
+                        reference_panic: None,
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(quote! {
+        #generate_case_fn
+        #conformance_case_fn
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5292,6 +5621,75 @@ mod tests {
                 "the rejection must name the method `{method}`: {err}"
             );
         }
+    }
+
+    /// V4 conformance element-type gate (design §8.3): the vectorized
+    /// differential path compares f32/f64 vector outputs. An integer-vector
+    /// (`Vector<u32, N>`) `&mut Array` output has no differential compare yet, so
+    /// it is rejected by name at the conformance builder — not silently
+    /// mis-generated. (Bounds proving of such a kernel is a separate, supported
+    /// path — this gate is only about the *compare*.)
+    #[test]
+    fn vector_integer_output_rejected_by_conformance_gate() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k<N: Size>(a: &Array<Vector<u32, N>>, out: &mut Array<Vector<u32, N>>) { \
+             if ABSOLUTE_POS < out.len() { out[ABSOLUTE_POS] = a[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let err = expand(quote!(compare(exact), instantiate(N = 4)), &func)
+            .expect_err("an integer-vector output has no differential compare in v1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("f32/f64 vector outputs") && msg.contains("u32"),
+            "expected the targeted f32/f64-only conformance gate naming the element: {msg}"
+        );
+    }
+
+    /// V4: a kernel mixing a `Vector` array and a plain scalar-`Array` is outside
+    /// the all-`Vector` elementwise class the vectorized differential path serves
+    /// — rejected by name rather than mis-sized (the vector array is `lines * W`
+    /// scalars, the scalar array `lines`, so one launch length cannot serve both).
+    #[test]
+    fn vector_kernel_with_mixed_scalar_array_is_rejected() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k<N: Size>(a: &Array<Vector<f32, N>>, s: &Array<f32>, out: &mut Array<Vector<f32, N>>) { \
+             if ABSOLUTE_POS < out.len() { out[ABSOLUTE_POS] = a[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let err = expand(
+            quote!(compare(abs = 1e-6), gen(a in -1.0..=1.0, s in -1.0..=1.0, out in 0.0..=0.0), instantiate(N = 4)),
+            &func,
+        )
+        .expect_err("a mixed scalar/vector array kernel is outside the v1 elementwise class");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mixed") || msg.contains("scalar-`Array"),
+            "expected the mixed-array rejection: {msg}"
+        );
+    }
+
+    /// V4: a vector kernel now generates `conformance_case`/`generate_case` — the
+    /// gen(...) clause is honoured, not rejected. (V3 rejected gen on vector
+    /// kernels; V4 lifts that.) Confirm a well-formed vector kernel with gen
+    /// expands cleanly and its module carries `VECTOR_WIDTH`.
+    #[test]
+    fn vector_kernel_with_gen_expands_and_records_width() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k<N: Size>(a: &Array<Vector<f32, N>>, out: &mut Array<Vector<f32, N>>) { \
+             if ABSOLUTE_POS < out.len() { out[ABSOLUTE_POS] = a[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let out = expand(
+            quote!(compare(abs = 1e-6), gen(a in -1.0..=1.0, out in 0.0..=0.0), instantiate(N = 4)),
+            &func,
+        )
+        .expect("a well-formed vector kernel with gen must expand")
+        .to_string();
+        assert!(out.contains("VECTOR_WIDTH"), "the module records the pinned width");
+        assert!(out.contains("conformance_case"), "V4 generates the vectorized conformance_case");
+        // The launch splices the width `usize` (4) after cube_dim; the twin's
+        // element type is the `Line` shim.
+        assert!(out.contains("vericl :: Line"), "twin maps Vector<f32,4> to the Line shim");
     }
 
     /// Round-7 F1 (defense-in-depth): a *parenthesised* intrinsic callee

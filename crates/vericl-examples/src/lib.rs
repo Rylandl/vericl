@@ -1259,16 +1259,18 @@ pub fn comptime_shift(x: &Array<u32>, y: &mut Array<u32>, #[comptime] extra: u32
 }
 
 /// Clean-room vectorized elementwise add over `Array<Vector<f32, N>>`
-/// (design-line-vector.md §11 V3). The width is pinned to `4` via
+/// (design-line-vector.md §11 V3/V4). The width is pinned to `4` via
 /// `instantiate(N = 4)`, so the reference twin is monomorphized to
 /// `&[::vericl::Line<f32, 4>]` and the `Vector` element ban is lifted under the
 /// vector gate. Reference kernel shape is upstream-public (cubecl-core's own
-/// `runtime_tests/vector.rs`; MIT/Apache-2.0). No `gen(...)`: the vectorized
-/// differential launch/I/O is delivered in a later milestone — this fixture
-/// exercises the twin + bounds path, not the GPU conformance path.
+/// `runtime_tests/vector.rs`; MIT/Apache-2.0). The `gen(...)` range applies per
+/// lane: each case draws `lines * 4` flat scalars in it (design §4.4, §9). A
+/// vector-`W` add is `W` correctly-rounded scalar adds, so the twin is bit-exact
+/// with the GPU — `compare(abs = 1e-6)` is generous headroom, not required.
 #[vericl::kernel(
     assumes(a.len() == out.len(), b.len() == out.len()),
     compare(abs = 1e-6),
+    gen(a in -100.0..=100.0, b in -100.0..=100.0, out in 0.0..=0.0),
     instantiate(N = 4)
 )]
 #[cube(launch)]
@@ -1285,10 +1287,12 @@ pub fn vec_add<N: Size>(
 /// Clean-room vectorized scale-by-splat: `out[p] = a[p] * Vector::new(s)`. Its
 /// body contains a `Vector` ident (the splat constructor), so it exercises the
 /// V3 `Vector`->`::vericl::Line` head rewrite inside the twin body (design §4.3),
-/// which `vec_add` above does not.
+/// which `vec_add` above does not. The scalar `s` is drawn once per case; `a` is
+/// drawn per-lane. Per-lane `*` is correctly rounded, so the twin is bit-exact.
 #[vericl::kernel(
     assumes(a.len() == out.len()),
     compare(abs = 1e-6),
+    gen(s in -8.0..=8.0, a in -100.0..=100.0, out in 0.0..=0.0),
     instantiate(N = 4)
 )]
 #[cube(launch)]
@@ -1299,6 +1303,84 @@ pub fn vec_scale<N: Size>(
 ) {
     if ABSOLUTE_POS < out.len() {
         out[ABSOLUTE_POS] = a[ABSOLUTE_POS] * Vector::new(s);
+    }
+}
+
+/// Clean-room vectorized `out[p] = a[p] * a[p] + b[p]` — the **vec_madd-class
+/// tolerance example** (design §4.5, §6). Unlike `vec_add`/`vec_scale` (whose
+/// per-lane `+`/`*` are individually correctly rounded and therefore bit-exact),
+/// `a*a + b` is fusable: a backend that contracts it to a single fused
+/// multiply-add rounds once where the twin (two ops) rounds twice, a ≤1-ULP
+/// per-lane gap — the identical, well-understood float-contraction divergence a
+/// *scalar* `a*a+b` kernel has, handled by the declared `compare(abs = …)`. The
+/// abs bound is justified from the `gen` ranges: with `|a|,|b| ≤ 8`, `|a*a+b| ≤
+/// 72`, and one f32 rounding of a value ≤ 72 is ≤ ulp(72)/2 ≈ 4e-6, so `abs =
+/// 1e-5` is generous headroom. The vector model itself adds **zero** divergence
+/// (design §4.5): this tolerance is a per-lane float fact, not a lane-coupling
+/// artifact.
+#[vericl::kernel(
+    assumes(a.len() == out.len(), b.len() == out.len()),
+    compare(abs = 1e-5),
+    gen(a in -8.0..=8.0, b in -8.0..=8.0, out in 0.0..=0.0),
+    instantiate(N = 4)
+)]
+#[cube(launch)]
+pub fn vec_madd<N: Size>(
+    a: &Array<Vector<f32, N>>,
+    b: &Array<Vector<f32, N>>,
+    out: &mut Array<Vector<f32, N>>,
+) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] * a[ABSOLUTE_POS] + b[ABSOLUTE_POS];
+    }
+}
+
+/// DEFECTIVE (tolerance too tight): the same `a*a + b` as `vec_madd`, but with a
+/// bit-exact `compare(max_ulp = 0)`. On a backend that fuses `a*a + b` to one FMA
+/// rounding (Metal does — design §6), the two-rounding twin diverges by up to a
+/// representable step per lane, so a bit-exact tolerance FAILS — and the
+/// differential check reports the divergence naming the specific `(line, lane)`
+/// (design §9). It is the negative control for per-lane divergence reporting:
+/// the fix is the honest `compare(abs = …)` on `vec_madd`, justified from the
+/// input ranges. Kept OUT of the conformance suite.
+#[vericl::kernel(
+    assumes(a.len() == out.len(), b.len() == out.len()),
+    compare(max_ulp = 0),
+    gen(a in -8.0..=8.0, b in -8.0..=8.0, out in 0.0..=0.0),
+    instantiate(N = 4)
+)]
+#[cube(launch)]
+pub fn vec_madd_bitexact<N: Size>(
+    a: &Array<Vector<f32, N>>,
+    b: &Array<Vector<f32, N>>,
+    out: &mut Array<Vector<f32, N>>,
+) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] * a[ABSOLUTE_POS] + b[ABSOLUTE_POS];
+    }
+}
+
+/// DEFECTIVE (bounds): the boundary guard is `<=`, reading and writing one
+/// **line** past the end. Exactly the `axpy_off_by_one` defect (design §11 V4
+/// negative control) at a `Vector<f32, 4>` element type: WGSL robustness clamps
+/// the over-read on the GPU, but the `Line`-array reference twin indexes
+/// `out[out.len()]` and panics deterministically — the differential check catches
+/// it. Kept OUT of the conformance suite (it belongs to a negative-control test),
+/// like its scalar sibling.
+#[vericl::kernel(
+    assumes(a.len() == out.len(), b.len() == out.len()),
+    compare(abs = 1e-6),
+    gen(a in -100.0..=100.0, b in -100.0..=100.0, out in 0.0..=0.0),
+    instantiate(N = 4)
+)]
+#[cube(launch)]
+pub fn vec_add_off_by_one<N: Size>(
+    a: &Array<Vector<f32, N>>,
+    b: &Array<Vector<f32, N>>,
+    out: &mut Array<Vector<f32, N>>,
+) {
+    if ABSOLUTE_POS <= out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] + b[ABSOLUTE_POS];
     }
 }
 

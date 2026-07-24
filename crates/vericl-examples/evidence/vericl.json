@@ -1073,6 +1073,73 @@
         "vericl-ir's two-thread reduction (t1 != t2 over one cube; per-phase write-write / read-write / inter-cube single-writer disjointness in QF_LIA over the CubeCL IR)",
         "the GPUVerify-style two-thread abstraction (a race exists iff some pair of threads conflicts, so UNSAT for a symbolic distinct pair proves race freedom for all pairs)"
       ]
+    },
+    {
+      "kernel": "vec_add",
+      "identity": {
+        "source_hash": "sha256:acd02b8c15bd8d3dd9ee447261f5b18ff23864ba7c03e34236742e6eb06c25e2",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:2a3f5dca08e9a82e682b3d2ec5e89a214e43e6fe8c3d801e70544c1922daed0c"
+      },
+      "contract": {
+        "assumes": [
+          "a.len() == out.len()",
+          "b.len() == out.len()"
+        ],
+        "compare": "f32 |e-a| <= 1e-6 + 0e0*|e|",
+        "wrapping": false,
+        "instantiate": [
+          "N = 4"
+        ],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": 256,
+            "reference": "vericl-macros sequential Line<P, W> lane-array twin",
+            "seed": 59649,
+            "sizes": [
+              1,
+              7,
+              256,
+              1000,
+              1027,
+              4096,
+              65536
+            ],
+            "sizes_unit": "lines",
+            "vector_width": 4
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_LIA",
+            "obligations": 3,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
     }
   ]
 }
