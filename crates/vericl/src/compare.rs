@@ -7,8 +7,11 @@ use crate::contract::Compare;
 /// Result of comparing two output buffers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompareReport {
+    /// `true` iff every element was within tolerance (`mismatches == 0`).
     pub pass: bool,
+    /// Number of elements compared.
     pub checked: usize,
+    /// Number of elements outside the declared tolerance.
     pub mismatches: usize,
     /// Worst observed f32 ULP distance (f32 comparisons only, mismatched or not).
     pub max_ulp: Option<u64>,
@@ -16,10 +19,14 @@ pub struct CompareReport {
     pub worst: Option<Mismatch>,
 }
 
+/// A single element where two buffers diverged, for diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Mismatch {
+    /// Element index at which the divergence occurred.
     pub index: usize,
+    /// The reference (expected) value, widened to f64.
     pub expected: f64,
+    /// The observed (actual) value, widened to f64.
     pub actual: f64,
     /// ULP distance; `None` when NaN is involved or comparison is integral.
     pub ulp: Option<u64>,
@@ -266,6 +273,7 @@ pub fn compare_exact_u32(expected: &[u32], actual: &[u32]) -> CompareReport {
 /// kernels; an f32 array needs `max_ulp` or `abs`/`rel`. This is a contract-
 /// authoring bug caught the first time the kernel's evidence is generated,
 /// not a runtime data problem.
+#[doc(hidden)] // generated-code plumbing (macro-emitted conformance_case)
 pub fn compare_f32_with(compare: Compare, expected: &[f32], actual: &[f32]) -> CompareReport {
     match compare {
         Compare::MaxUlpF32(max_ulp) => compare_f32(expected, actual, max_ulp),
@@ -284,6 +292,7 @@ pub fn compare_f32_with(compare: Compare, expected: &[f32], actual: &[f32]) -> C
 
 /// Dispatch a declared [`Compare`] mode against a `u32` buffer pair. See
 /// [`compare_f32_with`]; panics if `compare` is not [`Compare::Exact`].
+#[doc(hidden)] // generated-code plumbing (macro-emitted conformance_case)
 pub fn compare_u32_with(compare: Compare, expected: &[u32], actual: &[u32]) -> CompareReport {
     match compare {
         Compare::Exact => compare_exact_u32(expected, actual),
@@ -303,6 +312,7 @@ pub fn compare_u32_with(compare: Compare, expected: &[u32], actual: &[u32]) -> C
 /// Panics on [`Compare::Exact`] (integer mode) or on an f32 compare variant
 /// reaching an f64 kernel — both are contract-authoring bugs caught the first
 /// time evidence is generated, not runtime data problems.
+#[doc(hidden)] // generated-code plumbing (macro-emitted conformance_case)
 pub fn compare_f64_with(compare: Compare, expected: &[f64], actual: &[f64]) -> CompareReport {
     match compare {
         Compare::MaxUlpF64(max_ulp) => compare_f64(expected, actual, max_ulp),

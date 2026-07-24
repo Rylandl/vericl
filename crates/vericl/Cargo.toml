@@ -4,6 +4,10 @@ description = "Conformance and evidence harness for CubeCL compute kernels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["cubecl", "gpu", "kernel", "verification", "conformance"]
+categories = ["development-tools::testing", "science", "hardware-support"]
 
 [dependencies]
 vericl-macros = { workspace = true }

@@ -8,6 +8,12 @@ matter, and VeriCL produces the artifacts and checks needed to support clearly b
 about it: differential test results across backends, machine-checked safety properties, and an
 evidence manifest that goes stale when anything it depends on changes.
 
+> **New to VeriCL? Start with the [user guide](docs/guide.md).** It walks a competent Rust/GPU
+> developer from a plain CubeCL kernel to `cargo test`-verified evidence in under ten minutes of
+> reading — installation, annotating a first kernel, the `suite!` block, the `VERICL_UPDATE`
+> workflow, reading an evidence file, what each rejection means, and an honest "what VeriCL does not
+> do". This README is the design record and changelog; the guide is the manual.
+
 ## Status
 
 Exploratory. This document records the problem, the design decisions that are locked in, and the

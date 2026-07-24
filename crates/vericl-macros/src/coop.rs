@@ -186,7 +186,7 @@ fn unwrap_paren_group(e: &Expr) -> &Expr {
 /// the unwritten cell as `0.0`).
 struct SharedCompoundAssignCheck<'a> {
     shared: &'a HashSet<String>,
-    hit: Option<String>,
+    hit: Option<(String, proc_macro2::Span)>,
 }
 
 impl<'a, 'ast> Visit<'ast> for SharedCompoundAssignCheck<'a> {
@@ -210,7 +210,7 @@ impl<'a, 'ast> Visit<'ast> for SharedCompoundAssignCheck<'a> {
                 if let Expr::Path(p) = unwrap_paren_group(idx.expr.as_ref()) {
                     if let Some(id) = p.path.get_ident() {
                         if self.shared.contains(&id.to_string()) && self.hit.is_none() {
-                            self.hit = Some(id.to_string());
+                            self.hit = Some((id.to_string(), i.span()));
                         }
                     }
                 }
@@ -551,9 +551,9 @@ fn analyse(
     {
         let mut chk = SharedCompoundAssignCheck { shared: &shared_names, hit: None };
         chk.visit_block(body);
-        if let Some(name) = chk.hit {
+        if let Some((name, span)) = chk.hit {
             return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
+                span,
                 format!(
                     "kernel `{fn_name_str}`: compound assignment (`{name}[…] OP= …`) into a \
                      shared tile is outside the vericl v1 subset — it would bypass the twin's \

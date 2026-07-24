@@ -1,9 +1,12 @@
 [package]
 name = "vericl-macros"
-description = "Contract attribute macro for vericl"
+description = "Contract and suite attribute/function macros for vericl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["cubecl", "gpu", "kernel", "verification", "macro"]
+categories = ["development-tools::procedural-macro-helpers", "development-tools::testing"]
 
 [lib]
 proc-macro = true

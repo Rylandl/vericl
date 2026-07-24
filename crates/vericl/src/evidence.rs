@@ -9,19 +9,34 @@ use serde::{Deserialize, Serialize};
 use crate::compare::CompareReport;
 use crate::contract::{ContractRecord, Identity};
 
+/// The evidence manifest — the serialized form of an `evidence/*.json` file.
+///
+/// One [`Entry`] per kernel, each binding its [`Claim`]s to the [`Identity`]
+/// they were produced from. Load one from disk with [`Manifest::load`] and
+/// check it against a freshly built manifest with [`verify`]; `vericl::suite!`
+/// does exactly this on every `cargo test` run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
+    /// The `vericl` version that produced this manifest.
     pub vericl_version: String,
+    /// One entry per kernel in the suite.
     pub entries: Vec<Entry>,
 }
 
+/// One kernel's evidence: its identity, contract, established claims, and the
+/// components the entry trusts rather than checks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
+    /// The kernel's name.
     pub kernel: String,
+    /// The identity every claim below is bound to; a mismatch is stale evidence.
     pub identity: Identity,
+    /// The contract (assumptions + comparison semantics) claims were produced under.
     pub contract: ContractRecord,
+    /// What each check established, tagged by [`ClaimKind`].
     pub claims: Vec<Claim>,
-    /// Components this evidence trusts rather than checks.
+    /// Components this evidence trusts rather than checks (README "Claims and
+    /// trust boundaries").
     pub trusted: Vec<String>,
 }
 
@@ -29,6 +44,7 @@ pub struct Entry {
 /// never interchangeable (see README "Claims and trust boundaries").
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Claim {
+    /// What this result establishes (proved / tested / assumed).
     pub kind: ClaimKind,
     /// Which check produced this claim (e.g. "differential").
     pub check: String,
@@ -37,9 +53,12 @@ pub struct Claim {
     pub backend: Option<String>,
     /// Check configuration: seeds, sizes, case counts.
     pub config: serde_json::Value,
+    /// The outcome of the check ([`ClaimResult`]).
     pub result: ClaimResult,
 }
 
+/// Which of the four claim categories a result falls into (README "Claims and
+/// trust boundaries").
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ClaimKind {
@@ -52,11 +71,17 @@ pub enum ClaimKind {
     Assumed,
 }
 
+/// The outcome recorded for a [`Claim`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum ClaimResult {
+    /// The check passed.
     Pass,
-    Fail { detail: String },
+    /// The check failed, with a human-readable explanation.
+    Fail {
+        /// What diverged / why the check failed.
+        detail: String,
+    },
     /// The claim is a recorded assumption; nothing was executed.
     Declared,
 }
@@ -71,7 +96,9 @@ pub enum ClaimResult {
 /// set (nothing was compared).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CaseOutcome {
+    /// A label for the case (e.g. `"n=256"`).
     pub case: String,
+    /// One `(param name, report)` per compared `&mut Array` parameter.
     pub reports: Vec<(String, CompareReport)>,
     /// Set when the reference execution panicked (e.g. an out-of-bounds
     /// access the GPU backend would silently clamp).
@@ -146,6 +173,7 @@ pub fn describe_case_outcome(o: &CaseOutcome) -> String {
 /// `config` JSON for a differential (`Tested`) claim. Shared by `conform.rs`
 /// and the `vericl::suite!`-generated runner so the field names/shape can
 /// never drift between hand-written and generated code.
+#[doc(hidden)] // generated-code plumbing (suite! claim config builder)
 pub fn differential_config(sizes: &[usize], seed: u64, cube_dim: u32) -> serde_json::Value {
     serde_json::json!({
         "sizes": sizes,
@@ -162,6 +190,7 @@ pub fn differential_config(sizes: &[usize], seed: u64, cube_dim: u32) -> serde_j
 /// line is `W` scalars — the buffer is `sizes[i] * W` scalars). The twin
 /// operates on `Line<P, W>` lane arrays, front-end-independently of the GPU's
 /// SIMD `Vector<P, W>`, so the reference wording is width-aware.
+#[doc(hidden)] // generated-code plumbing (suite! claim config builder)
 pub fn differential_vector_config(
     sizes: &[usize],
     seed: u64,
@@ -179,6 +208,7 @@ pub fn differential_vector_config(
 }
 
 /// `config` JSON for a `Proved`/`smt-oob-freedom` claim.
+#[doc(hidden)] // generated-code plumbing (suite! claim config builder)
 pub fn proved_config(solver: &str, obligations: usize) -> serde_json::Value {
     serde_json::json!({
         "solver": solver,
@@ -191,12 +221,14 @@ pub fn proved_config(solver: &str, obligations: usize) -> serde_json::Value {
 /// claim depends on when race freedom is *not* proved (the honest-fallback
 /// tier, docs/design-shared-memory.md §6). Distinct from the `smt-race-freedom`
 /// proved-claim check the strong tier cites — the two must never be conflated.
+#[doc(hidden)] // generated-code plumbing (cooperative claim wiring)
 pub const RACE_FREEDOM_ASSUMPTION_CHECK: &str = "intra-phase-race-freedom";
 
 /// The `check` string of the `Proved` race-freedom claim, duplicated here
 /// (core cannot depend on `vericl-ir`, by design) so a cooperative differential
 /// claim's `depends_on` can cite it. Kept byte-identical to
 /// `vericl_ir::SMT_RACE_FREEDOM_CHECK` — the suite asserts both agree.
+#[doc(hidden)] // generated-code plumbing (cooperative claim wiring)
 pub const SMT_RACE_FREEDOM_CHECK: &str = "smt-race-freedom";
 
 /// How a cooperative differential (`tested`) claim records its dependency on
@@ -204,6 +236,10 @@ pub const SMT_RACE_FREEDOM_CHECK: &str = "smt-race-freedom";
 /// memory.md §6). The phase-split twin picks one intra-segment thread order, so
 /// it is a faithful reference *only* under race freedom; that dependency is
 /// always made explicit, never assumed silently.
+///
+/// Generated-code plumbing: a parameter of [`cooperative_differential_config`],
+/// set by the `suite!` runner — not an API user code constructs.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaceDependency {
     /// Strong tier: the `smt-race-freedom` proof is present and discharged the
@@ -221,6 +257,7 @@ pub enum RaceDependency {
 /// author-supplied declared reference). `dependency` records whether the twin's
 /// faithfulness is discharged by the `smt-race-freedom` proof or rests on the
 /// injected assumption.
+#[doc(hidden)] // generated-code plumbing (suite! claim config builder)
 pub fn cooperative_differential_config(
     sizes: &[usize],
     seed: u64,
@@ -255,6 +292,7 @@ pub fn cooperative_differential_config(
 /// leans on but does not itself establish. A cooperative differential result
 /// with neither this assumption nor the `smt-race-freedom` proof is refused,
 /// never recorded silently.
+#[doc(hidden)] // generated-code plumbing (cooperative claim wiring)
 pub fn race_freedom_assumption_claim() -> Claim {
     Claim {
         kind: ClaimKind::Assumed,
@@ -274,6 +312,7 @@ pub fn race_freedom_assumption_claim() -> Claim {
 /// bounds obligations are discharged by the two-thread cooperative walk (the
 /// single-thread bounds walk defers a barrier-carrying loop) — recorded here so
 /// the provenance is explicit.
+#[doc(hidden)] // generated-code plumbing (suite! claim config builder)
 pub fn proved_bounds_cooperative_config(solver: &str, obligations: usize) -> serde_json::Value {
     serde_json::json!({
         "solver": solver,
@@ -289,6 +328,7 @@ pub fn proved_bounds_cooperative_config(solver: &str, obligations: usize) -> ser
 /// counts (write-write / read-write / inter-cube single-writer / barrier
 /// uniformity). `obligations` is the total of the three SMT-checked race
 /// classes.
+#[doc(hidden)] // generated-code plumbing (suite! claim config builder)
 #[allow(clippy::too_many_arguments)]
 pub fn proved_race_config(
     solver: &str,
@@ -312,6 +352,7 @@ pub fn proved_race_config(
 }
 
 impl Manifest {
+    /// A manifest over `entries`, stamped with the current `vericl` version.
     pub fn new(entries: Vec<Entry>) -> Self {
         Self {
             vericl_version: crate::VERSION.to_string(),
@@ -319,6 +360,7 @@ impl Manifest {
         }
     }
 
+    /// Write the manifest as pretty JSON to `path`, creating parent directories.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -326,6 +368,7 @@ impl Manifest {
         std::fs::write(path, serde_json::to_string_pretty(self).unwrap() + "\n")
     }
 
+    /// Read a manifest from `path` (an `evidence/*.json` file).
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let data = std::fs::read_to_string(path)?;
         serde_json::from_str(&data)

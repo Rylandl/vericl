@@ -2171,3 +2171,145 @@ full 7-round soundness re-review** (both its SSA-value and memory models
 changed — architectural, characterized-not-rewritten per protocol); re-stamp
 evidence ~1 h. Recommended playbook (order, re-verify list, dedicated review
 round) in `docs/upgrade-drill-2026-07.md`.
+
+## Productization gate — DONE 2026-07-24
+
+The final roadmap item before first outside users. Ergonomics-first
+(familiar workflows, actionable errors, zero new concepts) treated as a
+first-class gate. Five deliverables; publishing itself deliberately NOT done
+(gated on Ryland). No evidence touched (byte-identical); zero regressions.
+
+**1 — Real user guide (`docs/guide.md`, 13 sections, ~750 lines).** The path
+from "I have a CubeCL kernel" to "`cargo test` verifies evidence" for a
+competent Rust/GPU dev who has never seen this repo: installation (z3 per-OS
+table + the three-crate `Cargo.toml`, with *why* each of `vericl`/`vericl-ir`/
+`cubecl` is needed), a first verified kernel (axpy) end to end, the contract
+clauses built up (minimal `assumes`+`compare`, the four compare modes, `gen`,
+`wrapping`), `instantiate(...)`, composition (`helper`+`uses`), cooperative
+kernels, the `suite!` field reference, the `VERICL_UPDATE` workflow, reading an
+evidence file (the four claim categories + identity/staleness + lane
+independence, from the real `axpy` entry), a rejection reference (VeriCL's own
++ the two rustc-mediated cases + run-time panics, each with a fix), and an
+honest "what VeriCL does not do". Linked prominently from `README.md` (callout
+after the intro). **Every ```rust snippet is a verbatim excerpt of a kernel in
+`crates/vericl-examples/src/lib.rs` or a `suite!` in `tests/` — all compiled by
+the green `cargo test --workspace` run** (signatures + attributes verified
+byte-identical against source); the only non-excerpt blocks are TOML, JSON
+(from the real `evidence/vericl.json`), and `text` error output.
+
+**2 — Error-message audit.** Swept every user-facing `syn::Error`/`panic!`/
+`.expect` site across `vericl-macros/{lib,suite,coop}.rs` (114 sites cataloged
+verbatim with span + verdict). The vast majority already passed the bar (name
+the construct + say what to do + right span). Fixed the ones that failed
+(before → after):
+
+| Site | Before | After |
+|---|---|---|
+| lib.rs catch-all (highest-traffic rejection) | "`X` is outside the vericl v0 kernel subset; …rejected rather than silently approximated (see README "First release")" — no remediation | now lists the supported subset (affine indexing, bounded `for`/`match`, `&Array`/`Slice`, `instantiate`, `cooperative`) and points at the guide's rejection reference for `X` |
+| lib.rs plain-param-name | "expected a plain parameter name" | adds: "destructuring/tuple/`_` patterns … are outside the subset; give each parameter a simple name (e.g. `x: &Array<f32>`)" |
+| lib.rs unsupported param type | "unsupported parameter type in the vericl v0 subset" | now names what IS supported (scalar / `&Array` / core `&Slice` / `#[comptime]` scalar) |
+| lib.rs kernel-returns-value | "kernels must not return a value" | adds: "…writes through an `&mut Array<T>` output, not a return value (a value-returning `#[cube]` fn is a `#[vericl::helper]`)" |
+| lib.rs `#[vericl::reference]` no-args (A24) | span = `call_site()` | span = the offending argument tokens |
+| suite.rs duplicate field (C5) | span = `call_site()` | span = the duplicate field's own value tokens |
+| suite.rs evidence-write (E8) | bare `.expect("write vericl evidence manifest")` | actionable panic naming the path + "check the `evidence:` path is writable and its parent exists" |
+| coop.rs shared compound-assign (D4) | span = `call_site()` | span = the offending `tile[i] OP= …` expression (captured the `ExprBinary` span in the visitor) |
+
+Two BADSPAN cases (`check_instantiate_local_collisions` B8, cross-barrier local
+D6) were left at the coarse span **deliberately**: both messages already name
+the exact offending identifier (the actionable info), and threading spans
+through their shared string-only collectors (`collect_locals` is also used by
+`UsesRewriteFold`; `IdentRefCollector` by several passes) is disproportionate
+regression risk for rare/advanced rejections — documented here as an accepted
+pre-1.0 gap. The two **rustc-mediated** cases got doc-comment cross-references
+where the error lands, not silent acceptance: E0499/E0502 overlapping-mutable-
+slice (doc on `SliceRewriteFold`, naming the exact rustc codes) and the
+missing-`#[vericl::kernel]`-annotation → "cannot find `<name>_vericl`"
+resolution error (doc on the `suite!` module). Both are also in the guide's
+rejection reference. Consistency note left as-is: coop.rs says "v1"/"v1.1"
+subset where lib.rs says "v0" — intentional (cooperative is a later tier), not
+churned.
+
+**3 — API stability pass (core `vericl` crate).** The genuine public surface a
+user touches is small: the four macros, `Compare`, and the evidence-reading
+types (`Manifest`/`Entry`/`Claim`/`ClaimKind`/`ClaimResult`/`ContractRecord`/
+`Identity`/`verify`) + the compare/ulp utilities + `SplitMix64`. Everything
+else that is `pub` is there ONLY because macro-generated code references it
+across the crate boundary at the user's call site — it cannot be `pub(crate)`
+(that would break `suite!`), so it was marked `#[doc(hidden)]` instead
+(compile-invisible, zero regression, reversible): the `trust`/`host_shims`/
+`panic`/`shared`/`line` plumbing modules, `Line`, `SharedTile`,
+`catch_reference_panic`, all the `*_config` claim builders +
+`race_freedom_assumption_claim` + `RaceDependency` + the two `*_CHECK` consts,
+`combine_source_hash`/`check_helper_composition_depth`/
+`MAX_HELPER_COMPOSITION_DEPTH`/`StructuredAssume`, and the `compare_*_with`
+dispatchers. `#![warn(missing_docs)]` added to the core crate and satisfied
+(zero warnings) — every remaining visible type/field/variant/method now has a
+doc comment (`Manifest`, `Entry` + fields, `Claim`/`ClaimResult` + variants,
+`CompareReport`/`Mismatch` fields, `Compare` variant fields, `Identity`/
+`ContractRecord` fields, `SplitMix64` methods, `Compare::describe`,
+`Contract::record`). No compat break — the doc-hidden items stay `pub` and
+callable; the pre-1.0 note in `docs/release-checklist.md` records that they are
+plumbing, not API. A crate-root comment block documents the surface split.
+
+**4 — Publication readiness (PREPARED, not published).** crates.io metadata on
+all three published crates (`description` [already present], `license`,
+`repository = https://github.com/Rylandl/vericl`, `keywords`, `categories`);
+`vericl` sets `readme = "../../README.md"` (cargo copies it into the package —
+verified in the dry-run tarball, 53 KB README present). **`vericl-ir` made
+publishable** (removed `publish = false`) — the critical finding: the `suite!`
+macro emits `::vericl_ir::` at the user's call site (even with `prove: false`,
+for the IR identity hash), so it MUST be on crates.io or no external `suite!`
+compiles. `vericl-examples` kept `publish = false`. `cargo publish --workspace
+--dry-run --allow-dirty` passes for all three (packaged together via a local
+temp registry so inter-crate deps resolve; `vericl` correctly resolves
+`vericl-macros = "0.1.0"`, path stripped). `docs/release-checklist.md` records
+the exact publish sequence (workspace command, or leaf-first order + the
+expected standalone-dry-run chicken-and-egg), a from-crates.io smoke test, and
+the decisions that stay Ryland's (whether/when to publish, crate-name
+ownership, version choice, the `=0.10.0` cubecl pin's user-facing consequence,
+yank policy).
+
+**5 — This record.**
+
+**Verification (all green, reported):** `cargo test --workspace` = 283 passed /
+0 failed / 1 ignored, zero warnings; `cargo test -p vericl-examples --features
+cpu` all green (incl. the f64-on-cpu suite); `cargo clippy --workspace
+--all-targets` clean; `cargo clippy -p vericl-examples --all-targets --features
+cpu` clean; `conform` demo-defects exit 0; `evidence/*.json` byte-identical
+(git clean). Files changed: `Cargo.toml` (+repository), the three published
+crates' `Cargo.toml` (metadata; `vericl-ir` un-`publish=false`d),
+`vericl-macros/src/{lib,suite,coop}.rs` (messages/spans/doc cross-refs),
+`vericl/src/{lib,compare,contract,evidence,rng}.rs` (doc-hide + docs +
+missing_docs lint), `README.md` (guide callout). New: `docs/guide.md`,
+`docs/release-checklist.md`.
+
+### Roadmap state — the agreed sequencing is COMPLETE
+
+With the productization gate done, the agreed roadmap (README first-release
+outcomes + the 2026-07-22 roadmap + the foundation/Slice/interpreter rungs) is
+delivered end to end, and VeriCL is ready for first outside users (publishing
+gated on Ryland). Remaining **known** items, all previously recorded, none
+blocking first users:
+
+1. **Prover port for cubecl 0.11** when it ships (0.11.0-pre.1 drilled
+   2026-07-24; `vericl`/`vericl-macros` unaffected, `vericl-ir` is the porting
+   job — playbook in `docs/upgrade-drill-2026-07.md`; the real upgrade also
+   bumps MSRV to rustc ≥ 1.95 per cubecl-zspace).
+2. **The queued f64-on-wgpu silent-corruption disclosure** (still reproduces at
+   0.11.0-pre.1; item 1 of the checklist done, SPIR-V path still open). **Do
+   NOT contact anyone without Ryland's explicit go.**
+3. **The post-`Slice` subset frontier:** `plane_*` reductions, then custom
+   `CubeType`-struct arguments, then 2-D topology (then `Tensor` + the deferred
+   `View`/`VirtualLayout` machinery) — each rejected explicitly today, not
+   approximated.
+4. **Proof certificates** (independently-checkable `unsat` proofs to move the z3
+   binary out of the trusted base) when the tooling exists — cvc5 + Alethe +
+   Carcara are not available at the pinned versions; decision record in
+   `docs/certificates-decision.md`.
+
+Smaller carried debts (unchanged): fold the cubecl crate version into
+`Identity`; a standalone `vericl check` CLI (superseded by the `cargo test`
+story for v0); a `FLOAT_METHOD_CONST_ONLY` distinction if a dogfooded kernel
+needs a runtime `new`/`from_int`; a full QF_BV overflow model as a precision
+upgrade; VeriCL-authored (buffer-named) diagnostics for the two rustc-mediated
+rejections (E0499 aliasing, missing-annotation accessor).

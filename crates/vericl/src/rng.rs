@@ -1,16 +1,20 @@
 //! Minimal seeded PRNG (SplitMix64) for reproducible differential-test inputs.
 //! No external dependency so input generation stays stable across builds.
 
+/// A dependency-free seeded PRNG (SplitMix64) used for reproducible
+/// differential-test input generation. Deterministic across builds.
 #[derive(Debug, Clone)]
 pub struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
+    /// A generator seeded with `seed`.
     pub fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
+    /// The next 64-bit output.
     pub fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
@@ -19,6 +23,7 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
+    /// The next 32-bit output (top half of a fresh `u64`).
     pub fn next_u32(&mut self) -> u32 {
         (self.next_u64() >> 32) as u32
     }
@@ -29,6 +34,7 @@ impl SplitMix64 {
         lo + (hi - lo) * unit
     }
 
+    /// `n` uniform f32 values in `[lo, hi)`.
     pub fn fill_f32(&mut self, n: usize, lo: f32, hi: f32) -> Vec<f32> {
         (0..n).map(|_| self.next_f32_range(lo, hi)).collect()
     }
@@ -42,10 +48,12 @@ impl SplitMix64 {
         lo + (hi - lo) * unit
     }
 
+    /// `n` uniform f64 values in `[lo, hi)`.
     pub fn fill_f64(&mut self, n: usize, lo: f64, hi: f64) -> Vec<f64> {
         (0..n).map(|_| self.next_f64_range(lo, hi)).collect()
     }
 
+    /// `n` full-range `u32` values.
     pub fn fill_u32(&mut self, n: usize) -> Vec<u32> {
         (0..n).map(|_| self.next_u32()).collect()
     }

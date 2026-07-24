@@ -31,11 +31,28 @@
 //! manifest write, and reuses `entries` before it's finalized — exactly
 //! `conform.rs`'s old `add_cpu_lane(&mut entries)` shape, just generated
 //! instead of hand-written.
+//!
+//! **Missing-annotation accessor error (rustc-mediated, by design).** Each name
+//! in `kernels: [...]` is resolved to that kernel's generated `<name>_vericl`
+//! module and its accessor functions (`conformance_case`, `kernel_definition`,
+//! `contract`, `BUFFER_PARAMS`, …). If a listed kernel is missing its
+//! `#[vericl::kernel]` attribute — the annotation that *generates* that module —
+//! there is nothing for `suite!` to reference, and rustc reports a plain
+//! resolution error at the `suite!` call site ("failed to resolve: use of
+//! undeclared crate or module `<name>_vericl`", or "cannot find function
+//! `conformance_case`"). vericl-macros cannot pre-empt this with a friendlier
+//! message: a `#[proc_macro]` invocation has no whole-crate visibility, so it
+//! cannot tell whether `<name>` names an annotated kernel or an ordinary `fn`.
+//! The fix is always the same — add `#[vericl::kernel(...)]` (and `#[cube(launch)]`)
+//! to the kernel, or remove the name from `kernels:`. The guide's "Reading
+//! rejections" section documents this so a user hitting the resolution error
+//! recognizes the cause.
 
 use proc_macro2::{Ident, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::{Expr, LitStr, Path, Token};
 
 enum SuiteField {
@@ -157,63 +174,70 @@ fn build_spec(fields: Punctuated<SuiteField, Token![,]>) -> syn::Result<SuiteSpe
     let mut frontend_independent: Option<Expr> = None;
     let mut extra_lane: Option<(TokenStream2, Path)> = None;
 
-    let dup = |field: &str| -> syn::Error {
-        syn::Error::new(proc_macro2::Span::call_site(), format!("suite!: duplicate `{field}` field"))
+    // Underline the offending (duplicate) field's own tokens, not the whole
+    // `suite!` invocation.
+    let dup = |field: &str, span: proc_macro2::Span| -> syn::Error {
+        syn::Error::new(span, format!("suite!: duplicate `{field}` field"))
+    };
+    let first_span = |exprs: &[Expr]| -> proc_macro2::Span {
+        exprs.first().map(|e| e.span()).unwrap_or_else(proc_macro2::Span::call_site)
     };
 
     for f in fields {
         match f {
             SuiteField::Runtime(p) => {
                 if runtime.is_some() {
-                    return Err(dup("runtime"));
+                    return Err(dup("runtime", p.span()));
                 }
                 runtime = Some(p);
             }
             SuiteField::Kernels(k) => {
                 if kernels.is_some() {
-                    return Err(dup("kernels"));
+                    let span =
+                        k.first().map(|i| i.span()).unwrap_or_else(proc_macro2::Span::call_site);
+                    return Err(dup("kernels", span));
                 }
                 kernels = Some(k);
             }
             SuiteField::Evidence(e) => {
                 if evidence.is_some() {
-                    return Err(dup("evidence"));
+                    return Err(dup("evidence", e.span()));
                 }
                 evidence = Some(e);
             }
             SuiteField::Sizes(s) => {
                 if sizes.is_some() {
-                    return Err(dup("sizes"));
+                    return Err(dup("sizes", first_span(&s)));
                 }
                 sizes = Some(s);
             }
             SuiteField::Seed(s) => {
                 if seed.is_some() {
-                    return Err(dup("seed"));
+                    return Err(dup("seed", s.span()));
                 }
                 seed = Some(s);
             }
             SuiteField::CubeDim(c) => {
                 if cube_dim.is_some() {
-                    return Err(dup("cube_dim"));
+                    return Err(dup("cube_dim", c.span()));
                 }
                 cube_dim = Some(c);
             }
             SuiteField::Prove(p) => {
                 if prove.is_some() {
-                    return Err(dup("prove"));
+                    return Err(dup("prove", p.span()));
                 }
                 prove = Some(p);
             }
             SuiteField::FrontendIndependent(p) => {
                 if frontend_independent.is_some() {
-                    return Err(dup("frontend_independent"));
+                    return Err(dup("frontend_independent", p.span()));
                 }
                 frontend_independent = Some(p);
             }
             SuiteField::ExtraLane { cfg_predicate, path } => {
                 if extra_lane.is_some() {
-                    return Err(dup("extra_lane"));
+                    return Err(dup("extra_lane", path.span()));
                 }
                 extra_lane = Some((cfg_predicate, path));
             }
@@ -756,7 +780,13 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
                         bad.kernel
                     );
                 }
-                current.save(&__vericl_evidence_path).expect("write vericl evidence manifest");
+                current.save(&__vericl_evidence_path).unwrap_or_else(|e| {
+                    panic!(
+                        "vericl: could not write the evidence manifest to {} ({e}) — check the \
+                         `evidence:` path is writable and its parent directory exists",
+                        __vericl_evidence_path.display()
+                    )
+                });
                 println!("vericl evidence written to {}", __vericl_evidence_path.display());
             } else {
                 let stored = ::vericl::Manifest::load(&__vericl_evidence_path).unwrap_or_else(|e| {

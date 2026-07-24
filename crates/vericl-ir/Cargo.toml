@@ -1,10 +1,12 @@
 [package]
 name = "vericl-ir"
 description = "CubeCL IR extraction, kernel identity hashing, and SMT out-of-bounds proving for vericl"
-publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["cubecl", "gpu", "smt", "verification", "kernel"]
+categories = ["development-tools::testing", "science", "mathematics"]
 
 [dependencies]
 cubecl = { workspace = true }

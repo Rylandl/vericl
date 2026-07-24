@@ -22,7 +22,12 @@ pub enum Compare {
     /// exists, but an absolute bound derived from the declared input ranges
     /// does. The bound is part of the contract and must be justified by the
     /// `assumes(...)` clauses.
-    AbsRelF32 { abs: f32, rel: f32 },
+    AbsRelF32 {
+        /// Absolute tolerance term.
+        abs: f32,
+        /// Relative tolerance term (scaled by `|expected|`).
+        rel: f32,
+    },
     /// f64 counterpart of [`Compare::MaxUlpF32`] — maximum permitted ULP
     /// distance between f64 results. The macro emits this (rather than the
     /// f32 variant) for an f64 kernel; see the `NumKind::F64` handling in
@@ -31,10 +36,17 @@ pub enum Compare {
     /// f64 counterpart of [`Compare::AbsRelF32`]. Tolerances are stored at f64
     /// precision (an f64 tolerance rounded to f32 would be a dishonest record
     /// of a bound the author declared for an f64 kernel).
-    AbsRelF64 { abs: f64, rel: f64 },
+    AbsRelF64 {
+        /// Absolute tolerance term (f64 precision).
+        abs: f64,
+        /// Relative tolerance term (scaled by `|expected|`).
+        rel: f64,
+    },
 }
 
 impl Compare {
+    /// A short human-readable description of the comparison mode, as recorded
+    /// in the evidence `contract.compare` field (e.g. `"f32 max_ulp=0"`).
     pub fn describe(&self) -> String {
         match self {
             Compare::Exact => "exact".to_string(),
@@ -60,6 +72,10 @@ impl Compare {
 ///
 /// Recognizing more clause shapes only ever adds provable obligations —
 /// never silently loosens one — so growing this enum is always sound.
+///
+/// Generated-code plumbing: constructed by `#[vericl::kernel]` and consumed by
+/// the `suite!`/`conform` prover wiring — not an API user code calls.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuredAssume {
     /// `A.len() == B.len()`.
@@ -133,8 +149,11 @@ pub struct Contract {
 /// Serializable form of a [`Contract`] for the evidence manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContractRecord {
+    /// Pretty-printed `assumes(...)` clauses.
     pub assumes: Vec<String>,
+    /// The declared comparison mode ([`Compare::describe`]).
     pub compare: String,
+    /// Whether the `wrapping` clause was declared.
     pub wrapping: bool,
     /// See [`Contract::instantiate`]. `[]` for a non-generic, non-comptime
     /// kernel. `#[serde(default)]` so evidence written before this field
@@ -155,7 +174,10 @@ pub struct ContractRecord {
 /// identity and the currently built kernel makes the evidence stale.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Identity {
+    /// Hash of the kernel source tokens + contract + vericl version (composition-
+    /// aware for a kernel with `uses(...)`; see `<kernel>_vericl::identity()`).
     pub source_hash: String,
+    /// The `vericl` version that produced the evidence.
     pub vericl_version: String,
     /// Content hash of the expanded CubeCL IR (see `vericl-ir::kernel_ir_hash`).
     ///
@@ -183,6 +205,7 @@ impl Contract {
         }
     }
 
+    /// The serializable [`ContractRecord`] form of this contract, for the manifest.
     pub fn record(&self) -> ContractRecord {
         ContractRecord {
             assumes: self.assumes.iter().map(|s| s.to_string()).collect(),
@@ -231,6 +254,7 @@ impl Contract {
 /// purely cosmetic reordering, never let a real dependency change through
 /// unnoticed — but is worth knowing before reordering a `uses(...)` list
 /// expecting evidence to stay untouched.
+#[doc(hidden)] // generated-code plumbing (called by `<kernel>_vericl::identity()`)
 pub fn combine_source_hash(local: &str, deps: &[String]) -> String {
     if deps.is_empty() {
         return local.to_string();
@@ -252,6 +276,7 @@ pub fn combine_source_hash(local: &str, deps: &[String]) -> String {
 /// macro invocations with full reliability; see that check's doc). 32 is
 /// far beyond any plausible legitimate helper-call depth (v0's own examples
 /// nest at most two deep) and cheap to check on every call.
+#[doc(hidden)] // generated-code plumbing (runtime cycle backstop)
 pub const MAX_HELPER_COMPOSITION_DEPTH: u32 = 32;
 
 /// Panics with an actionable message identifying `name` if `depth` has
@@ -263,6 +288,7 @@ pub const MAX_HELPER_COMPOSITION_DEPTH: u32 = 32;
 /// forever chasing its own tail instead of failing loudly and namely — a
 /// silent hang is strictly worse than a clear panic naming the offending
 /// item.
+#[doc(hidden)] // generated-code plumbing (called by `<kernel>_vericl::identity()`)
 pub fn check_helper_composition_depth(name: &str, depth: u32) {
     assert!(
         depth < MAX_HELPER_COMPOSITION_DEPTH,

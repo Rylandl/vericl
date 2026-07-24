@@ -705,8 +705,12 @@ fn transform_body(
                     } else {
                         format!(
                             "`{s}` is outside the vericl v0 kernel subset; unsupported constructs \
-                             are rejected rather than silently approximated (see README \
-                             \"First release\")"
+                             are rejected rather than silently approximated. Rewrite the kernel \
+                             within the supported subset — affine `ABSOLUTE_POS` indexing, bounded \
+                             `for`/`match`, `&Array<T>`/core `Slice`, `#[comptime]`/generic params \
+                             via `instantiate(...)`, and (via `cooperative(cube_dim = N)`) \
+                             workgroup shared memory — or see the rejection reference in \
+                             docs/guide.md for what `{s}` needs"
                         )
                     };
                     errors.push(syn::Error::new(id.span(), msg));
@@ -1457,6 +1461,16 @@ fn is_slice_creation_call(e: &Expr) -> bool {
 /// do not compile — the borrow checker IS the rejection, §4.3). Runs on the
 /// twin only; the re-emitted `#[cube]` kernel keeps `x.slice(a, b)` verbatim.
 ///
+/// **Where the aliasing rejection lands (rustc-mediated, by design).** An
+/// overlapping-mutable-slice kernel is rejected by rustc's own borrow checker on
+/// this generated twin — the user sees a standard **E0499** ("cannot borrow `*x`
+/// as mutable more than once at a time") or **E0502** on the `.slice_mut(...)`
+/// call spans, not a vericl-authored message. This is deliberate (the borrow
+/// checker is the aliasing oracle, not an approximation of one); a buffer-named
+/// vericl diagnostic is future work (`docs/design-view-slice.md` §8.4). The
+/// guide's "Reading rejections" section names E0499/E0502 so a user hitting it
+/// knows it is the intended safety catch, not a spurious macro failure.
+///
 /// Slice laundering / reinterpret methods (`SLICE_REJECT_METHODS`) are rejected.
 ///
 /// # Latent fragility — keys on method **name + arity**, not receiver type (F4)
@@ -1867,7 +1881,12 @@ struct Param {
 /// parameter names/types before the full param list is classified.
 fn fn_arg_ident(pt: &PatType) -> syn::Result<Ident> {
     let Pat::Ident(pi) = pt.pat.as_ref() else {
-        return Err(syn::Error::new(pt.pat.span(), "expected a plain parameter name"));
+        return Err(syn::Error::new(
+            pt.pat.span(),
+            "expected a plain parameter name — destructuring, tuple, or `_` patterns in a \
+             kernel/helper signature are outside the vericl v0 subset; give each parameter a \
+             simple name (e.g. `x: &Array<f32>`)",
+        ));
     };
     Ok(pi.ident.clone())
 }
@@ -1937,7 +1956,9 @@ fn classify_param(arg: &FnArg) -> syn::Result<Param> {
         }),
         other => Err(syn::Error::new(
             other.span(),
-            "unsupported parameter type in the vericl v0 subset",
+            "unsupported parameter type in the vericl v0 subset — a kernel/helper parameter must \
+             be a scalar (f32/f64/u32/i32/u64/i64), an `&Array<T>`/`&mut Array<T>`, a core \
+             `&Slice<T>`/`&SliceMut<T>` (helper params only), or a `#[comptime]` scalar",
         )),
     }
 }
@@ -2431,7 +2452,9 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     if !matches!(func.sig.output, ReturnType::Default) {
         return Err(syn::Error::new(
             func.sig.output.span(),
-            "kernels must not return a value",
+            "kernels must not return a value — a `#[cube(launch)]` kernel writes its results \
+             through an `&mut Array<T>` output parameter, not a return value (a value-returning \
+             `#[cube]` device function is a `#[vericl::helper]` instead)",
         ));
     }
 
@@ -3933,8 +3956,15 @@ fn expand_reference(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStrea
     // The attribute takes no arguments — a declared reference carries no
     // contract of its own (it is compared against the kernel, not launched).
     if !attr.is_empty() {
+        // Underline the offending argument tokens, not the whole call site.
+        let attr_span = attr
+            .clone()
+            .into_iter()
+            .next()
+            .map(|t| t.span())
+            .unwrap_or_else(proc_macro2::Span::call_site);
         return Err(syn::Error::new(
-            proc_macro2::Span::call_site(),
+            attr_span,
             format!(
                 "#[vericl::reference] on `{fn_name_str}` takes no arguments — it only records the \
                  fn's source hash for a kernel's `reference = …` identity (docs/design-shared-\
