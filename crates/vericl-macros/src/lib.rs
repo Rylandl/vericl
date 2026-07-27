@@ -34,6 +34,7 @@ use syn::{
     RangeLimits, ReturnType, Token, Type, parse_macro_input, parse_quote,
 };
 
+mod config;
 mod coop;
 mod suite;
 
@@ -1297,21 +1298,59 @@ impl Fold for StripUnrollFold {
 /// that constant's doc for why. A pure check, not a rewrite: unlike
 /// `StripUnrollFold`/`WrappingFold` it never changes the tree, only
 /// collects `errors`.
+/// **Receiver awareness (design R6).** The list is a list of *names*, so before
+/// this it produced a false positive on a config method that happens to share
+/// one: `cfg.dot()` on a struct-typed `#[comptime]` parameter was rejected with
+/// a message about `F::dot` and the Float whitelist — a wrong diagnosis for a
+/// plain host method on a user struct (`dot`, `normalize`, `magnitude` are all
+/// plausible config method names). A method call whose receiver chain is rooted
+/// in a **config** `#[comptime]` parameter is therefore exempt from the
+/// name-based list: its host-callability is gated where the config is declared
+/// (`vericl::config!` runs the same list over every method body in the block),
+/// which is strictly stronger than a name check here.
+///
+/// The exemption is withdrawn the moment the name is ambiguous. `locals` holds
+/// every binding the body introduces; if the config parameter's name is *also*
+/// bound as a local anywhere in the body, the receiver could be either, so the
+/// ordinary error is emitted with a note naming both readings. This mirrors
+/// `check_instantiate_local_collisions`' posture — the shadowing case is
+/// resolved by rejecting, never by guessing.
 #[derive(Default)]
 struct FloatMethodCheck {
     errors: Vec<syn::Error>,
+    /// Names of the struct-typed (config) `#[comptime]` parameters of the item
+    /// being checked. Empty for every kernel without one, which is why this
+    /// change is a no-op for existing kernels.
+    config_params: HashSet<String>,
+    /// Every name the body binds locally (over-inclusive; see
+    /// `collect_locals`). A config parameter name appearing here makes the
+    /// receiver ambiguous.
+    locals: HashSet<String>,
 }
 
 impl FloatMethodCheck {
     fn check(&mut self, name: &Ident) {
+        self.check_with_note(name, None);
+    }
+
+    fn check_with_note(&mut self, name: &Ident, ambiguous_config_param: Option<&str>) {
         let s = name.to_string();
         if FLOAT_METHOD_REJECT.contains(&s.as_str()) {
+            let note = match ambiguous_config_param {
+                Some(p) => format!(
+                    " — note: if `{s}` is a method on the #[comptime] config parameter `{p}`, its \
+                     host-callability is gated where the config is declared (`vericl::config!`), \
+                     not here; but `{p}` is also bound as a local in this body, so which one this \
+                     receiver names cannot be decided at macro-expansion time — rename the local"
+                ),
+                None => String::new(),
+            };
             self.errors.push(syn::Error::new(
                 name.span(),
                 format!(
                     "host-callability of `F::{s}` in the reference twin is unverified — outside \
                      the vericl v0 subset; verified host-callable Float/Numeric methods are: \
-                     {}",
+                     {}{note}",
                     FLOAT_METHOD_WHITELIST.join(", ")
                 ),
             ));
@@ -1321,7 +1360,19 @@ impl FloatMethodCheck {
 
 impl Fold for FloatMethodCheck {
     fn fold_expr_method_call(&mut self, i: syn::ExprMethodCall) -> syn::ExprMethodCall {
-        self.check(&i.method);
+        let root = receiver_root_ident(i.receiver.as_ref());
+        match root.as_deref() {
+            // Rooted in a config comptime param, unshadowed: gated at the
+            // `vericl::config!` declaration instead of by name here.
+            Some(r) if self.config_params.contains(r) && !self.locals.contains(r) => {}
+            // Rooted in a config comptime param's NAME, but that name is also
+            // bound locally: ambiguous, so check and explain both readings.
+            Some(r) if self.config_params.contains(r) => {
+                let r = r.to_string();
+                self.check_with_note(&i.method, Some(&r));
+            }
+            _ => self.check(&i.method),
+        }
         syn::fold::fold_expr_method_call(self, i)
     }
 
@@ -2004,6 +2055,130 @@ fn is_comptime_param(arg: &FnArg) -> bool {
     pt.attrs.iter().any(|a| a.path().is_ident("comptime"))
 }
 
+/// Scalar types a `#[comptime]` parameter may have *without* being a config
+/// type. Matched by trailing path segment (like `is_wrapping_integer_type`), so
+/// `std::primitive::u32` counts. Everything else in `#[comptime]` position is a
+/// **struct-typed comptime parameter**: a config, which must be declared with
+/// `vericl::config!` (docs/design-struct-comptime.md §10.1).
+const COMPTIME_SCALAR_TYPES: &[&str] = &[
+    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "bool",
+    "char", "f32", "f64",
+];
+
+/// `true` iff a `#[comptime]` parameter's (already instantiate-substituted)
+/// type is a **config type** — anything that is not a plain scalar.
+///
+/// Deliberately "not a scalar" rather than "looks like a struct": the point is
+/// that every non-scalar comptime type goes through the `ConfigIdentity`
+/// requirement, so an unrecognized shape is *gated*, never waved through. A
+/// generic-argument-carrying path (`Vec<u32>`, `Option<Cfg>`) is a config type
+/// by this rule and is therefore rejected for want of a `ConfigIdentity` impl —
+/// the honest v1 boundary, since neither its definition nor its contents can be
+/// hashed (design §10.1).
+fn is_config_comptime_type(ty: &Type) -> bool {
+    let Type::Path(tp) = ty else { return true };
+    if tp.qself.is_some() {
+        return true;
+    }
+    let Some(last) = tp.path.segments.last() else { return true };
+    if !matches!(last.arguments, syn::PathArguments::None) {
+        return true;
+    }
+    !COMPTIME_SCALAR_TYPES.contains(&last.ident.to_string().as_str())
+}
+
+/// The distinct config types among a classified parameter list, in declared
+/// parameter order, deduplicated by type token text — the order and set the
+/// kernel folds `<T as ConfigIdentity>::CONFIG_HASH` into `identity()` in.
+fn config_comptime_types(params: &[Param]) -> Vec<Type> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<Type> = Vec::new();
+    for p in params {
+        let ParamKind::Comptime(ty) = &p.kind else { continue };
+        if !is_config_comptime_type(ty) {
+            continue;
+        }
+        if seen.insert(ty.to_token_stream().to_string()) {
+            out.push(ty.clone());
+        }
+    }
+    out
+}
+
+/// Design R2 — the **pinnable expression** allowlist for a struct-typed
+/// `#[comptime]` parameter's `instantiate(...)` value.
+///
+/// `instantiate(...)` stores a comptime value as raw tokens and splices it into
+/// three places: the reference twin's `let` binding, the kernel's `expand()`
+/// call, and `kernel_definition()`'s. A value that differs between those
+/// evaluations makes the recorded evidence describe a kernel that was never run
+/// — measured (design §5.3 F8): an `ImpureCfg` whose method returns an
+/// incrementing counter gives the twin `1` and the kernel `2`, diverging by
+/// 8388608 ulp while the *proof* still reports `Proved{2}`, because the IR is
+/// internally consistent with whichever variant was expanded.
+///
+/// This is a recognizer, and the round-4 recognizer lesson applies: the
+/// recognized form must *imply* the claimed property, so the classifier is an
+/// explicit allowlist of `Expr` variants and anything unclassified is rejected.
+/// It is only half the gate — the syntactic half. The other half is emitted, not
+/// checked: every pinned config value is additionally bound to a generated
+/// `const` item of the parameter's own type (see `config_pin_checks` in
+/// `expand`), so rustc itself must const-evaluate it. That is what actually
+/// rules out `cfg = cfg_from_env()`, which is syntactically a call like any
+/// `const fn` call and cannot be told apart from one by `syn`.
+fn is_pinnable_config_expr(e: &Expr) -> bool {
+    match e {
+        // A literal leaf, or a path to a `const` / unit struct / unit variant.
+        Expr::Lit(_) => true,
+        Expr::Path(p) => p.qself.is_none(),
+        // A struct/enum literal whose every field (and functional-update base)
+        // is itself pinnable.
+        Expr::Struct(s) => {
+            s.fields.iter().all(|f| is_pinnable_config_expr(&f.expr))
+                && s.rest.as_deref().is_none_or(is_pinnable_config_expr)
+        }
+        // A call with a *named* callee: an enum tuple-variant constructor, a
+        // tuple-struct constructor, or a `const fn`. Const-evaluability (hence
+        // purity) is enforced by the emitted `const` binding, not here.
+        Expr::Call(c) => {
+            matches!(peel_paren(c.func.as_ref()), Expr::Path(_))
+                && c.args.iter().all(is_pinnable_config_expr)
+        }
+        Expr::Unary(u) => {
+            matches!(u.op, syn::UnOp::Neg(_) | syn::UnOp::Not(_))
+                && is_pinnable_config_expr(&u.expr)
+        }
+        Expr::Paren(p) => is_pinnable_config_expr(&p.expr),
+        Expr::Group(g) => is_pinnable_config_expr(&g.expr),
+        Expr::Tuple(t) => t.elems.iter().all(is_pinnable_config_expr),
+        Expr::Array(a) => a.elems.iter().all(is_pinnable_config_expr),
+        _ => false,
+    }
+}
+
+/// The root identifier a method call's receiver chain bottoms out in —
+/// `cfg` for `cfg.tile().m`, `x` for `(&x[i]).foo()`, `None` for anything that
+/// isn't rooted in a plain single-segment name. Used by `FloatMethodCheck` to
+/// tell a config method call from a Float method call (design R6).
+fn receiver_root_ident(mut e: &Expr) -> Option<String> {
+    loop {
+        match e {
+            Expr::Paren(p) => e = &p.expr,
+            Expr::Group(g) => e = &g.expr,
+            Expr::Field(f) => e = &f.base,
+            Expr::MethodCall(m) => e = &m.receiver,
+            Expr::Index(i) => e = &i.expr,
+            Expr::Unary(u) => e = &u.expr,
+            Expr::Reference(r) => e = &r.expr,
+            Expr::Try(t) => e = &t.expr,
+            Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
+                return Some(p.path.segments[0].ident.to_string());
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn classify_param(arg: &FnArg) -> syn::Result<Param> {
     let FnArg::Typed(pt) = arg else {
         return Err(syn::Error::new(arg.span(), "self parameters are not supported"));
@@ -2019,10 +2194,23 @@ fn classify_param(arg: &FnArg) -> syn::Result<Param> {
 
     if comptime {
         return match pt.ty.as_ref() {
+            // Design R5. The old text here claimed "must be plain scalar types"
+            // while only ever rejecting references — a wording bug, not a gate
+            // (docs/design-struct-comptime.md §10.3): a struct-typed comptime
+            // param has always fallen through to `ParamKind::Comptime`, and as
+            // of the struct-comptime milestone it is *officially* supported,
+            // gated by `ConfigIdentity` + the pinnable-expression check rather
+            // than by this arm. What is genuinely rejected is the reference
+            // form (17 real ecosystem sites use it), for the reason stated.
             Type::Reference(r) => Err(syn::Error::new(
                 r.span(),
-                "#[comptime] parameters must be plain scalar types in the vericl v0 subset \
-                 (Array is not supported as a comptime parameter)",
+                "a #[comptime] parameter must be taken by value, not by reference — a `&T` \
+                 cannot be pinned by instantiate(...) (the pinned expression is bound as a \
+                 `let` in the reference twin, so its lifetime is the twin binding's, not the \
+                 kernel's); change the parameter to take `T` by value (a comptime config is \
+                 `Clone` by CubeCL's own requirement, so passing by value is free at \
+                 expansion). A struct/enum comptime parameter IS supported by value — declare \
+                 its type with `vericl::config! { … }` (docs/design-struct-comptime.md)",
             )),
             _ => Ok(Param { name, kind: ParamKind::Comptime(pt.ty.as_ref().clone()) }),
         };
@@ -2304,7 +2492,10 @@ fn resolve_instantiate(
                 format!(
                     "{item_kind} `{fn_name_str}` has generic type parameters and/or \
                      #[comptime] parameters but no instantiate(...) contract clause; add one \
-                     naming a concrete value for each, e.g. `instantiate(F = f32, N = 8)`, so \
+                     naming a concrete value for each, e.g. `instantiate(F = f32, N = 8)` — or, \
+                     for a struct-typed #[comptime] config parameter, a literal construction \
+                     such as `instantiate(cfg = TileCfg {{ m: 3, n: 8 }})` (the config type must \
+                     be declared with `vericl::config! {{ … }}`) — so \
                      vericl can monomorphize the reference twin{}",
                     if item_kind == "helper" {
                         "" // the twin is the only thing a helper monomorphizes
@@ -2493,9 +2684,15 @@ fn resolve_instantiate(
 
 /// Tidy `quote`'s token spacing for human-readable contract strings.
 fn pretty(ts: &impl ToTokens) -> String {
-    ts.to_token_stream()
-        .to_string()
-        .replace(" . ", ".")
+    // Collapse whitespace runs first: a long token stream (a nested config
+    // struct literal in `instantiate(...)`, say) comes back from
+    // `TokenStream::to_string()` line-wrapped by rustc's pretty printer, and a
+    // recorded contract string with embedded newlines is unreadable in the
+    // evidence JSON. A no-op for every short single-line value (`F = f32`,
+    // `taps = 3`, an `assumes` clause) — verified by the evidence manifests
+    // being byte-identical across this change.
+    let flat = ts.to_token_stream().to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.replace(" . ", ".")
         .replace(" (", "(")
         .replace("( ", "(")
         .replace(" )", ")")
@@ -2507,6 +2704,24 @@ fn pretty(ts: &impl ToTokens) -> String {
 #[proc_macro]
 pub fn suite(input: TokenStream) -> TokenStream {
     match suite::expand(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// `vericl::config! { <the config type and every one of its impl blocks> }` —
+/// the declaration form for a struct-typed `#[comptime]` parameter's type.
+///
+/// Re-emits the items verbatim, hashes the whole block into
+/// `impl ::vericl::ConfigIdentity for T { const CONFIG_HASH }`, and gates every
+/// body in it. A kernel taking `#[comptime] cfg: T` folds `T`'s `CONFIG_HASH`
+/// into its recorded identity, so a config method-body edit makes stored
+/// evidence stale — the identity hole this macro exists to close. See
+/// `config::expand`'s module doc for the gate table and the precise residual,
+/// and `docs/design-struct-comptime.md` for the measurements behind it.
+#[proc_macro]
+pub fn config(input: TokenStream) -> TokenStream {
+    match config::expand(input.into()) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -2712,6 +2927,38 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         &fn_name_str,
     )?;
 
+    // --- design R2, the recognizing half: a struct-typed #[comptime]
+    // parameter's `instantiate(...)` value must be a pinnable expression form.
+    // See `is_pinnable_config_expr` for what that means and why the emitted
+    // `const` binding (below) is the other, enforcing half.
+    for p in &params {
+        let ParamKind::Comptime(ty) = &p.kind else { continue };
+        if !is_config_comptime_type(ty) {
+            continue;
+        }
+        let tokens = &plan.comptime_values[&p.name.to_string()];
+        let pinnable = syn::parse2::<Expr>(tokens.clone())
+            .ok()
+            .is_some_and(|e| is_pinnable_config_expr(&e));
+        if !pinnable {
+            return Err(syn::Error::new(
+                tokens.span(),
+                format!(
+                    "instantiate(...) value for the struct-typed #[comptime] parameter `{}` must \
+                     be a literal construction (e.g. `TileCfg {{ m: 3, n: 8 }}`, `Mode::Triple`, a \
+                     path to a `const`) or a call to a `const fn` with pinnable arguments — \
+                     `{}` is an arbitrary host expression, which vericl cannot pin: the pinned \
+                     expression is evaluated separately for the reference twin, for kernel \
+                     expansion, and for IR extraction, so a value that varies between them (or \
+                     between builds) makes the recorded evidence describe a kernel that was never \
+                     run",
+                    p.name,
+                    pretty(tokens)
+                ),
+            ));
+        }
+    }
+
     // `wrapping` rewrites `+`/`-`/`*`/`<<`/`>>` untyped — syn has no type
     // information at macro-expansion time — so it must not be allowed to
     // touch float math. Every parameter (including a #[comptime] const,
@@ -2899,8 +3146,20 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
 
     // Reject any call to a Float/Numeric method whose host-callability isn't
     // verified (see FLOAT_METHOD_REJECT) — a silently panicking or
-    // miscomputing twin is exactly what vericl must never ship.
-    let mut float_check = FloatMethodCheck::default();
+    // miscomputing twin is exactly what vericl must never ship. Receiver-aware
+    // for struct-typed `#[comptime]` (config) parameters: a `cfg.dot()` is a
+    // host method on a user struct, gated at the `vericl::config!` declaration,
+    // not a Float intrinsic (design R6). Both sets are empty for a kernel
+    // without a config parameter, so this is a no-op there.
+    let mut float_check = FloatMethodCheck {
+        errors: Vec::new(),
+        config_params: params
+            .iter()
+            .filter(|p| matches!(&p.kind, ParamKind::Comptime(t) if is_config_comptime_type(t)))
+            .map(|p| p.name.to_string())
+            .collect(),
+        locals: collect_locals(&ref_block, &[]),
+    };
     ref_block = float_check.fold_block(ref_block);
     if let Some(combined) = float_check.errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
@@ -2975,6 +3234,53 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         let ref_accessor = reference_accessor_path(ref_path);
         identity_dep_exprs.push(quote!(#ref_accessor()));
     }
+    // --- struct-typed #[comptime] (config) parameters: one identity dependency
+    // per distinct config type, in declared parameter order (design §7). This is
+    // the third instance of the same precedent — `uses(...)` folds a helper's
+    // hash, `reference = path` folds a declared reference's, and a config type
+    // folds `vericl::config!`'s hash of its whole declaration block. Without it,
+    // a config METHOD BODY edit changes what the kernel computes (measured: ×24
+    // -> ×11) while leaving `SOURCE_HASH` bit-identical, because the config's
+    // definition is in neither of that hash's inputs (design §5.1).
+    //
+    // Naming `<T as ::vericl::ConfigIdentity>::CONFIG_HASH` is also what
+    // *requires* the declaration: an undeclared config type has no impl, so the
+    // kernel fails to compile with the trait's
+    // `#[diagnostic::on_unimplemented]` message naming `vericl::config!`
+    // (design R1) — the same "the dependency must be annotated" mechanism the
+    // `reference = …` fold gets from calling a sibling accessor that only
+    // `#[vericl::reference]` generates.
+    let config_types = config_comptime_types(&params);
+    for ty in &config_types {
+        identity_dep_exprs
+            .push(quote!(<#ty as ::vericl::ConfigIdentity>::CONFIG_HASH.to_string()));
+    }
+
+    // --- design R2, the enforcing half: bind every struct-typed comptime
+    // parameter's pinned value to a `const` of its own type, so rustc must
+    // const-evaluate it. `instantiate(cfg = cfg_from_env())` is syntactically
+    // indistinguishable from a `const fn` call (`is_pinnable_config_expr`
+    // classifies the *form*; it cannot see constness), and the pinned expression
+    // is evaluated once per consumer — twin, `expand()`, `kernel_definition()` —
+    // so an impure one makes the three disagree and the recorded evidence
+    // describe a kernel that was never run (measured, design §5.3 F8). A `const`
+    // item is Rust's own purity guarantee and rejects it with E0015 at the
+    // value's span. It doubles as a type check on the pinned value.
+    let config_pin_checks: Vec<TokenStream2> = params
+        .iter()
+        .filter_map(|p| {
+            let ParamKind::Comptime(ty) = &p.kind else { return None };
+            if !is_config_comptime_type(ty) {
+                return None;
+            }
+            let value = &plan.comptime_values[&p.name.to_string()];
+            let ident = format_ident!("__VERICL_PIN_MUST_BE_CONST_EVALUABLE_{}", p.name);
+            Some(quote! {
+                #[allow(dead_code, non_upper_case_globals)]
+                const #ident: #ty = #value;
+            })
+        })
+        .collect();
 
     // --- generated signatures ---
     let mod_name = Ident::new(&format!("{fn_name}_vericl"), fn_name.span());
@@ -3351,6 +3657,14 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             /// `identity()` below for the recorded, composition-aware hash).
             pub const SOURCE_HASH: &str = #hash;
 
+            // Design R2's enforcing half — one `const` per struct-typed
+            // #[comptime] parameter, binding its pinned value at its declared
+            // type so rustc must const-evaluate it. An impure pin
+            // (`cfg = cfg_from_env()`) is E0015 here, at the value's own span,
+            // instead of a numeric divergence in the differential lane. Absent
+            // entirely for a kernel with no config parameter.
+            #(#config_pin_checks)*
+
             /// Names of the `#[vericl::helper]`-annotated functions this
             /// kernel calls via `uses(...)`. `[]` for a non-composing
             /// kernel.
@@ -3410,6 +3724,14 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             /// `SOURCE_HASH` is folded in the same way, so a drift in the
             /// reference *body* (not just the clause path text the attribute
             /// tokens already cover) moves identity too (round-3 review F2).
+            /// For a kernel with a struct-typed `#[comptime]` (config)
+            /// parameter, `<T as ::vericl::ConfigIdentity>::CONFIG_HASH` — the
+            /// `vericl::config!` block's hash of the config type AND every one
+            /// of its impl blocks — is folded in last, one per distinct config
+            /// type in declared parameter order, so a config METHOD BODY edit
+            /// moves identity even though `SOURCE_HASH` (which covers neither
+            /// the config's definition nor its methods) cannot see it
+            /// (docs/design-struct-comptime.md §5.1, §7).
             /// A no-op wrapper (returns exactly
             /// `contract().identity()`) when `USES` is empty and no reference
             /// is declared. Depth-guarded
@@ -3915,7 +4237,17 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
     // safety relies on Rust preferring an inherent method over a trait
     // method for a *concrete* receiver type, a preference that does not
     // apply to a bound-but-unsubstituted generic type parameter).
-    let mut float_check = FloatMethodCheck::default();
+    // Receiver-aware for a struct-typed (config) `#[comptime]` helper parameter,
+    // exactly as on the kernel path (design R6).
+    let mut float_check = FloatMethodCheck {
+        errors: Vec::new(),
+        config_params: params
+            .iter()
+            .filter(|p| matches!(&p.kind, ParamKind::Comptime(t) if is_config_comptime_type(t)))
+            .map(|p| p.name.to_string())
+            .collect(),
+        locals: collect_locals(&ref_block, &[]),
+    };
     ref_block = float_check.fold_block(ref_block);
     if let Some(combined) = float_check.errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
@@ -3994,6 +4326,11 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
         }
     };
 
+    // Struct-typed (config) #[comptime] parameter types, folded into this
+    // helper's `identity_hash_at` below — the helper-side half of the kernel's
+    // config-identity folding (design §7).
+    let helper_config_types = config_comptime_types(&params);
+
     let pin_note = if plan.pretty.is_empty() {
         String::new()
     } else {
@@ -4051,11 +4388,23 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
             /// own place in the chain — see
             /// `::vericl::check_helper_composition_depth`'s doc for why this
             /// is guarded rather than left to recurse unbounded.
+            ///
+            /// A struct-typed (config) `#[comptime]` parameter's
+            /// `<T as ::vericl::ConfigIdentity>::CONFIG_HASH` is folded in the
+            /// same way, after the used sub-helpers: a helper's comptime
+            /// parameters stay pass-through (the *caller* pins the value), but
+            /// the config's definition still determines what the helper
+            /// computes, so it belongs in the helper's identity exactly as it
+            /// belongs in a kernel's. Naming the associated const also requires
+            /// the type to be declared with `vericl::config!`.
             pub fn identity_hash_at(depth: u32) -> ::std::string::String {
                 ::vericl::check_helper_composition_depth(#fn_name_str, depth);
                 ::vericl::combine_source_hash(
                     SOURCE_HASH,
-                    &[#(#used_helper_mods::identity_hash_at(depth + 1)),*],
+                    &[
+                        #(#used_helper_mods::identity_hash_at(depth + 1),)*
+                        #(<#helper_config_types as ::vericl::ConfigIdentity>::CONFIG_HASH.to_string(),)*
+                    ],
                 )
             }
         }
@@ -6743,5 +7092,261 @@ mod tests {
             errors.iter().any(|e| e.to_string().contains("nested")),
             "the rejection must mention the nested macro: {errors:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Struct-typed #[comptime] parameters (docs/design-struct-comptime.md).
+    // The macro's own half: classification, the pinnable-expression
+    // recognizer (R2), the identity fold (§7), and the receiver-aware
+    // FloatMethodCheck (R6). The end-to-end half — a real config kernel that
+    // compiles, proves, and whose identity MOVES on a config method-body edit
+    // — lives in `crates/vericl-examples`.
+    // -----------------------------------------------------------------
+
+    fn comptime_ty(src: &str) -> Type {
+        let arg: FnArg = syn::parse_str(src).expect("valid fn arg");
+        match classify_param(&arg).expect("classified").kind {
+            ParamKind::Comptime(t) => t,
+            _ => panic!("expected a comptime param for `{src}`"),
+        }
+    }
+
+    /// A `#[comptime]` parameter's type is a *config type* exactly when it is
+    /// not a plain scalar. The classification decides who must implement
+    /// `ConfigIdentity`, so an unrecognized shape must land on the CONFIG side
+    /// (gated), never on the scalar side (waved through).
+    #[test]
+    fn config_comptime_type_classification() {
+        for scalar in ["taps: u32", "b: bool", "k: usize", "a: f32", "q: std::primitive::u32"] {
+            let src = format!("#[comptime] {scalar}");
+            assert!(
+                !is_config_comptime_type(&comptime_ty(&src)),
+                "`{scalar}` must classify as a plain scalar"
+            );
+        }
+        for cfg in [
+            "cfg: TileCfg",
+            "cfg: nested::Deep",
+            "mode: Mode",
+            // Generic-argument-carrying paths are config types by this rule and
+            // therefore need a ConfigIdentity impl they cannot have — the
+            // honest v1 boundary (a `Vec<u32>` comptime value was accepted
+            // ungated before this milestone).
+            "w: Vec<u32>",
+            "o: Option<TileCfg>",
+        ] {
+            let src = format!("#[comptime] {cfg}");
+            assert!(
+                is_config_comptime_type(&comptime_ty(&src)),
+                "`{cfg}` must classify as a config type"
+            );
+        }
+    }
+
+    /// Design R5: the comptime-parameter rejection is now about *references*,
+    /// which is what it always actually enforced — the old "must be plain
+    /// scalar types" text described a gate that did not exist (§10.3).
+    #[test]
+    fn reference_comptime_param_is_rejected_with_the_by_value_message() {
+        let arg: FnArg = syn::parse_str("#[comptime] cfg: &TileCfg").expect("valid fn arg");
+        let err = match classify_param(&arg) {
+            Err(e) => e,
+            Ok(_) => panic!("a reference comptime param must be rejected"),
+        };
+        let s = err.to_string();
+        assert!(s.contains("by value, not by reference"), "got: {s}");
+        assert!(s.contains("vericl::config!"), "the message must name the config form: {s}");
+        assert!(
+            !s.contains("must be plain scalar types"),
+            "the un-enforced 'plain scalar types' claim must be gone: {s}"
+        );
+    }
+
+    fn pinnable(src: &str) -> bool {
+        is_pinnable_config_expr(&syn::parse_str::<Expr>(src).expect("valid expr"))
+    }
+
+    /// Design R2, the recognizer half. Strict-by-construction: an explicit
+    /// allowlist of `Expr` variants, everything else unclassified and therefore
+    /// rejected.
+    #[test]
+    fn pinnable_config_expression_recognizer() {
+        for good in [
+            "TileCfg { m: 3, n: 8 }",
+            "Mode::Triple",
+            "nested::Deep { v: 7 }",
+            "StageCfg { tile: TileCfg { m: 3, n: 8 }, k: 2 }",
+            "default_cfg()",
+            "TileCfg::square(4)",
+            "Mode::Scaled(3)",
+            "DEFAULT_CFG",
+            "TileCfg { m: 3, ..BASE }",
+            "Wrap { v: -1 }",
+            "Arr { a: [1, 2, 3], t: (1, true) }",
+        ] {
+            assert!(pinnable(good), "`{good}` must be pinnable");
+        }
+        for bad in [
+            // The design's H2 shape.
+            "cfg_from_env().tweak()",
+            "{ let c = TileCfg { m: 3, n: 8 }; c }",
+            "if flag { A } else { B }",
+            "vec![2u32, 3, 5]",
+            "unsafe { READ() }",
+            "*PTR",
+            "cfg.clone()",
+            "&TileCfg { m: 3, n: 8 }",
+            "|| TileCfg { m: 3, n: 8 }",
+        ] {
+            assert!(!pinnable(bad), "`{bad}` must NOT be pinnable");
+        }
+    }
+
+    /// End-to-end R2: a non-pinnable value for a struct-typed comptime param is
+    /// rejected at macro time with the authored message. A *scalar* comptime
+    /// param is untouched by this gate (it was never the hazard: its value is a
+    /// literal in the contract tokens the source hash covers).
+    #[test]
+    fn non_pinnable_config_pin_is_rejected_end_to_end() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: TileCfg) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let err = expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0),
+                   instantiate(cfg = cfg_from_env().tweak())),
+            &func,
+        )
+        .expect_err("an arbitrary host expression must not be pinnable");
+        let s = err.to_string();
+        assert!(s.contains("must be a literal construction"), "got: {s}");
+        assert!(s.contains("`cfg`"), "the message must name the parameter: {s}");
+        assert!(s.contains("evidence describe a kernel that was never run"), "got: {s}");
+
+        // Discrimination: the literal construction of the SAME type is accepted.
+        expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0),
+                   instantiate(cfg = TileCfg { m: 3, n: 8 })),
+            &func,
+        )
+        .expect("a literal construction must be accepted");
+    }
+
+    /// §7: a kernel with a struct-typed comptime param folds
+    /// `<T as ConfigIdentity>::CONFIG_HASH` into `identity()` and emits the
+    /// const-evaluability pin check; a kernel WITHOUT one emits neither
+    /// (the byte-identical-identity guarantee for every existing kernel).
+    #[test]
+    fn config_kernel_folds_config_hash_and_emits_the_pin_check() {
+        let cfg_fn: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: TileCfg) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let out = expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0),
+                   instantiate(cfg = TileCfg { m: 3, n: 8 })),
+            &cfg_fn,
+        )
+        .expect("valid config kernel")
+        .to_string();
+        assert!(
+            out.contains("< TileCfg as :: vericl :: ConfigIdentity > :: CONFIG_HASH"),
+            "the config hash must be folded into identity(): {out}"
+        );
+        assert!(
+            out.contains("__VERICL_PIN_MUST_BE_CONST_EVALUABLE_cfg"),
+            "the const-evaluability pin check must be emitted: {out}"
+        );
+
+        let scalar_fn: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] taps: u32) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let scalar_out = expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0),
+                   instantiate(taps = 3)),
+            &scalar_fn,
+        )
+        .expect("valid scalar kernel")
+        .to_string();
+        assert!(
+            !scalar_out.contains("as :: vericl :: ConfigIdentity >"),
+            "a scalar comptime kernel must not fold a config hash: {scalar_out}"
+        );
+        assert!(!scalar_out.contains("__VERICL_PIN_MUST_BE_CONST_EVALUABLE"), "no pin check for a scalar");
+        // The strongest form of risk 4's guard at this level: a kernel with no
+        // comptime parameter at all is byte-identical to what it expanded to
+        // before this milestone in the identity-relevant respect — no deps.
+        let plain: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let plain_out =
+            expand(quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0)), &plain)
+                .expect("valid plain kernel")
+                .to_string();
+        assert!(plain_out.contains("combine_source_hash (SOURCE_HASH , & [] ,)"), "{plain_out}");
+    }
+
+    /// Design R6, both directions. The false positive: a config method named
+    /// `dot` is NOT rejected. The preserved true positive: the same name on a
+    /// float array element still is. And the shadowing case (risk 8): a local
+    /// binding of the config parameter's name makes the receiver ambiguous, so
+    /// the rejection returns, with a note naming both readings.
+    #[test]
+    fn float_method_check_is_receiver_aware_for_config_params() {
+        let attr = quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0),
+                          instantiate(cfg = TileCfg { m: 3, n: 8 }));
+
+        // (a) `cfg.dot()` on a config comptime param: accepted.
+        let ok: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: TileCfg) { \
+             if ABSOLUTE_POS < y.len() { \
+             y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * f32::cast_from(cfg.dot()); } }",
+        )
+        .expect("valid fn");
+        expand(attr.clone(), &ok).expect("a config method named `dot` must not be rejected");
+
+        // (b) a genuine float `.dot(..)` still rejected, message unchanged.
+        let bad: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: TileCfg) { \
+             if ABSOLUTE_POS < y.len() { \
+             y[ABSOLUTE_POS] = x[ABSOLUTE_POS].dot(x[0]); } }",
+        )
+        .expect("valid fn");
+        let err = expand(attr.clone(), &bad).expect_err("a float `.dot(..)` must still be rejected");
+        assert!(err.to_string().contains("host-callability of `F::dot`"), "got: {err}");
+
+        // (c) risk 8 — the config param name is also bound as a local, so the
+        // receiver is ambiguous: reject, with the note.
+        let shadow: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: TileCfg) { \
+             if ABSOLUTE_POS < y.len() { let cfg = x[ABSOLUTE_POS]; \
+             y[ABSOLUTE_POS] = cfg.dot(x[0]); } }",
+        )
+        .expect("valid fn");
+        let err = expand(attr, &shadow).expect_err("a shadowed receiver must be rejected");
+        let s = err.to_string();
+        assert!(s.contains("host-callability of `F::dot`"), "got: {s}");
+        assert!(s.contains("also bound as a local"), "the note must explain the ambiguity: {s}");
+    }
+
+    /// A kernel WITHOUT a config param keeps the old receiver-blind behavior
+    /// exactly — the exemption is opt-in via a declared config parameter, not a
+    /// general weakening of the list.
+    #[test]
+    fn float_method_check_without_config_params_is_unchanged() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS].normalize(); } }",
+        )
+        .expect("valid fn");
+        let err = expand(quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0)), &func)
+            .expect_err("`.normalize()` must still be rejected");
+        assert!(err.to_string().contains("F::normalize"), "got: {err}");
     }
 }

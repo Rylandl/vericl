@@ -2532,3 +2532,169 @@ byte-for-byte, all differentials green; new `evidence/round3.json` (7 entries) p
 cubek-random distribution core (Bernoulli) compiles, is differential-green at `max_ulp = 0`
 and `Proved{5}`; its probe contract also turned out to carry a `compare(exact)`-on-f32 bug
 that the rejection had been hiding (see the survey addendum).
+
+## Struct-typed `#[comptime]` params — SOUNDNESS milestone — DONE 2026-07-27
+
+Built to `docs/design-struct-comptime.md`. **Review round 10 covers this milestone together with the
+already-landed shim-and-small-gate batch above** (the design's own §13 pre-registration; the same
+"one review over two related batches" pattern round 7 used for quick-wins 1+2).
+
+**The premise correction first, because everything else follows from it.** The capability was never
+missing — it was *ungated and unclaimed*. `classify_param` rejected only *reference*-typed comptime
+params (its error text claimed "must be plain scalar types" and enforced nothing of the sort), and
+`resolve_instantiate` stores a comptime value as raw tokens, so fourteen struct-comptime shapes
+already compiled, passed the wgpu differential and proved. **So this is a soundness milestone with
+zero new capability**, closing three measured defects.
+
+### What shipped
+
+**1. `vericl::config! { … }`** (`crates/vericl-macros/src/config.rs`, new). Re-emits its items
+verbatim, hashes the whole token block into `impl ::vericl::ConfigIdentity for T { const
+CONFIG_HASH }` (one per declared struct/enum), and runs nine gates over the block. An item macro, not
+an attribute, for a structural reason: an inherent `impl` is a separate item, so an attribute on the
+type could not see — let alone hash or gate — the method bodies, which is where the defects live.
+Hash granularity is deliberately identical to a kernel's own `SOURCE_HASH` (token-level: whitespace
+and `//` comments do not move it, a doc comment does).
+
+**2. Kernel/helper side.** A struct-typed `#[comptime]` param's type must implement `ConfigIdentity`
+— naming `<T as ConfigIdentity>::CONFIG_HASH` in the generated `identity()` is simultaneously the
+identity fold and the *requirement*, exactly the mechanism `reference = path` uses. Folded via
+`combine_source_hash` after the `uses(...)` and reference deps, one per distinct config type in
+declared param order. Helpers fold theirs into `identity_hash_at` the same way.
+
+**3. Pinnable-expression gate, in two halves.** A syntactic allowlist of `Expr` variants
+(`is_pinnable_config_expr`; strict-by-construction, unclassified ⇒ rejected) with a VeriCL-authored
+message — *plus* a generated `const __VERICL_PIN_MUST_BE_CONST_EVALUABLE_<name>: T = <value>;` in the
+kernel's module, so rustc must const-evaluate the pin. The second half is what actually rules out
+`cfg = cfg_from_env()`: syntactically it is a call like any `const fn` call, and `syn` cannot see
+constness. Measured: `error[E0015]: cannot call non-const function 'cfg_from_env' in constants` at
+the value's own span, with a note pointing at the non-const fn.
+
+**4. Un-claimed the false gate.** `classify_param`'s comptime error now says what it enforces (take
+the parameter by value; a struct/enum IS supported, declare it with `vericl::config!`). The
+missing-`instantiate` suggestion gained the struct form. `FloatMethodCheck` is receiver-aware: a
+method call rooted in a *config* comptime param is exempt from the name-based list (gated at the
+declaration instead), which fixes the measured `cfg.dot()` false positive without touching the
+`x.dot(y)` true positive.
+
+### Risks 2 and 3 — the two the design flagged unresolved
+
+**Risk 2 (a free function called from a config method escapes the hash and the gates) — CLOSED, in
+the sound direction.** Gate G4: a call in a config body must resolve to something the block declares,
+to `Self`, to a primitive's associated fn (`u32::max`), or to `core`/`std`/`alloc`. Anything else is
+rejected by name with a message that names the fix ("move the function INTO this vericl::config!
+block"). Three companion gates close the same escape by other routes, each of which was a real hole:
+**G9** rejects reading a `const`/`static` declared outside the block; **G8** rejects any macro
+invocation in a body (`anything!(fma(a,b,c))` would otherwise evade G3 and G4 wholesale, since a
+macro's tokens are opaque to `syn`'s visitors); **G7** rejects `static`/`mod`/`macro_rules!` items;
+and a struct-literal check rejects constructing an undeclared type. Two further gates close the
+design's own §7 *deferral* rather than merely documenting it: **G6** requires every field type to be
+a scalar primitive or a type declared in the SAME block (so a nested config in a sibling block cannot
+escape the hash — the design had this as a v1.1 `deps(...)` item), and **G5** rejects a generic config
+type (one block is one hash, so `Cfg<A>` and `Cfg<B>` would share an identity).
+
+**Risk 3 (an out-of-block `#[cube] impl` evades both) — NOT closed; accepted with a loud backstop, and
+the residual is now a TEST rather than prose.** Rust permits an inherent `impl` for a local type
+anywhere in the crate and a `#[proc_macro]` sees only the tokens it is handed, so there is no
+macro-scope fix. `crates/vericl-examples/tests/config_out_of_block_backstop.rs` pins all three parts:
+(i) the host-callability half fails loudly — the twin panics with `Unexpanded Cube functions should
+not be called.`; (ii) the *real harness path* records it as `reference_panic`, the case does not pass,
+and `describe_case_outcome` renders it — nothing swallowed; (iii) an assertion whose entire job is to
+STATE the residual — two byte-identical `config!` blocks with different out-of-block impls hash
+identically — written to fail if the residual is ever closed, with a discrimination control showing
+an *in-block* edit does move the hash. Additional backstop: a config-derived value that reaches the
+device is a constant in the IR, so `ir_hash` moves even when `source_hash` does not. Narrower members
+of the same family, stated: an out-of-block *trait* impl (including operator traits), and `core`/`std`
+bodies (not user code, so not an identity concern).
+
+### The identity-regression proof
+
+The design's §5.1 measurement is now a permanent test
+(`config_identity_moves_on_a_config_method_edit`): `cfg_identity_base::scaled` and
+`cfg_identity_alt::scaled` are **token-identical** kernels — same name in two modules, same body, same
+contract — differing only in `TileCfg::total()`'s body (`self.m * self.n` vs `self.m + self.n`). It
+asserts, in order: their `SOURCE_HASH`es are **bit-identical** (the hole, still there, so the test
+fails if that hash's inputs silently change); their twins compute `×24` vs `×11`; their **recorded
+identities differ**; and the recorded hash is exactly `combine_source_hash(SOURCE_HASH,
+[CONFIG_HASH])`, reproduced independently rather than merely observed to differ.
+
+### End-to-end staleness, and why `ir_hash` alone would not have done it
+
+Injected (then reverted) a single config METHOD BODY edit — `StageCfg::scale()`'s `Doubled` arm from
+`2 * base` to `3 * base` — and re-ran the public suite without renewing evidence:
+
+```text
+kernel `config_window_sum`: STALE evidence — identity mismatch
+  (source_hash sha256:aebbe050… -> sha256:84ec3bd0…, ir_hash sha256:b1b507d6… -> sha256:66aaf9b1…)
+kernel `config_mode_scale`:  STALE evidence — identity mismatch
+  (source_hash sha256:4d4b31a5… -> sha256:0979a558…)
+```
+
+`config_mode_scale` is the decisive line. It pins the `Flat` arm, so the edit does not change what it
+computes and **its `ir_hash` does not move at all** — only the folded `CONFIG_HASH` moves it. That is
+the design's §5.1 argument made concrete: `ir_hash` is a *partial* mitigation (it is `Option`, it is
+only populated under `prove: true`, and it cannot see a host-only surface such as a config used in
+`assumes(...)`), and the source-level config fold is the actual fix.
+
+### Negative controls (one per positive, per the pre-registered risks)
+
+Macro-level (`vericl-macros` unit tests 67 -> **92**: 18 new in the `config` module, 7 new
+kernel-side): config-hash movement on a method edit; hash
+granularity (whitespace/comment vs doc comment); verbatim re-emission; each of G1–G9 rejected with a
+positive control beside it; the pinnable recognizer over 11 accepted and 9 rejected forms; R2
+end-to-end with the literal-construction discrimination; the config-hash fold present for a config
+kernel and **absent** for scalar-comptime and plain kernels; R6's three cases (accepted `cfg.dot()`,
+rejected `x.dot(y)`, and the shadowed-receiver ambiguity re-rejected with a note). Compile-level,
+measured in a scratch crate: R1's rendered `E0277` with the label on the parameter and a help at the
+type definition; R2's `E0015` at the pin span; R4 at `fma`'s own span (one error, not two — G3
+suppresses G4 for the same call); R5 on `&TileCfg`; the `const fn` pin accepted as a positive control;
+and the `define_3d_size_base!`-in-`config!` rejection. Run-level: the out-of-block backstop trio.
+
+### Public surface + evidence
+
+Two suite-wired example kernels on both lanes, plus 7 new `vericl-examples` lib tests (98 -> 105)
+and a 3-test residual-backstop integration file. `config_window_sum` — fields + a depth-2 config method
+as a **loop bound** + a **`comptime!` block** over the same config (enum dispatch) — `max_ulp = 0`,
+`Proved{3}`. `config_mode_scale` — the same config type pinned at a different value, the enum's other
+arm, and a config method **named `dot`** (R6's false positive, fixed in code that compiles) —
+`max_ulp = 0`, `Proved{2}`. Plus the two identity-probe modules and the risk-3 evasion probe, none
+suite-wired. **All 26 pre-existing evidence entries are byte-identical** (per-entry canonical-JSON
+SHA-256) — risk 4's guard, at the evidence level; two entries added.
+
+### Ecosystem correction + spot-validation
+
+`docs/ecosystem-survey-2026-07.md` gains the struct-comptime correction addendum, and the two rows
+that quoted the false gate now carry SUPERSEDED markers. Both classifier runs were **reproduced
+independently** rather than copied from the design: 51 → **89** gate-free items (+38, matching the
+recorded sole-blocker count exactly), `fn_nontest` **12 → 12 unchanged** (all 38 are impl blocks (29)
+or trait definitions (9), which `ItemFn`-based macros structurally cannot annotate), 127 → 158
+single-gate items. The frontier re-ranks: **custom `CubeType` struct args 8 → 28 sole-blocker, all 28
+plain non-test `fn`s** — the only plain-function bucket in the table and 9× the next best. Also moved:
+View/Layout 45 → 57 (0 fns), `comptime_type!` 4 → 18, `plane_*` 2 → 14, `comptime!{}` 2 → 9 (3 fns).
+
+Spot-validated in the survey workspace, non-destructively (13 pre-existing entries byte-identical, 1
+added): `tile_size_window_scale`, a clean-room port of `cubek-std/src/size.rs`'s `TileSize` +
+`MatmulDim` — upstream's `get(dim)` enum dispatch and the whole `m()/n()/k()/mn()/mnk()` accessor
+chain — driving a loop bound and a `comptime!` block. `max_ulp = 0` on wgpu/Metal and cubecl-cpu,
+`Proved{3}`. **The one measured ergonomic cost:** upstream declares that family with
+`define_3d_size_base!`, and a macro invocation inside `vericl::config!` is rejected (the invocation's
+tokens would be hashed but the macro's *definition* would not). The expansion must be written out.
+For a corpus where a whole config-type family is macro-generated, that is the largest friction the
+milestone introduces, and it is the price of the hash meaning what it says.
+
+### Deferred, recorded rather than silently skipped
+
+- **`Identity::ir_hash` unconditional** (design M4's second half). Left as-is: the one `prove: false`
+  suite's stored evidence would change, which is out of scope for this milestone's deliverables, and
+  the backstop it strengthens (risk 3's identity half) is already present on every `prove: true`
+  suite. Recorded as a standalone follow-up.
+- Structured config-driven `assumes` (design §10.4), config-derived `SharedMemory`/`gen(...)` sizes,
+  and free-fn calls inside `comptime!` — all unchanged deferrals with targeted rejections.
+- **Behaviour change worth knowing:** a non-config struct comptime value that was *accidentally*
+  accepted before is now rejected — notably `instantiate(w = vec![2u32, 3, 5])` (`Vec<u32>` has no
+  `ConfigIdentity`, and `vec![…]` is not a pinnable form). That is the design's declared v1 boundary
+  (§10.1), not a regression, but it is a real narrowing of what compiled yesterday.
+
+**Gates:** full workspace test green on default and `--features cpu`; clippy clean on both,
+all targets; demo-defects exit 0 (every defect caught); evidence updated last.
+

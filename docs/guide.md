@@ -26,6 +26,7 @@ charter-and-changelog; this document is the manual.
 3. [Your first verified kernel](#3-your-first-verified-kernel)
 4. [The contract clauses, built up](#4-the-contract-clauses-built-up)
 5. [Generic and `#[comptime]` kernels: `instantiate(...)`](#5-generic-and-comptime-kernels-instantiate)
+   - [5.1 Struct-typed `#[comptime]` config parameters: `vericl::config!`](#51-struct-typed-comptime-config-parameters-vericlconfig)
 6. [Kernel composition: `#[vericl::helper]` + `uses(...)`](#6-kernel-composition-vericlhelper--uses)
 7. [Cooperative kernels: shared-memory reductions](#7-cooperative-kernels-shared-memory-reductions)
 8. [The `suite!` block](#8-the-suite-block)
@@ -358,6 +359,122 @@ platform caveat, stated loudly: **WGSL has no f64**, and CubeCL launches an f64 
 wgpu/Metal backend with no error and silently wrong results. So an f64 kernel's differential lane
 must be `cubecl-cpu`, never wgpu (see section 8 and the README's "f64 support" section).
 
+### 5.1 Struct-typed `#[comptime]` config parameters: `vericl::config!`
+
+A `#[comptime]` parameter's type does not have to be a scalar. CubeCL lets you pass a whole
+configuration struct or enum, and evaluates every `cfg.field` / `cfg.method()` as **ordinary host
+Rust while the IR is built** — the config never reaches the GPU; only the constants it computes do.
+This is how the CubeCL ecosystem configures nearly everything.
+
+VeriCL supports it, with one requirement: **the config type and all of its impl blocks must be
+declared inside a `vericl::config! { … }` block.**
+
+```rust
+vericl::config! {
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+    pub struct WindowCfg { pub taps: u32, pub gain: u32 }
+
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+    pub enum Weighting { Flat, Doubled }
+
+    // A nested config: `WindowCfg` must be declared in this SAME block.
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+    pub struct StageCfg { pub window: WindowCfg, pub weighting: Weighting }
+
+    impl WindowCfg {
+        pub fn taps(&self) -> u32 { self.taps }
+    }
+
+    impl StageCfg {
+        pub fn taps(&self) -> u32 { self.window().taps() }
+        pub fn window(&self) -> WindowCfg { self.window }
+        pub fn scale(&self) -> u32 {
+            let base = self.window().gain;
+            match self.weighting { Weighting::Flat => base, Weighting::Doubled => 2u32 * base }
+        }
+    }
+}
+
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0),
+    instantiate(cfg = StageCfg { window: WindowCfg { taps: 3, gain: 2 }, weighting: Weighting::Doubled })
+)]
+#[cube(launch)]
+pub fn config_window_sum(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: StageCfg) {
+    if ABSOLUTE_POS < y.len() {
+        let mut acc = x[ABSOLUTE_POS];
+        for j in 1..cfg.taps() {                    // a config method as a loop bound
+            let idx = ABSOLUTE_POS + j as usize;
+            if idx < x.len() { acc += x[idx]; }
+        }
+        let scale = comptime!(cfg.scale());         // a comptime! block over the config
+        y[ABSOLUTE_POS] = acc * f32::cast_from(scale);
+    }
+}
+```
+
+`instantiate(...)`'s grammar is unchanged — a config is pinned exactly like a scalar.
+
+**Why the declaration is required.** A kernel's `SOURCE_HASH` covers its own tokens and its contract
+attribute's. A config type's *definition* is in neither. Before `vericl::config!` existed, editing
+`total()` from `self.m * self.n` to `self.m + self.n` changed a kernel from ×24 to ×11 and left its
+recorded identity bit-identical — the evidence still looked fresh. `vericl::config!` hashes the whole
+block into a `CONFIG_HASH` that the kernel folds into its identity, so that edit now re-stales the
+evidence, exactly the way editing a `uses(...)` helper's body does.
+
+**If you forget it**, the error names the fix:
+
+```text
+error[E0277]: `TileCfg` is used as a struct-typed #[comptime] parameter but is not declared with a
+              `vericl::config!` block
+   |
+   | pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: TileCfg) {
+   |                                                               ^^^^^^^ not a vericl config type
+   = note: wrap the type AND its impl blocks in `vericl::config! { … }` so vericl can fold the
+           config's definition into kernel identity and gate its method bodies for host-callability
+```
+
+**What you can pin.** A literal construction — a struct/enum literal, a unit variant, a path to a
+`const`, nested compositions of those — or a call to a `const fn`. Anything else is rejected. The
+reason is not tidiness: the pinned expression is evaluated *separately* for the reference twin, for
+kernel expansion, and for IR extraction, so a value that differs between them produces evidence
+describing a kernel that was never run. `const` is Rust's own guarantee that it cannot:
+
+```text
+error[E0015]: cannot call non-const function `cfg_from_env` in constants
+   |
+   |     instantiate(cfg = cfg_from_env())
+   |                       ^^^^^^^^^^^^^^
+```
+
+**What a config method body may contain.** Ordinary host Rust: field reads, arithmetic, `if`,
+`match`, `let`, loops, calls to `core`/`std`, to a primitive's associated functions (`u32::max`), to
+`Self`, and to anything else the same block declares. What it may **not** contain, and why:
+
+| Rejected in a `vericl::config!` block | Why |
+|---|---|
+| a call to a non-host-callable intrinsic (`fma`, `cast_from`, `mul_hi`, …) | it runs in the reference twin as host Rust and would panic there; you get a compile error at the callee instead |
+| `#[cube]` on any impl or method | the twin would call the host body while the device gets the expanded one |
+| a call to a **free function declared outside the block** | its body is neither hashed nor gated — move the function into the block |
+| a read of a `const`/`static` declared outside the block | same reason: the kernel's meaning would depend on something `CONFIG_HASH` cannot see |
+| a generic config type (`Cfg<S>`) | one block is one hash, so every instantiation would share it |
+| a field whose type is not a scalar primitive or another type declared in the same block | a nested config in a *sibling* block would escape the hash |
+| a `static`, a `mod`, or any macro invocation (including `macro_rules!`-generated config types) | their contents are opaque to the gates, so hashing the block would not cover what the type is |
+
+Each of these is a targeted message, and each exists so that the tokens VeriCL hashed really are the
+tokens that determine what the kernel computes.
+
+**One residual, stated up front.** Rust lets you write an inherent `impl` for your own type anywhere
+in the crate, and a `impl MyCfg { … }` written *outside* the `vericl::config!` block is invisible to
+both the hash and the gates — a proc macro only sees the tokens it is handed. Keep every impl for a
+config type inside its block. If you do not, the failure is loud rather than silent: a
+non-host-callable call reached that way panics in the twin with `Unexpanded Cube functions should
+not be called.`, which the differential lane reports as a failure.
+
+---
+
 ---
 
 ## 6. Kernel composition: `#[vericl::helper]` + `uses(...)`
@@ -667,9 +784,9 @@ rejected rather than approximated: unbounded `while`/`loop`, stepped/descending 
 
 ### Rustc-mediated rejections (delegated to the compiler, by design)
 
-Two safety catches are enforced by rustc on the *generated twin*, not by a VeriCL message — this is
-deliberate (the compiler is a stronger oracle than a macro pass), so recognize them for what they
-are:
+Four safety catches are enforced by rustc on the *generated twin* or on generated `const` items, not
+by a VeriCL message — this is deliberate (the compiler is a stronger oracle than a macro pass), so
+recognize them for what they are:
 
 - **Overlapping mutable slices** surface as a borrow-checker error **E0499** ("cannot borrow … as
   mutable more than once at a time") or **E0502** on your `.slice_mut(...)` calls. That is the
@@ -681,6 +798,17 @@ are:
   "cannot find function `conformance_case`"). The `suite!` macro can't see whether a name is an
   annotated kernel, so it can't pre-empt this. The fix is always: add `#[vericl::kernel(...)]` (and
   `#[cube(launch)]`) to the kernel, or remove the name from `kernels:`.
+
+- **A struct-typed `#[comptime]` parameter whose type is not declared with `vericl::config!`**
+  surfaces as **E0277** on the `ConfigIdentity` trait, with a VeriCL-authored
+  `#[diagnostic::on_unimplemented]` message, the label on the parameter's type and a help pointing at
+  the type's definition. Rustc renders it because the requirement *is* a trait bound — that is what
+  makes the declaration impossible to skip (section 5.1).
+- **A non-const-evaluable `instantiate(...)` value for a config parameter** surfaces as **E0015**
+  ("cannot call non-const function … in constants") at the value's own span, from the `const` binding
+  VeriCL generates for each pinned config value. The syntactic half of that gate is a
+  VeriCL-authored message; const-evaluability is delegated because Rust's own `const` rules are
+  exactly the purity guarantee needed (section 5.1).
 
 ### Run-time panics
 

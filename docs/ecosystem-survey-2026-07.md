@@ -325,6 +325,10 @@ The v0 survey ranked gaps by *incidence*. Incidence is the wrong number for "wha
 this unlock", because an item usually trips several gates. The re-census adds the sole-blocker count
 (items where the gate is the only blocking gate tripped); 127 of 464 items have exactly one.
 
+> **Row 1 SUPERSEDED (2026-07-27)**: `struct-typed #[comptime] param` was a classifier bug, not a
+> VeriCL gate — see the struct-comptime correction addendum at the end of this document for the
+> re-run without it (51 → 89 gate-free, `fn_nontest` **12 → 12**, and a re-ranked frontier).
+
 | Gate | Items | **Sole** | Sole non-test `fn` |
 |---|---:|---:|---:|
 | struct-typed `#[comptime]` param | 243 | **38** | 0 |
@@ -356,7 +360,9 @@ it.**
 **`comptime!{}` blocks unlock zero on their own.** All 12 lexically admissible items are blocked by
 something else — 9 of the 12 by a struct-typed `#[comptime]` param, exactly as the 2026-07-23 update
 predicted. That shape is now measured: **243 of 464 items, the single largest blocking gate in the
-corpus.**
+corpus.** (Superseded: it turned out not to be a gate at all — see the struct-comptime correction
+addendum. The `comptime!{}` finding stands and in fact sharpens: with the false gate removed,
+`comptime!{}` out of subset goes from 2 to **9** sole-blocker, 3 of them plain non-test `fn`s.)
 
 Core `Slice` is the same story, and consistent with the Slice milestone's own "necessary but rarely
 sufficient": of ~84 slice-creation sites inside `#[cube]` items, every one in cubek/cubecl-std
@@ -432,6 +438,12 @@ byte-identical, verified by per-entry canonical-JSON SHA-256):
   panic at every size.
 
 ### The post-re-census frontier ranking (measured)
+
+> **SUPERSEDED (2026-07-27)** — item 1 below measured a classifier bug, not a VeriCL gate. See
+> "Addendum — struct-comptime correction" at the end of this document for the re-run: struct-typed
+> `#[comptime]` params leave the ranking entirely (they were never a gate), and **`custom CubeType`
+> struct args become #1 at 28 sole-blocker, all 28 plain non-test `fn`s**. The rest of this section
+> is preserved as it was recorded.
 
 The Slice milestone's recorded frontier ranking was (1) `plane_*`, (2) `CubeType`-arg, (3) 2-D
 topology, (4) `Tensor` + `View`. **The sole-blocker measurement overturns it.**
@@ -512,3 +524,108 @@ evidence than "runs and passes", and this is a concrete instance of the gap.
 Also cleared by this batch, from the re-census's `cast_from` three-bucket accounting: the
 `usize`-source rows move from "definitely still rejected" to shimmed. The **non-`f32` cast
 TARGET** rows (e.g. `u32::cast_from(...)`) are unchanged and remain the honest residual.
+
+## Addendum — struct-comptime correction (2026-07-27): the 243/38 row measured a classifier bug
+
+**The re-census's #1-ranked gate did not exist.** The classifier's rule is "any `#[comptime] name: T`
+with `T` outside `{u8…usize, i8…isize, bool, f32, f64, char}` → **blocking**"
+(`classify.py:514-517`). Measured against unmodified VeriCL, that rule is wrong: `classify_param`
+only ever rejected *reference*-typed comptime parameters, and `resolve_instantiate` stores a comptime
+value as raw tokens, so fourteen struct-comptime shapes — plain fields, depth-2 method chains,
+`comptime!` blocks over a config, enum + `match` dispatch, config-driven loop bounds, `uses(...)`
+composition, a `const fn` pin, cooperative × config, a config type that also derives `CubeType`,
+`assumes(...)` over a config, `Vector` × config, generic-over-a-config-trait, path-qualified struct
+literals, and a non-`Copy` `Vec<u32>` value — all compiled and all passed the wgpu/Metal
+differential, with `Proved` SMT bounds on every shape that was proof-probed. The full measurement is
+`docs/design-struct-comptime.md` §2; the error text at the rejection site even *said* "must be plain
+scalar types" while enforcing nothing of the sort (a wording bug, now corrected).
+
+So the row measured the classifier, not VeriCL. **This addendum is that correction, and the
+milestone that followed it is a soundness milestone, not a coverage one.**
+
+### The corrected numbers (re-run, not estimated)
+
+`classify.py` re-run with the struct-comptime row demoted from `blocking` to `supported` and
+everything else byte-identical:
+
+| Bucket | with the false gate | without it | Δ |
+|---|---:|---:|---:|
+| Items tripping zero blocking gates | 51 | **89** | **+38** |
+| …with the extra return/unbounded-loop screen | 49 | **87** | +38 |
+| …of which **plain non-test `fn`** | 12 | **12** | **0** |
+| …of which impl/trait non-test | 33 | 71 | +38 |
+| Items with exactly one blocking gate | 127 | 158 | +31 |
+
+Both runs were reproduced independently for this addendum (`python3 classify.py` and
+`python3 scratchpad/structct/classify_nostructct.py` over the same six-crate scope): 51 → 89 total,
+12 → 12 `fn_nontest`, 127 → 158 single-gate items, and every row of the sole-blocker table below.
+The `+38` matches the recorded sole-blocker count exactly. **All 38 are `impl` blocks (29) or
+`trait` definitions (9); zero are free functions**, and `#[vericl::kernel]`/`#[vericl::helper]` both
+parse `ItemFn`, so VeriCL structurally cannot annotate any of them. Anyone reading "243 items, the
+single largest blocking gate" as a reach number is reading the wrong number — the same lesson the
+re-census itself taught about `match` (119 items, 0 unlocked) and `plane_*` (88 items, 2 sole).
+
+### The frontier re-ranks
+
+The recorded post-re-census ranking — (1) struct comptime, (2) View/Layout, (3) `CubeType` args — is
+**superseded**. With the false gate removed:
+
+| Gate | items | sole (before) | sole (after) | sole non-test `fn` (after) |
+|---|---:|---:|---:|---:|
+| **custom `CubeType` param (broad)** | 141 | 8 | **28** | **28** |
+| View/Layout machinery | 110 | 45 | **57** | 0 |
+| `comptime_type!` | 53 | 4 | **18** | 0 |
+| `plane_*` | 88 | 2 | **14** | 2 |
+| `comptime!{}` out of subset | 71 | 2 | **9** | **3** |
+| `CubeType`-arg (v0 name list) | 68 | 8 | 8 | 1 |
+| cmma / `Matrix` | 62 | 6 | 6 | 0 |
+
+**`custom CubeType param (broad)` is now unambiguously the next milestone: 28 sole-blocker, all 28
+plain non-test `fn`s** — a 3.5× jump, and the only bucket in the table that is plain functions. For
+*annotatable* functions it is 9× the next-best bucket. It is genuinely separate work (a twin
+representation for a struct-of-buffers, a `gen(...)` story for structured launch data, a `LaunchArg`
+construction path, per-field comparison semantics — `docs/design-struct-comptime.md` §4.4), and the
+struct-comptime mechanism does **not** cover it: the comptime path is a *bypass* with zero generated
+types, while `CubeLaunch` generates an `XLaunch`/`XCompilationArg`/`LaunchArg` fan-out per field.
+
+Two smaller co-gates become worth their own line items: `comptime!{}` out of subset (2 → 9 sole, 3
+plain fns), whose dominant unsupported form is a free-fn call inside `comptime!`, and `plane_*`
+(2 → 14 sole, 2 plain fns).
+
+**The impl/trait item wall is the real ceiling.** 71 of the 89 gate-free items — and every one of the
+38 this correction touches — are `impl`/`trait` members. Whether to grow `ItemImpl`/`ItemTrait`
+support is now the single largest open roadmap question, and it is orthogonal to every construct-level
+gate remaining.
+
+### What actually shipped, and what the corpus pays for it
+
+`vericl::config! { … }` (declaration + `CONFIG_HASH` + method-body gates), a `ConfigIdentity`
+requirement on struct-typed comptime parameter types, and a pinnable-expression gate. Three measured
+defects closed: a silent identity hole (a config method-body edit left `SOURCE_HASH` bit-identical
+while changing the kernel from ×24 to ×11), a compile-time gate hole (an `fma` in a config method
+failed only at run time), and an ungated pinned expression. Details and the residual:
+`docs/design-struct-comptime.md`, README "Struct-typed `#[comptime]` parameters".
+
+**Spot-validation — the corpus's canonical config shape, end to end.** `cubek-std/src/size.rs`
+generates `TileSize`/`PartitionSize`/`StageSize` from one `define_3d_size_base!`, and
+`config.tile_size.m()` is the ubiquitous accessor idiom (417 struct-comptime occurrences across 63
+type strings; nested structs and enums are 67% of them). Ported clean-room into the survey crate as
+`tile_size_window_scale` — `MatmulDim` + `TileSize` with upstream's enum-dispatched
+`get(dim)`/`m()`/`n()`/`k()`/`mn()`/`mnk()` chain, driving a loop bound (`tile.k()`) and a
+`comptime!` block (`tile.mn()`):
+
+| Kernel | Source | compare | wgpu/Metal | cubecl-cpu | Proved |
+|---|---|---|---|---|---|
+| `tile_size_window_scale` | cubek-std `size.rs:14-95` (`define_3d_size_base!`, expanded) | `max_ulp = 0` | PASS | PASS | `Proved{3}` |
+
+Added non-destructively: the 13 pre-existing evidence entries are byte-identical (per-entry canonical
+JSON SHA-256), one new entry added, identity `sha256:c9ff3bb2…` folding `TileSize`'s `CONFIG_HASH`.
+
+**The one real ergonomic cost, measured rather than glossed.** Upstream writes
+`define_3d_size_base!(TileSize, u32);`. A macro invocation inside `vericl::config!` is **rejected**:
+the invocation's tokens would be hashed but the macro's *definition* would not, so an edit to the
+macro would change what the config type is while leaving every dependent kernel's recorded identity
+unmoved — and no body gate can walk an unexpanded macro. The expansion must be written out. For this
+corpus, where a whole config-type family is macro-generated, that is the largest single friction the
+milestone introduces, and it is the price of the hash meaning what it says.
+

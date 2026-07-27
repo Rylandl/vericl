@@ -156,6 +156,106 @@ split needed). The reason is the same: for a *concrete* `f64` receiver Rust pref
 `f64::method` over the trait's `unexpanded!()` default, and the associated fns (`new`, `from_int`,
 `min_value`, `max_value`) have real per-type `f64` impls.
 
+### Struct-typed `#[comptime]` parameters: `vericl::config! { … }`
+
+A `#[comptime]` parameter's type does not have to be a scalar. CubeCL lets a `#[cube]` item take
+`#[comptime] cfg: SomeConfig` for a user struct or enum, and re-emits `cfg.field` / `cfg.method()`
+as **plain host Rust executed while the IR is built** — so the config never reaches the device, only
+the constants it computes do. This is the CubeCL ecosystem's dominant configuration idiom (243 of
+464 surveyed items; `docs/ecosystem-survey-2026-07.md`).
+
+VeriCL accepted that shape before this milestone — but *ungated and unclaimed*, with three measured
+defects (`docs/design-struct-comptime.md` §5). The decisive one: a config type's **definition** is in
+neither input of `SOURCE_HASH` (the kernel's own tokens; the contract attribute tokens), so editing a
+config method body from `self.m * self.n` to `self.m + self.n` changed the kernel from ×24 to ×11 and
+left the recorded identity **bit-identical**. Stored evidence stayed "fresh" while describing a
+different kernel.
+
+The declaration form closes it. Wrap the config type **and every one of its impl blocks** in one
+`vericl::config!` invocation:
+
+```rust
+vericl::config! {
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+    pub struct TileCfg { pub m: u32, pub n: u32 }
+
+    impl TileCfg {
+        pub fn total(&self) -> u32 { self.m * self.n }
+    }
+}
+
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0),
+    instantiate(cfg = TileCfg { m: 3, n: 8 })        // unchanged grammar
+)]
+#[cube(launch)]
+pub fn scaled(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: TileCfg) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * f32::cast_from(cfg.total());
+    }
+}
+```
+
+An item macro rather than an attribute for a structural reason: an inherent `impl` is a *separate
+item*, so `#[vericl::config]` on the type could not see — let alone hash or gate — the method bodies,
+which is where the defects live.
+
+**What the declaration buys.**
+
+- **Identity.** The macro hashes the whole token block into
+  `impl vericl::ConfigIdentity for TileCfg { const CONFIG_HASH }`, and the kernel folds that const
+  into `identity()` via `combine_source_hash` — the same treatment `uses(...)` gives a helper body
+  and `reference = path` gives a declared reference. A config method-body edit now makes the stored
+  evidence correctly stale.
+- **A required declaration, not an optional one.** A struct-typed `#[comptime]` parameter whose type
+  is *not* declared with `vericl::config!` no longer compiles:
+  `` error[E0277]: `TileCfg` is used as a struct-typed #[comptime] parameter but is not declared with
+  a `vericl::config!` block `` — via `#[diagnostic::on_unimplemented]`, with the label on the
+  parameter and a help pointing at the type definition.
+- **Gated method bodies.** Every body in the block is checked for host-callability with the same
+  closed reject list the kernel body gets, so an `fma` in a config method is a **compile** error at
+  the callee's span instead of a run-time twin panic. `#[cube]` anywhere in the block is rejected
+  outright.
+- **A pinnable pinned expression.** The `instantiate(...)` value for a config parameter must be a
+  literal construction (a struct/enum literal, a path to a `const`) or a `const fn` call. Two halves:
+  a strict-by-construction syntactic allowlist with a VeriCL-authored message, plus a generated
+  `const` binding of the value at its own type, so rustc must const-evaluate it —
+  `instantiate(cfg = cfg_from_env())` is `error[E0015]: cannot call non-const function
+  'cfg_from_env' in constants` at the value's span. Without that gate the pinned expression is
+  evaluated once per consumer (twin, `expand()`, IR extraction), and an impure one makes them
+  disagree: measured, an incrementing counter gave the twin `1` and the kernel `2` — an 8388608-ULP
+  divergence whose *proof* still said `Proved{2}`, because the IR was internally consistent with
+  whichever variant was expanded.
+
+**The subset, exactly.** Accepted: field access, method calls at any depth, `match`/`if` on a
+comptime scrutinee, `comptime!` blocks over a config, config-driven loop bounds and index
+arithmetic, nested config types (declared in the same block), `uses(...)` composition, generics,
+`Vector`, and cooperative kernels. Rejected, each with a targeted message: a config type not declared
+with `vericl::config!`; a non-pinnable `instantiate(...)` value; `#[cube]` on a config impl; a
+non-host-callable call in a config method; a **reference**-typed `#[comptime]` parameter (it must be
+taken by value); a generic config type; a field whose type is neither a scalar primitive nor declared
+in the same block; and, inside the block, a `static`, a `mod`, or any macro invocation — including
+the `macro_rules!`-generated config families CubeCL's own `cubek-std` uses, which must be written out
+so that what is hashed is what the type actually is. The prover is untouched: a struct-comptime
+kernel's IR is *byte-identical* to the same kernel written with plain comptime scalars.
+
+**The residual, stated plainly.** Rust allows an inherent `impl` for a local type anywhere in the
+crate, so a second impl block written *outside* the `vericl::config!` invocation escapes both the
+hash and the gates. There is no fix at macro scope. It is accepted because it fails loudly — the twin
+panics with `Unexpanded Cube functions should not be called.`, which the differential harness catches
+and reports, and a config-derived value that reaches the device still moves `ir_hash` — and both
+halves are pinned by tests
+(`crates/vericl-examples/tests/config_out_of_block_backstop.rs`), including one assertion whose whole
+job is to state the residual so it cannot be quietly forgotten.
+
+**Honest reach.** This milestone's value is soundness, not coverage. Re-running the ecosystem
+classifier with the (measured non-existent) struct-comptime gate removed moves gate-free items from
+51 to 89 — and plain non-test functions from 12 to **12, unchanged**: all 38 are `impl` blocks or
+`trait` definitions, which `#[vericl::kernel]`/`#[vericl::helper]` (both `ItemFn`-based)
+structurally cannot annotate.
+
 ### f64 support: the cubecl-cpu-only tier
 
 `instantiate(F = f64)` monomorphizes a generic kernel at `f64` exactly like `F = f32`: the twin

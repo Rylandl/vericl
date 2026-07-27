@@ -142,6 +142,28 @@ vericl::suite! {
         // destructuring a wrapping two-word counter step. Exact u32 + proved
         // bounds; the per-item interaction rule is unchanged.
         counter_split_map,
+        // --- Struct-typed #[comptime] parameters (docs/design-struct-comptime.md) ---
+        // A `#[comptime] cfg: StageCfg` whose type is declared with
+        // `vericl::config! { … }`. The config never reaches the device — CubeCL
+        // re-emits `cfg.field`/`cfg.method()` as host Rust at expansion time —
+        // so the IR is byte-identical to the same kernel written with plain
+        // comptime scalars, and the prover needs no notion of a config at all.
+        // What the milestone adds is soundness, not capability: each of these
+        // folds `<StageCfg as vericl::ConfigIdentity>::CONFIG_HASH` into its
+        // recorded identity, so a config METHOD BODY edit makes this evidence
+        // correctly stale (the hole measured in design §5.1 left it "fresh").
+        //
+        // `config_window_sum`: fields + a depth-2 config method as a LOOP BOUND
+        // + a `comptime!` block over the same config (enum dispatch). Bit-exact
+        // (`max_ulp = 0`, plain adds and one multiply by a constant — no fma
+        // contraction shape) + proved bounds.
+        config_window_sum,
+        // `config_mode_scale`: the same config type pinned at a different value,
+        // exercising the enum's other arm and a config method NAMED `dot` —
+        // which the receiver-blind float-method check used to reject with a
+        // message about `F::dot` (design R6's measured false positive). Bit-exact
+        // + proved.
+        config_mode_scale,
     ],
     evidence: "evidence/vericl.json",
     extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime),

@@ -217,6 +217,49 @@ impl Contract {
     }
 }
 
+/// Identity of a struct/enum used as a struct-typed `#[comptime]` kernel
+/// parameter (a *config type*), implemented **only** by the
+/// `vericl::config! { … }` item macro.
+///
+/// # Why this trait exists
+///
+/// A kernel's `SOURCE_HASH` covers its own tokens plus the contract attribute
+/// tokens (see [`Contract::source_hash`]). A config type's *definition* — its
+/// fields and, decisively, its **method bodies** — is in neither: it lives in
+/// separate items the kernel's `#[proc_macro_attribute]` invocation cannot
+/// see. Measured consequence before this trait existed: editing a config
+/// method from `self.m * self.n` to `self.m + self.n` changed the kernel from
+/// ×24 to ×11 while leaving `SOURCE_HASH` bit-identical, so stored evidence
+/// stayed "fresh" while describing a different kernel
+/// (`docs/design-struct-comptime.md` §5.1).
+///
+/// [`CONFIG_HASH`](ConfigIdentity::CONFIG_HASH) is a SHA-256 over the **whole**
+/// `vericl::config!` token block (every declared type, every impl block, every
+/// method body), which a kernel folds into its recorded identity via
+/// [`combine_source_hash`] — exactly the way `uses(...)` folds a helper's hash
+/// and `reference = path` folds a declared reference's. Requiring the trait is
+/// also what *forces* the declaration: a struct-typed `#[comptime]` parameter
+/// whose type is not wrapped in `vericl::config!` fails to compile, with the
+/// `#[diagnostic::on_unimplemented]` message below naming the fix.
+///
+/// # Do not implement this by hand
+///
+/// A hand-written impl can claim any hash it likes, including a constant one —
+/// which reintroduces exactly the identity hole the trait closes. Only
+/// `vericl::config!` derives a hash that actually covers the definition. See
+/// `docs/guide.md` §5.1 and the README's struct-comptime section.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is used as a struct-typed #[comptime] parameter but is not declared with a `vericl::config!` block",
+    label = "not a vericl config type",
+    note = "wrap the type AND its impl blocks in `vericl::config! {{ … }}` so vericl can fold the config's definition into kernel identity and gate its method bodies for host-callability"
+)]
+pub trait ConfigIdentity {
+    /// SHA-256 (as `"sha256:<hex>"`) over the entire `vericl::config!` token
+    /// block that declared this type. Folded into the kernel's recorded
+    /// `source_hash` by [`combine_source_hash`].
+    const CONFIG_HASH: &'static str;
+}
+
 /// Fold a kernel's or helper's own (compile-time) source hash together with
 /// the already-computed identity hashes of every helper it directly
 /// `uses(...)`, producing the hash actually recorded as identity.

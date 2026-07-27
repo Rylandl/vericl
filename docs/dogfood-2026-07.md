@@ -457,3 +457,40 @@ Message-only: every verdict, obligation count and counterexample is unchanged, a
 sibling that adds the guard the production pipeline already carries still proves at **exactly the
 same 55 obligations** the distilled version did — restoring the real phasor changed the fidelity,
 not the proof.
+
+## Addendum — struct-comptime soundness milestone (2026-07-27)
+
+**Private-corpus reach of this milestone: zero, and that was known before it started.** The
+re-census's ranked private walls are `fma`, `cast_from` sources, tuple `wrapping`, an injectivity
+assume and 2-D dispatch; **not one of the 22 private kernels uses a struct-typed `#[comptime]`
+parameter**. The 19/22 faithful count is unchanged by this milestone, and no private source,
+annotation or evidence file was touched.
+
+It is recorded here anyway, because dogfooding is where the *cost* of a soundness gate shows up
+first if it has one, and because the milestone's own claim is that it changes nothing for kernels
+that do not use it:
+
+- **Non-config kernels' identity is byte-identical.** `identity()` folds a config hash only when the
+  kernel declares a struct-typed `#[comptime]` parameter; with no dependencies
+  `combine_source_hash` is a pure pass-through, so `identity().source_hash == SOURCE_HASH` exactly as
+  before. Verified two ways: a unit test asserting the pass-through for a plain kernel, a
+  scalar-comptime kernel and a `match` kernel; and the public suite re-run, in which all 26
+  pre-existing evidence entries verified unchanged before the two new config kernels were added.
+- **The `#[comptime] taps: u32` shape the private kernels DO use is untouched.** A plain scalar
+  comptime parameter is classified as a scalar, gets no `ConfigIdentity` requirement, no pinnable
+  expression gate and no generated `const` binding — its expansion is byte-for-byte what it was.
+- **One wording change is visible everywhere**, and is a correction rather than a behaviour change:
+  the comptime-parameter rejection used to claim "`#[comptime]` parameters must be plain scalar
+  types" while only ever rejecting *references*. It now says what it enforces (take the parameter by
+  value) and points at `vericl::config!` for the struct case.
+- **One recorded-string change**, checked against every stored manifest: pretty-printed contract
+  strings now collapse whitespace runs, so a long pinned config literal is one line in the evidence
+  JSON instead of rustc-pretty-printer-wrapped. Every existing `instantiate`/`assumes` string is
+  single-line already, so every pre-existing evidence entry is byte-identical — confirmed on the
+  public suite and on the ecosystem-survey crate's 13 entries.
+
+**The one thing dogfooding would have caught and did not need to**: the milestone's own ergonomic
+cost lands on macro-generated config families (`vericl::config!` rejects a macro invocation, so
+CubeCL's `define_3d_size_base!` shape must be written out). The private corpus has no config types
+at all, so the cost is entirely ecosystem-facing — measured there instead, in the survey addendum.
+

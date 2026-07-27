@@ -1754,6 +1754,298 @@ pub fn counter_split_map(x: &Array<u32>, y: &mut Array<u32>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Struct-typed `#[comptime]` parameters — the `vericl::config!` milestone
+// (docs/design-struct-comptime.md).
+//
+// CubeCL re-emits `cfg.field` and `cfg.method()` on a `#[comptime]` parameter
+// as ordinary HOST Rust executed while the IR is built, so the config never
+// reaches the device — only the constants it computes do, and the resulting IR
+// is byte-identical to the same kernel written with plain comptime scalars
+// (design §3). VeriCL accepted that shape before this milestone, but ungated:
+// the config type's DEFINITION was in neither input of `SOURCE_HASH`, its
+// method bodies were invisible to every kernel-body gate, and the pinned
+// expression had no purity requirement. `vericl::config! { … }` is the
+// declaration that closes all three — see `config_identity_moves_on_a_config_
+// method_edit` below for the regression test that proves the first.
+// ---------------------------------------------------------------------------
+
+vericl::config! {
+    /// The tap window of the config-driven accumulation below. Integer-valued
+    /// by construction, not by choice: a `#[cube(launch)]` comptime type must
+    /// be `Hash + Eq`, and no float type is (design §1.1).
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+    pub struct WindowCfg {
+        /// Number of taps accumulated — reached as a loop bound through a
+        /// depth-2 method chain (`cfg.taps()` -> `self.window().taps()`).
+        pub taps: u32,
+        /// Per-tap gain factor.
+        pub gain: u32,
+    }
+
+    /// Enum config member — `match`ed on a comptime scrutinee, which CubeCL
+    /// lowers to a plain Rust `match` evaluated at expansion time (no
+    /// `Branch::Switch` in the IR at all, design §1.2).
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+    pub enum Weighting {
+        /// Scale by the window's gain.
+        Flat,
+        /// Scale by twice the window's gain.
+        Doubled,
+    }
+
+    /// A NESTED config — the ecosystem's dominant shape (33% of real config
+    /// types contain other config types, design §4.1). `WindowCfg` and
+    /// `Weighting` must be declared in THIS SAME block: one block is one
+    /// `CONFIG_HASH`, so a nested type declared in a sibling block would
+    /// contribute its method bodies to the kernel's meaning without
+    /// contributing to its identity. `vericl::config!` enforces that rather
+    /// than documenting it (gate G6).
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+    pub struct StageCfg {
+        /// The tap window.
+        pub window: WindowCfg,
+        /// How the accumulation is scaled.
+        pub weighting: Weighting,
+    }
+
+    impl WindowCfg {
+        /// Plain field accessor.
+        pub fn taps(&self) -> u32 {
+            self.taps
+        }
+
+        /// Deliberately named `dot` — the design's measured FALSE POSITIVE
+        /// (§5.2 M4). Before this milestone `FloatMethodCheck` rejected any
+        /// call to a `FLOAT_METHOD_REJECT` name, receiver-blind, so a kernel
+        /// calling this method was rejected with a message about `F::dot` and
+        /// the Float whitelist — a wrong diagnosis for a plain host method on a
+        /// user struct. `config_mode_scale` below calls it and compiles: the
+        /// check is now receiver-aware (design R6), and this method's
+        /// host-callability is gated HERE, where the config is declared.
+        pub fn dot(&self) -> u32 {
+            self.taps * self.gain
+        }
+    }
+
+    impl StageCfg {
+        /// Depth-2 chain root.
+        pub fn window(&self) -> WindowCfg {
+            self.window
+        }
+
+        /// Used as a LOOP BOUND in `config_window_sum` — a depth-2 method
+        /// chain that lowers to `RangeLoop { end: Constant(UInt(3)) }`.
+        pub fn taps(&self) -> u32 {
+            self.window().taps()
+        }
+
+        /// Enum dispatch, evaluated inside a `comptime!` block in
+        /// `config_window_sum`.
+        pub fn scale(&self) -> u32 {
+            let base = self.window().gain;
+            match self.weighting {
+                Weighting::Flat => base,
+                Weighting::Doubled => 2u32 * base,
+            }
+        }
+    }
+}
+
+/// FLAGSHIP config-driven kernel: fields, a config method used as a **loop
+/// bound**, and a **`comptime!` block** over the same config — the three shapes
+/// the milestone claims, in one kernel. Wired into `vericl::suite!` on both
+/// lanes, carrying `tested` (bit-exact differential) + `proved` (SMT bounds).
+///
+/// Its recorded identity folds `<StageCfg as vericl::ConfigIdentity>::
+/// CONFIG_HASH`, so editing any body in the `vericl::config!` block above makes
+/// this kernel's stored evidence stale — the hole the milestone closes.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0),
+    instantiate(cfg = StageCfg { window: WindowCfg { taps: 3, gain: 2 }, weighting: Weighting::Doubled })
+)]
+#[cube(launch)]
+pub fn config_window_sum(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: StageCfg) {
+    if ABSOLUTE_POS < y.len() {
+        let mut acc = x[ABSOLUTE_POS];
+        // Loop bound from a depth-2 config method chain.
+        for j in 1..cfg.taps() {
+            let idx = ABSOLUTE_POS + j as usize;
+            if idx < x.len() {
+                acc += x[idx];
+            }
+        }
+        // `comptime!` block over the config: the enum dispatch runs at
+        // expansion time and contributes a bare constant.
+        let scale = comptime!(cfg.scale());
+        y[ABSOLUTE_POS] = acc * f32::cast_from(scale);
+    }
+}
+
+/// The same config type pinned at a DIFFERENT value, exercising the enum's
+/// other arm and the `dot`-named config method (design R6's false-positive
+/// fix, demonstrated in code that actually compiles). Wired into
+/// `vericl::suite!` — `tested` + `proved` on both lanes.
+///
+/// Two kernels sharing one config type fold the same `CONFIG_HASH`, so one
+/// config method edit moves BOTH kernels' identity — which is correct: both
+/// kernels' meaning depends on it.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0),
+    instantiate(cfg = StageCfg { window: WindowCfg { taps: 2, gain: 3 }, weighting: Weighting::Flat })
+)]
+#[cube(launch)]
+pub fn config_mode_scale(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: StageCfg) {
+    if ABSOLUTE_POS < y.len() {
+        let w = f32::cast_from(cfg.window().dot());
+        let s = f32::cast_from(cfg.scale());
+        y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * (w + s);
+    }
+}
+
+// --- The identity-hole regression test's two halves -------------------------
+//
+// The design's §5.1 measurement, reproduced as a permanent test: one kernel,
+// built twice with ONLY a config method body changed, whose `SOURCE_HASH` was
+// bit-identical across the two builds while the kernel went from ×24 to ×11.
+//
+// Reproducing "the same kernel tokens, twice" needs the two copies to be
+// token-identical, which is why they live in two modules under the SAME
+// function name: the `#[vericl::kernel]` attribute hashes the fn's own tokens
+// plus the contract attribute's, and both are byte-for-byte equal here. The
+// ONLY difference between the modules is `total()`'s body. Not suite-wired —
+// this is an identity probe, not a claim surface.
+
+/// Base variant: `total()` multiplies (`3 * 8 = 24`).
+pub mod cfg_identity_base {
+    use cubecl::prelude::*;
+
+    vericl::config! {
+        #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+        pub struct TileCfg {
+            pub m: u32,
+            pub n: u32,
+        }
+
+        impl TileCfg {
+            pub fn total(&self) -> u32 {
+                self.m * self.n
+            }
+        }
+    }
+
+    #[vericl::kernel(
+        assumes(x.len() == y.len()),
+        compare(max_ulp = 0),
+        gen(x in -10.0..=10.0, y in 0.0..=0.0),
+        instantiate(cfg = TileCfg { m: 3, n: 8 })
+    )]
+    #[cube(launch)]
+    pub fn scaled(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: TileCfg) {
+        if ABSOLUTE_POS < y.len() {
+            y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * f32::cast_from(cfg.total());
+        }
+    }
+}
+
+/// Alt variant: identical kernel tokens, `total()` ADDS (`3 + 8 = 11`).
+pub mod cfg_identity_alt {
+    use cubecl::prelude::*;
+
+    vericl::config! {
+        #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+        pub struct TileCfg {
+            pub m: u32,
+            pub n: u32,
+        }
+
+        impl TileCfg {
+            pub fn total(&self) -> u32 {
+                self.m + self.n
+            }
+        }
+    }
+
+    #[vericl::kernel(
+        assumes(x.len() == y.len()),
+        compare(max_ulp = 0),
+        gen(x in -10.0..=10.0, y in 0.0..=0.0),
+        instantiate(cfg = TileCfg { m: 3, n: 8 })
+    )]
+    #[cube(launch)]
+    pub fn scaled(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: TileCfg) {
+        if ABSOLUTE_POS < y.len() {
+            y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * f32::cast_from(cfg.total());
+        }
+    }
+}
+
+// --- Risk 3's residual, made concrete and backstopped -----------------------
+
+vericl::config! {
+    /// Config for the out-of-block-evasion probe below. Also derives
+    /// `CubeType` (the design's measured I2 shape) because the out-of-block
+    /// `#[cube] impl` needs it — a derive is not a `#[cube]` attribute, so the
+    /// config gate accepts it, and the const path re-emits host methods
+    /// regardless.
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, CubeType)]
+    pub struct EvasiveCfg {
+        /// Gain factor.
+        pub gain: u32,
+    }
+
+    impl EvasiveCfg {
+        /// The gated, hashed half — an ordinary host method.
+        pub fn gain(&self) -> u32 {
+            self.gain
+        }
+    }
+}
+
+/// **Deliberately outside the `vericl::config!` block above.** Rust allows an
+/// inherent `impl` for a local type anywhere in the crate, so this second impl
+/// is invisible to `EvasiveCfg`'s `CONFIG_HASH` *and* to every gate the macro
+/// runs — the design's pre-registered risk 3, which has no clean fix at macro
+/// scope (a `#[proc_macro]` only ever sees the tokens it is handed).
+///
+/// It is accepted as a residual because the failure is LOUD, not silent, and
+/// `crates/vericl-examples/tests/config_out_of_block_backstop.rs` pins that:
+/// the reference twin calls this host body, CubeCL's `fma` is `unexpanded!()`
+/// on host, and the twin panics with "Unexpanded Cube functions should not be
+/// called." — which the differential harness catches and reports as a
+/// divergence rather than swallowing. Moving this impl INTO the block turns the
+/// same code into a compile-time rejection at `fma`'s span (gate G3).
+#[cube]
+impl EvasiveCfg {
+    /// Calls a device intrinsic that is not host-callable. Receiver and args
+    /// are all const, so CubeCL re-emits this as the ORIGINAL host method call
+    /// on both sides (design §1.2) — which is exactly why the twin reaches
+    /// `fma`'s `unexpanded!()` body and panics.
+    pub fn fused(&self) -> f32 {
+        fma(self.gain as f32, 2.0f32, 1.0f32)
+    }
+}
+
+/// The evasion probe. Compiles (both the config gate and the kernel gate are
+/// blind to the out-of-block impl), and its twin panics loudly at run time.
+/// NOT suite-wired: it is a residual demonstrator, not a claim surface.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(x in -1.0..=1.0, y in 0.0..=0.0),
+    instantiate(cfg = EvasiveCfg { gain: 2 })
+)]
+#[cube(launch)]
+pub fn config_out_of_block_evasion(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: EvasiveCfg) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * cfg.fused();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3762,6 +4054,195 @@ mod tests {
         comptime_shift_vericl::reference(&x, &mut y, x.len());
         for (i, &v) in x.iter().enumerate() {
             assert_eq!(y[i], v >> 3, "x={v}"); // extra(1) + 2 == 3
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Struct-typed `#[comptime]` parameters (docs/design-struct-comptime.md).
+    // The identity-hole regression test is the milestone's centre of gravity.
+    // -----------------------------------------------------------------
+
+    /// **The identity-hole regression test.** This is the design's §5.1
+    /// measurement made permanent.
+    ///
+    /// `cfg_identity_base::scaled` and `cfg_identity_alt::scaled` are
+    /// token-identical kernels — same name, same body, same contract attribute
+    /// — differing ONLY in the body of the config method `TileCfg::total()`
+    /// they call (`self.m * self.n` vs `self.m + self.n`, i.e. ×24 vs ×11 at
+    /// the pinned `m: 3, n: 8`). So:
+    ///
+    /// - their `SOURCE_HASH`es are **bit-identical**, because a config type's
+    ///   definition is in neither of that hash's inputs — the hole, still
+    ///   present and asserted here so this test fails if the hash's inputs ever
+    ///   silently change;
+    /// - their twins compute **different values** — the kernels are genuinely
+    ///   different;
+    /// - and their **recorded identities differ**, because `identity()` folds
+    ///   `<TileCfg as ConfigIdentity>::CONFIG_HASH`, which covers the whole
+    ///   `vericl::config!` block including that method body. Stored evidence
+    ///   for one build is therefore correctly STALE against the other.
+    #[test]
+    fn config_identity_moves_on_a_config_method_edit() {
+        // The hole itself: SOURCE_HASH cannot see the config method's body.
+        assert_eq!(
+            cfg_identity_base::scaled_vericl::SOURCE_HASH,
+            cfg_identity_alt::scaled_vericl::SOURCE_HASH,
+            "the two kernels are token-identical, so their own source hashes must match — \
+             this is the hole `vericl::config!` closes, not a bug in this test"
+        );
+
+        // …but they compute different things.
+        let x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut base_y = vec![0.0f32; x.len()];
+        let mut alt_y = vec![0.0f32; x.len()];
+        cfg_identity_base::scaled_vericl::reference(&x, &mut base_y, x.len());
+        cfg_identity_alt::scaled_vericl::reference(&x, &mut alt_y, x.len());
+        assert_eq!(base_y, vec![24.0, 48.0, 72.0, 96.0], "base multiplies: 3 * 8 = 24");
+        assert_eq!(alt_y, vec![11.0, 22.0, 33.0, 44.0], "alt adds: 3 + 8 = 11");
+
+        // …and the RECORDED identity — what evidence binds to — differs.
+        let base_id = cfg_identity_base::scaled_vericl::identity();
+        let alt_id = cfg_identity_alt::scaled_vericl::identity();
+        assert_ne!(
+            base_id.source_hash, alt_id.source_hash,
+            "a config method-body edit MUST move the kernel's recorded identity"
+        );
+
+        // The recorded hash is exactly `combine_source_hash(SOURCE_HASH,
+        // [CONFIG_HASH])` — reproduced independently, so the fold is verified
+        // rather than merely observed to differ.
+        assert_eq!(
+            base_id.source_hash,
+            vericl::combine_source_hash(
+                cfg_identity_base::scaled_vericl::SOURCE_HASH,
+                &[<cfg_identity_base::TileCfg as vericl::ConfigIdentity>::CONFIG_HASH.to_string()],
+            ),
+        );
+        assert_ne!(
+            <cfg_identity_base::TileCfg as vericl::ConfigIdentity>::CONFIG_HASH,
+            <cfg_identity_alt::TileCfg as vericl::ConfigIdentity>::CONFIG_HASH,
+            "the two config blocks differ, so their CONFIG_HASHes must"
+        );
+        // And the recorded hash is NOT the kernel's own SOURCE_HASH: folding a
+        // config dependency genuinely changes what gets recorded.
+        assert_ne!(base_id.source_hash, cfg_identity_base::scaled_vericl::SOURCE_HASH);
+    }
+
+    /// Risk 4's guard, from the outside: folding config hashes must change
+    /// identity for config kernels ONLY. A kernel with no `#[comptime]`
+    /// parameter, and one with a plain *scalar* comptime parameter, both keep
+    /// `identity().source_hash == SOURCE_HASH` (a pass-through
+    /// `combine_source_hash` with no deps) — which is what makes every stored
+    /// evidence entry for them byte-unchanged.
+    #[test]
+    fn non_config_kernels_keep_a_pass_through_identity() {
+        assert_eq!(axpy_vericl::identity().source_hash, axpy_vericl::SOURCE_HASH);
+        assert_eq!(fir3_vericl::identity().source_hash, fir3_vericl::SOURCE_HASH);
+        assert_eq!(select_mode_vericl::identity().source_hash, select_mode_vericl::SOURCE_HASH);
+        // And a config kernel does NOT.
+        assert_ne!(
+            config_window_sum_vericl::identity().source_hash,
+            config_window_sum_vericl::SOURCE_HASH,
+        );
+    }
+
+    /// Two kernels sharing one config type fold the SAME `CONFIG_HASH`, so one
+    /// config method edit moves both — correct, since both kernels' meaning
+    /// depends on it. (Their recorded identities still differ from each other,
+    /// because their own tokens and pinned values differ.)
+    #[test]
+    fn kernels_sharing_a_config_type_share_its_hash() {
+        let h = <StageCfg as vericl::ConfigIdentity>::CONFIG_HASH;
+        assert!(h.starts_with("sha256:"), "CONFIG_HASH must be a sha256 string: {h}");
+        assert_eq!(
+            config_window_sum_vericl::identity().source_hash,
+            vericl::combine_source_hash(config_window_sum_vericl::SOURCE_HASH, &[h.to_string()]),
+        );
+        assert_eq!(
+            config_mode_scale_vericl::identity().source_hash,
+            vericl::combine_source_hash(config_mode_scale_vericl::SOURCE_HASH, &[h.to_string()]),
+        );
+        assert_ne!(
+            config_window_sum_vericl::identity().source_hash,
+            config_mode_scale_vericl::identity().source_hash,
+        );
+    }
+
+    /// The flagship config kernel's twin computes what the config says: three
+    /// taps summed forward, scaled by the `Doubled` arm's `2 * gain = 4`.
+    #[test]
+    fn config_window_sum_twin_follows_the_config() {
+        let x: Vec<f32> = vec![1.0, 2.0, 4.0, 8.0, 16.0];
+        let mut y = vec![0.0f32; x.len()];
+        config_window_sum_vericl::reference(&x, &mut y, x.len());
+        for pos in 0..x.len() {
+            let mut acc = x[pos];
+            for j in 1..3usize {
+                if pos + j < x.len() {
+                    acc += x[pos + j];
+                }
+            }
+            assert_eq!(y[pos], acc * 4.0, "pos={pos}");
+        }
+    }
+
+    /// Design R6's false-positive fix, demonstrated end to end: a config method
+    /// NAMED `dot` is callable from a kernel (the kernel above compiles, which
+    /// is itself the assertion) and its twin computes the plain host method.
+    /// Pinned at `taps: 2, gain: 3` -> `dot() = 6`, `Flat` scale `= 3`.
+    #[test]
+    fn config_mode_scale_twin_uses_the_dot_named_config_method() {
+        let x: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut y = vec![0.0f32; x.len()];
+        config_mode_scale_vericl::reference(&x, &mut y, x.len());
+        for (i, &v) in x.iter().enumerate() {
+            assert_eq!(y[i], v * (6.0 + 3.0), "x={v}");
+        }
+    }
+
+    /// The pinned config value is recorded on the contract verbatim, exactly as
+    /// a scalar comptime value is — the instantiation text is already covered
+    /// by `SOURCE_HASH` (it lives in the contract attribute tokens), so this is
+    /// evidence legibility, not a second identity mechanism.
+    #[test]
+    fn config_pin_is_recorded_on_the_contract() {
+        let inst = config_window_sum_vericl::contract().instantiate;
+        assert_eq!(inst.len(), 1);
+        assert!(inst[0].starts_with("cfg = StageCfg"), "got: {}", inst[0]);
+        assert!(inst[0].contains("taps : 3"), "got: {}", inst[0]);
+        assert!(inst[0].contains("Doubled"), "got: {}", inst[0]);
+        assert!(!inst[0].contains('\n'), "the recorded pin must be one line: {}", inst[0]);
+    }
+
+    /// Bounds provability of the config-driven kernels, at the IR level: the
+    /// config contributes only CONSTANTS to the IR (design §3 measured the IR
+    /// to be byte-identical to the same kernel written with plain comptime
+    /// scalars), so the prover needs no notion of a config at all.
+    #[test]
+    fn config_kernels_definitions_are_provably_in_bounds() {
+        for (def, buffer_params, what) in [
+            (
+                config_window_sum_vericl::kernel_definition(),
+                config_window_sum_vericl::BUFFER_PARAMS,
+                "config_window_sum",
+            ),
+            (
+                config_mode_scale_vericl::kernel_definition(),
+                config_mode_scale_vericl::BUFFER_PARAMS,
+                "config_mode_scale",
+            ),
+        ] {
+            let buffers: Vec<vericl_ir::BufferParam> = buffer_params
+                .iter()
+                .map(|(name, is_output)| vericl_ir::BufferParam { name, is_output: *is_output })
+                .collect();
+            let assumes = [vericl_ir::Assume::LenEq { a: "x", b: "y" }];
+            match vericl_ir::prove_bounds_freedom(&def, &buffers, &assumes) {
+                vericl_ir::ProveResult::Proved { obligations } => {
+                    assert!(obligations >= 2, "{what}: expected >= 2 obligations, got {obligations}")
+                }
+                other => panic!("expected Proved ({what}), got {other:?}"),
+            }
         }
     }
 }
