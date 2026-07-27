@@ -248,10 +248,30 @@ impl Contract {
 /// which reintroduces exactly the identity hole the trait closes. Only
 /// `vericl::config!` derives a hash that actually covers the definition. See
 /// `docs/guide.md` §5.1 and the README's struct-comptime section.
+///
+/// # Scalar type aliases
+///
+/// The macro classifies a `#[comptime]` parameter as a config by *syntax*: any
+/// type that is not a written-out scalar primitive. A **type alias** for a
+/// scalar (`type Taps = u32;`) is therefore classified as a config, because a
+/// `#[proc_macro_attribute]` sees only the tokens of the item it annotates and
+/// has no name resolution — it cannot know that `Taps` *is* `u32` (round-10
+/// review, moderate 6).
+///
+/// rustc can, though, and the impls below are where that resolution happens:
+/// each scalar primitive carries a `CONFIG_HASH` naming the type itself, so
+/// `#[comptime] taps: Taps` compiles and folds `"vericl-scalar:u32"`. This is
+/// the honest identity for a scalar — a primitive has no user-authored
+/// definition that could drift — and it is not a weakening: changing the alias
+/// to `type Taps = u64;` moves the folded hash and re-stales the evidence, which
+/// is exactly what an identity fold is for. An alias to anything *else* still
+/// hits the `#[diagnostic::on_unimplemented]` message below, which names the
+/// alias case explicitly so the diagnosis is not misleading.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is used as a struct-typed #[comptime] parameter but is not declared with a `vericl::config!` block",
     label = "not a vericl config type",
-    note = "wrap the type AND its impl blocks in `vericl::config! {{ … }}` so vericl can fold the config's definition into kernel identity and gate its method bodies for host-callability"
+    note = "wrap the type AND its impl blocks in `vericl::config! {{ … }}` so vericl can fold the config's definition into kernel identity and gate its method bodies for host-callability",
+    note = "if `{Self}` is a TYPE ALIAS, note that vericl's macro cannot see through it (a proc macro has no name resolution): an alias for a scalar primitive resolves here automatically, but an alias for a struct/enum needs that underlying type declared with `vericl::config!`"
 )]
 pub trait ConfigIdentity {
     /// SHA-256 (as `"sha256:<hex>"`) over the entire `vericl::config!` token
@@ -259,6 +279,19 @@ pub trait ConfigIdentity {
     /// `source_hash` by [`combine_source_hash`].
     const CONFIG_HASH: &'static str;
 }
+
+/// Scalar primitives carry an identity naming the type itself — see
+/// [`ConfigIdentity`]'s "Scalar type aliases" section for why these exist and
+/// why a constant is the right value here (unlike a hand-written impl for a
+/// *struct*, which would hide a real definition).
+macro_rules! scalar_config_identity {
+    ($($t:ty),* $(,)?) => {
+        $(impl ConfigIdentity for $t {
+            const CONFIG_HASH: &'static str = concat!("vericl-scalar:", stringify!($t));
+        })*
+    };
+}
+scalar_config_identity!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, bool, char, f32, f64);
 
 /// Fold a kernel's or helper's own (compile-time) source hash together with
 /// the already-computed identity hashes of every helper it directly

@@ -1567,13 +1567,15 @@ pub fn vec_add_off_by_one<N: Size>(
 // `fma_two_product_residual` below, where the unfused rewrite is identically
 // zero and the fused answer is the entire signal.
 //
-// Tier, measured in `tests/host_shim_gpu_ground_truth.rs` over 7972 triples:
-// bit-exact vs. the real intrinsic on cubecl-cpu everywhere, and bit-exact on
-// wgpu/Metal on every triple with no subnormal operand or result (Metal
-// flushes subnormals to zero; the host does not — 78 triples, all exactly
-// flush-to-zero). Both kernels below keep their arithmetic in the normal range
-// by construction (see each one's `gen(...)` justification), so both carry the
-// bit-exact `compare(max_ulp = 0)` that tier earns.
+// Tier, measured in `tests/host_shim_gpu_ground_truth.rs` over 21996 triples:
+// bit-exact vs. the real intrinsic on cubecl-cpu everywhere (that lane does not
+// flush), and bit-exact on wgpu/Metal outside a 4974-triple flush-to-zero
+// domain — where the device flushes to a signed zero whenever the EXACT,
+// pre-rounding product-sum is subnormal, which reaches values that round to a
+// normal (`host_shims::fma_f32`'s doc has the model). Both kernels below keep
+// their arithmetic in the normal range by construction (see each one's
+// `gen(...)` justification), so both carry the bit-exact `compare(max_ulp = 0)`
+// that tier earns.
 
 /// A cubic polynomial in Horner form, evaluated with three **nested** fused
 /// multiply-adds — the standard shape of a hardware-friendly function
@@ -1594,7 +1596,17 @@ pub fn poly3_horner(x: f32) -> f32 {
     let c2 = -0.25f32;
     let c1 = 0.125f32;
     let c0 = 1.0f32;
-    fma(fma(fma(c3, x, c2), x, c1), x, c0)
+    // The QUALIFIED spelling of the free-function intrinsic. The bare `fma` is
+    // no longer rewritten to the host shim (round-10 review, major 3): a glob
+    // import is the weakest binding in Rust, so a user item named `fma` in this
+    // scope would win on the `#[cube]` side while the twin silently took the
+    // shim. `cubecl::prelude::fma` compiles inside `#[cube]` and is what the
+    // shim rewrite recognizes.
+    cubecl::prelude::fma(
+        cubecl::prelude::fma(cubecl::prelude::fma(c3, x, c2), x, c1),
+        x,
+        c0,
+    )
 }
 
 /// FLAGSHIP (`fma` shim): Horner evaluation of a cubic through three nested
@@ -1602,7 +1614,7 @@ pub fn poly3_horner(x: f32) -> f32 {
 /// justified: with `|x| <= 2` and these coefficients every intermediate is in
 /// `[-3, 3]`, so no operand or result is anywhere near the subnormal range
 /// where wgpu/Metal's flush-to-zero is the one measured divergence from the
-/// host shim.
+/// host shim (`|x| <= 2` keeps every intermediate above 2^-3).
 #[vericl::kernel(
     assumes(x.len() == y.len()),
     compare(max_ulp = 0),
@@ -1639,7 +1651,9 @@ pub fn fma_two_product_residual(h: &Array<f32>, x: &Array<f32>, y: &mut Array<f3
         let hi = h[ABSOLUTE_POS];
         let xi = x[ABSOLUTE_POS];
         let product = hi * xi;
-        y[ABSOLUTE_POS] = fma(hi, xi, -product);
+        // Qualified spelling — see `poly3_horner` for why the bare `fma` is no
+        // longer rewritten to the host shim (round-10 review, major 3).
+        y[ABSOLUTE_POS] = cubecl::prelude::fma(hi, xi, -product);
     }
 }
 
@@ -1659,7 +1673,7 @@ pub fn fma_two_product_residual(h: &Array<f32>, x: &Array<f32>, y: &mut Array<f3
 /// contract `a*b + c` into one fused instruction when the addend is
 /// independent — that is what `vec_madd_bitexact`'s bit-exact failure shows,
 /// and what the ground-truth probe measures (its unfused `a*b + c` kernel
-/// differs from the fused intrinsic on 0 of 7972 triples). Here the addend IS
+/// differs from the fused intrinsic on 0 of 21996 triples). Here the addend IS
 /// the product, so common-subexpression elimination collapses `t - t` to zero
 /// before any contraction can apply. Both behaviours are pinned by
 /// `fused_and_unfused_residual_kernels_compute_different_functions_on_gpu` in
@@ -1840,6 +1854,18 @@ vericl::config! {
             self.window().taps()
         }
 
+        /// The nested `dot` chain, written HERE rather than at the call site —
+        /// the round-10 chain rule (moderate 5) in practice. `FloatMethodCheck`
+        /// exempts only the FIRST link of a chain rooted at a config parameter,
+        /// so `cfg.window().dot()` in a kernel body is rejected at `dot`'s span
+        /// (its receiver is a method call's result, not the config parameter).
+        /// Moving the chain into the block is the fix the message names, and it
+        /// is the better program: the whole computation is now hashed by
+        /// `CONFIG_HASH` and gated by `vericl::config!`.
+        pub fn dot(&self) -> u32 {
+            self.window().dot()
+        }
+
         /// Enum dispatch, evaluated inside a `comptime!` block in
         /// `config_window_sum`.
         pub fn scale(&self) -> u32 {
@@ -1901,7 +1927,7 @@ pub fn config_window_sum(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: St
 #[cube(launch)]
 pub fn config_mode_scale(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: StageCfg) {
     if ABSOLUTE_POS < y.len() {
-        let w = f32::cast_from(cfg.window().dot());
+        let w = f32::cast_from(cfg.dot());
         let s = f32::cast_from(cfg.scale());
         y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * (w + s);
     }
@@ -1987,12 +2013,12 @@ pub mod cfg_identity_alt {
 // --- Risk 3's residual, made concrete and backstopped -----------------------
 
 vericl::config! {
-    /// Config for the out-of-block-evasion probe below. Also derives
-    /// `CubeType` (the design's measured I2 shape) because the out-of-block
-    /// `#[cube] impl` needs it — a derive is not a `#[cube]` attribute, so the
-    /// config gate accepts it, and the const path re-emits host methods
-    /// regardless.
-    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, CubeType)]
+    /// Config for the out-of-block-evasion probe below. Only `std` derives:
+    /// gate G11 (round-10 review) rejects a custom derive inside the block for
+    /// the same reason G7 rejects a macro invocation — the derive's *definition*
+    /// decides what impls the type has and `CONFIG_HASH` covers only the
+    /// invocation.
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
     pub struct EvasiveCfg {
         /// Gain factor.
         pub gain: u32,
@@ -2019,12 +2045,17 @@ vericl::config! {
 /// called." — which the differential harness catches and reports as a
 /// divergence rather than swallowing. Moving this impl INTO the block turns the
 /// same code into a compile-time rejection at `fma`'s span (gate G3).
-#[cube]
+///
+/// A **plain** impl, not a `#[cube]` one: a `#[cube] impl` would require
+/// `#[derive(CubeType)]` on the config type, which gate G11 now rejects inside
+/// the block. Nothing about the residual changes — CubeCL re-emits a comptime
+/// receiver's method as the original host method call on both sides (design
+/// §1.2), so the twin still reaches `fma`'s `unexpanded!()` body and still
+/// panics, and the kernel still launches (measured: `reference_panic =
+/// Some("Unexpanded Cube functions should not be called.")`, `pass() == false`).
 impl EvasiveCfg {
-    /// Calls a device intrinsic that is not host-callable. Receiver and args
-    /// are all const, so CubeCL re-emits this as the ORIGINAL host method call
-    /// on both sides (design §1.2) — which is exactly why the twin reaches
-    /// `fma`'s `unexpanded!()` body and panics.
+    /// Calls a device intrinsic that is not host-callable — which is exactly
+    /// why the twin reaches `fma`'s `unexpanded!()` body and panics.
     pub fn fused(&self) -> f32 {
         fma(self.gain as f32, 2.0f32, 1.0f32)
     }

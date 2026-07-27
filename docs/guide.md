@@ -449,29 +449,78 @@ error[E0015]: cannot call non-const function `cfg_from_env` in constants
    |                       ^^^^^^^^^^^^^^
 ```
 
+**The caveat on const-evaluable pins, stated exactly.** `const` guarantees the value is the same for
+every evaluation *within a build*. It does not guarantee it is a function of the source alone: a
+`const` derived from `option_env!` or `cfg!` is const-evaluable and can still differ between two
+builds of identical source.
+
+```rust
+pub const BUILD_M: u32 = match option_env!("MY_BUILD_M") { Some(_) => 9, None => 4 };
+pub const ENV_CFG: PinCfg = PinCfg { m: BUILD_M };     // accepted: it really is a const
+```
+
+What VeriCL records is honest about this rather than silent: the pin's **expression text**
+(`instantiate(cfg = ENV_CFG)`) is inside the contract-attribute tokens `SOURCE_HASH` hashes, so
+editing the pin re-stales the evidence — but the *environment that resolved it* is not hashed, and
+cannot be. So evidence produced by such a build is per-build deterministic, not per-source
+reproducible: rebuilding the same source with a different `MY_BUILD_M` produces a kernel with the
+same recorded identity and different behavior, and `ir_hash` (populated under `prove: true`) is what
+catches it. If reproducibility across builds matters to you, do not derive a pin from the build
+environment — write the value out.
+
 **What a config method body may contain.** Ordinary host Rust: field reads, arithmetic, `if`,
-`match`, `let`, loops, calls to `core`/`std`, to a primitive's associated functions (`u32::max`), to
-`Self`, and to anything else the same block declares. What it may **not** contain, and why:
+`match`, `let`, loops, calls into the pure part of `core`/`std`, to a primitive's associated
+functions (`u32::max`) and inherent methods (`x.pow(2)`), and to anything else the same block
+declares. What it may **not** contain, and why:
 
 | Rejected in a `vericl::config!` block | Why |
 |---|---|
 | a call to a non-host-callable intrinsic (`fma`, `cast_from`, `mul_hi`, …) | it runs in the reference twin as host Rust and would panic there; you get a compile error at the callee instead |
 | `#[cube]` on any impl or method | the twin would call the host body while the device gets the expanded one |
-| a call to a **free function declared outside the block** | its body is neither hashed nor gated — move the function into the block |
-| a read of a `const`/`static` declared outside the block | same reason: the kernel's meaning would depend on something `CONFIG_HASH` cannot see |
+| a call to a **function declared outside the block** — as `helper(x)`, as `Self::helper(x)`, **or as `self.helper()`** | its body is neither hashed nor gated — move the function into the block |
+| a read of a `const`/`static` declared outside the block, **including an associated `Self::K`** | same reason: the kernel's meaning would depend on something `CONFIG_HASH` cannot see |
+| a method reached through a **user extension trait** (`self.m.boost()` with `impl Boost for u32` elsewhere) | same reason again, in the shape that is easiest to miss — only the `std` inherent surface is admitted on a receiver the block cannot type |
+| anything **impure**: `std::env`, `std::process`, `std::time`, `std::fs`, `std::io`, `rand`, … (and `std::mem`, for target-dependence) | a config method is evaluated separately for the twin, for kernel expansion and for IR extraction; an answer that can differ between them makes the recorded evidence describe a kernel that was never run |
+| a **custom derive** (`#[derive(CubeType)]`, `#[derive(serde::Serialize)]`) | the derive's *definition* decides what impls the type gets, and the hash covers only the invocation — the same reason a macro cannot declare a config type. `std` derives are fine |
+| a `use` that **rebinds** `core`/`std`/`alloc`/a primitive name, or a glob `use` | the gates resolve path roots by name, so `use my::evil as core;` would re-point the whole standard-library allowance at user code |
 | a generic config type (`Cfg<S>`) | one block is one hash, so every instantiation would share it |
-| a field whose type is not a scalar primitive or another type declared in the same block | a nested config in a *sibling* block would escape the hash |
+| a field whose type — or a method's **return type** — is not a scalar primitive, `Self`, or another type declared in the same block | a nested config in a *sibling* block would escape the hash, and a return type whose methods live elsewhere would be ungated at the kernel's call site |
 | a `static`, a `mod`, or any macro invocation (including `macro_rules!`-generated config types) | their contents are opaque to the gates, so hashing the block would not cover what the type is |
 
 Each of these is a targeted message, and each exists so that the tokens VeriCL hashed really are the
 tokens that determine what the kernel computes.
+
+**Chains stop at the first link.** On the *kernel* side, a method call whose receiver **is** a config
+parameter is exempt from VeriCL's Float/Numeric name list — its host-callability was already checked
+where the config is declared, which is strictly stronger. That exemption covers one link and no
+more: `cfg.dot()` compiles, `cfg.window().dot()` is rejected at `dot`'s own span, because the
+justification applies to the method the config declares and not to whatever it returns. Write the
+whole chain as one more config method (`cfg.window_dot()`), which is the better program anyway — the
+computation is then hashed and gated instead of half-and-half.
 
 **One residual, stated up front.** Rust lets you write an inherent `impl` for your own type anywhere
 in the crate, and a `impl MyCfg { … }` written *outside* the `vericl::config!` block is invisible to
 both the hash and the gates — a proc macro only sees the tokens it is handed. Keep every impl for a
 config type inside its block. If you do not, the failure is loud rather than silent: a
 non-host-callable call reached that way panics in the twin with `Unexpanded Cube functions should
-not be called.`, which the differential lane reports as a failure.
+not be called.`, which the differential lane reports as a failure. The *in-block* half cannot reach
+into it, though — a config method may only call and read what the block declares, in every syntactic
+form (bare call, `Self::`-qualified, and method syntax on `self` or on a field).
+
+**Third-party config types are out of scope in v1, and that is a real limit.** A config type must be
+*declared* inside a `vericl::config!` block. Rust's orphan rule would let you write
+`impl ConfigIdentity for TheirCfg` in your own crate, but VeriCL never emits a bare impl: a hash over
+tokens you did not write would certify nothing, and the gates would have nothing to walk. If you need
+a config type from another crate, port the parts you use into a `vericl::config!` block of your own —
+a clean-room port. It is more work, and it is also the only version that means anything, because the
+hash then covers code that is actually in your repository.
+
+**A type alias for a scalar works.** `type Taps = u32;` in `#[comptime]` position compiles: VeriCL's
+macro cannot see through the alias (a proc macro has no name resolution), so it classifies `Taps` as
+a config, but the requirement it emits — `<Taps as ConfigIdentity>::CONFIG_HASH` — is resolved by
+*rustc*, which can. Scalars carry an identity naming the type, so retargeting the alias at another
+primitive re-stales the evidence. An alias for a **struct** still needs that struct declared with
+`vericl::config!`, and the error says so.
 
 ---
 

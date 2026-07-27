@@ -1393,7 +1393,7 @@
     {
       "kernel": "fma_poly3_map",
       "identity": {
-        "source_hash": "sha256:fa22af1c725c365e7f801fe12e92812fda00974a899f0a428d26a9f595a630da",
+        "source_hash": "sha256:24a9f32c4ed61ec5a99c2de80e1265b42368a323dc49f340ce98022b904a9601",
         "vericl_version": "0.1.0",
         "ir_hash": "sha256:44f425b77b5c04cb59dc8f82e5e465db342358b23fe43ec78e7e07522e3f0b2b"
       },
@@ -1457,7 +1457,7 @@
     {
       "kernel": "fma_two_product_residual",
       "identity": {
-        "source_hash": "sha256:e6a9c8d6db933e306b48bb3e2a6a2565900563564e06a8f5afdb9a21a2b25f65",
+        "source_hash": "sha256:9b7699ec2db82c9d98028dbfb5bcb247d2f57149d50018ad7ab7aed3107102ce",
         "vericl_version": "0.1.0",
         "ir_hash": "sha256:76aeb34a96f9ef78ffe9c28559d2b8e699a733a040d1e6963ff79a2e0008f714"
       },
@@ -1708,7 +1708,7 @@
     {
       "kernel": "config_window_sum",
       "identity": {
-        "source_hash": "sha256:aebbe050eb178f92efbf2cfb2547b5670f0ce7f120c2870b5190f781e1b05562",
+        "source_hash": "sha256:494fbf76087035310f9e758617b04b2cd258de5962bc8bd2c357c08a94900a53",
         "vericl_version": "0.1.0",
         "ir_hash": "sha256:b1b507d6082543a059b3b6a49a4ab09da5aa7b64592ff85e8231861809699421"
       },
@@ -1772,7 +1772,7 @@
     {
       "kernel": "config_mode_scale",
       "identity": {
-        "source_hash": "sha256:4d4b31a569f2a36b869f660e0d7c404c8eded9d4b2618720bdf79db0a95b7ef1",
+        "source_hash": "sha256:7e113b264242d3dad119ca6de2268647ed3ca02f45dc081bea256af052e78e76",
         "vericl_version": "0.1.0",
         "ir_hash": "sha256:72c104a92ac727e8c7b91a7f61c4088f6b218d5bd75a5ddfeeb5c3b83ef09ae7"
       },

@@ -167,6 +167,16 @@ const BANNED_PREFIXES: &[&str] = &["plane_", "Atomic"];
 /// host-side; the phase splitter removes it).
 const KNOWN_HOST_SAFE_FREE_FNS: &[&str] = &["range_stepped", "sync_cube"];
 
+/// cubecl free-function intrinsics whose BARE spelling vericl deliberately does
+/// not rewrite, because a glob import is the weakest binding in Rust and a proc
+/// macro cannot see the enclosing scope (see [`ShimRewriteFold`]'s doc,
+/// round-10 review major 3). Used only to add the "…or write
+/// `cubecl::prelude::fma(...)`" half to `UsesRewriteFold`'s rejection: a bare
+/// call to one of these is the shape most likely to be an author reaching for
+/// the intrinsic, and the generic "add it to uses(...)" message alone would
+/// send them the wrong way.
+const BARE_SHADOWABLE_INTRINSICS: &[&str] = &["fma"];
+
 /// `cubecl::prelude::Float`/`Numeric` trait method names empirically
 /// verified as host-callable on `f32` — safe to appear in a reference
 /// twin's body (after `instantiate(...)` substitutes the generic type
@@ -1303,11 +1313,18 @@ impl Fold for StripUnrollFold {
 /// one: `cfg.dot()` on a struct-typed `#[comptime]` parameter was rejected with
 /// a message about `F::dot` and the Float whitelist — a wrong diagnosis for a
 /// plain host method on a user struct (`dot`, `normalize`, `magnitude` are all
-/// plausible config method names). A method call whose receiver chain is rooted
-/// in a **config** `#[comptime]` parameter is therefore exempt from the
-/// name-based list: its host-callability is gated where the config is declared
+/// plausible config method names). A method call whose receiver *is* a
+/// **config** `#[comptime]` parameter is therefore exempt from the name-based
+/// list: its host-callability is gated where the config is declared
 /// (`vericl::config!` runs the same list over every method body in the block),
 /// which is strictly stronger than a name check here.
+///
+/// **The exemption is one link deep** (round-10 review, moderate 5). It applies
+/// to `cfg.dot()` and to nothing further along: `cfg.gainf().erf()` has its
+/// `erf` checked normally and rejected at `erf`'s own span, because the
+/// justification above covers the method the config *declares*, not whatever
+/// that method returns. See `direct_receiver_ident` for the full argument and
+/// the measurement behind it.
 ///
 /// The exemption is withdrawn the moment the name is ambiguous. `locals` holds
 /// every binding the body introduces; if the config parameter's name is *also*
@@ -1360,7 +1377,7 @@ impl FloatMethodCheck {
 
 impl Fold for FloatMethodCheck {
     fn fold_expr_method_call(&mut self, i: syn::ExprMethodCall) -> syn::ExprMethodCall {
-        let root = receiver_root_ident(i.receiver.as_ref());
+        let root = direct_receiver_ident(i.receiver.as_ref());
         match root.as_deref() {
             // Rooted in a config comptime param, unshadowed: gated at the
             // `vericl::config!` declaration instead of by name here.
@@ -1395,7 +1412,17 @@ impl Fold for FloatMethodCheck {
             // (rooted elsewhere) still has its last segment checked.
             let vericl_rooted =
                 p.path.segments.first().is_some_and(|s| s.ident == "vericl");
-            if !vericl_rooted {
+            // A BARE single-segment callee is not a cubecl intrinsic spelling:
+            // every name on `FLOAT_METHOD_REJECT` except `fma` is a
+            // `Cast`/`Numeric`/`Float` trait method, reachable only as
+            // `T::m(..)` or `x.m(..)`, and `fma` — the one free function — is
+            // deliberately left to `UsesRewriteFold`'s undeclared-call
+            // classification (round-10 major 3, see `ShimRewriteFold`'s doc).
+            // Checking it here would reject `uses(fma)` composing a user helper
+            // named `fma`, which is a legitimate program, and would diagnose a
+            // plain undeclared call as an unverified `F::fma`.
+            let bare = p.path.leading_colon.is_none() && p.path.segments.len() == 1;
+            if !vericl_rooted && !bare {
                 if let Some(last) = p.path.segments.last() {
                     self.check(&last.ident);
                 }
@@ -1432,26 +1459,30 @@ impl Fold for FloatMethodCheck {
 ///     left untouched (it cannot be the cubecl intrinsic, which is always
 ///     `T::mul_hi`/`x.mul_hi`; leaving it lets it classify as a possible
 ///     `uses(...)` helper in the later pass instead of being hijacked here).
-///   - `fma(a, b, c)` — bare, three arguments — and the explicitly qualified
-///     `cubecl::…::fma(a, b, c)`  →  `::vericl::host_shims::fma(a, b, c)`, via
-///     the `Fma` trait (f32 is the sole verified type). Unlike `mul_hi`, the
-///     BARE form is the intrinsic here: cubecl 0.10 defines `fma` only as the
-///     free function `cubecl::prelude::fma`, glob-imported by every `#[cube]`
-///     kernel. That makes shadowing a real hazard rather than a theoretical
-///     one, so the rewrite is guarded: if `fma` also names a `uses(...)`-listed
-///     helper or a local binding in this item, the call is NOT rewritten and a
-///     targeted error is raised instead (`shadowed_fma_error`). Guessing which
-///     one the `#[cube]` side resolved to is exactly the class of silent wrong
-///     twin this macro exists to prevent. Every other syntactic form
-///     (`f32::fma(..)`, `x.fma(..)`, `<f32 as Float>::fma(..)`, a 2- or 4-arg
-///     `fma`) is left for `FloatMethodCheck` to reject by name — none of them
-///     compiles on the `#[cube]` side in 0.10 either.
+///   - `cubecl::…::fma(a, b, c)` — the **explicitly qualified** free-function
+///     intrinsic  →  `::vericl::host_shims::fma(a, b, c)`, via the `Fma` trait
+///     (f32 is the sole verified type).
+///
+///     **A BARE `fma(a, b, c)` is deliberately NOT recognized** (round-10
+///     review, major 3). cubecl 0.10 defines `fma` only as the free function
+///     `cubecl::prelude::fma`, glob-imported by every `#[cube]` kernel — but a
+///     glob import is the weakest binding in Rust, so a user's own item named
+///     `fma` anywhere in the kernel's scope wins over it, and a proc macro
+///     cannot see the enclosing scope. Guarding the rewrite against
+///     `uses(...)`-listed names and `collect_locals`' `PatIdent`s (as this fold
+///     did before) misses exactly that case: measured with a `#[cube] pub fn
+///     fma(a, b, c) { a * b + c + 1000.0 }` beside the kernel, the twin computed
+///     `5.0` from the host shim while the device computed `1005.0` from the
+///     user's function — a silently wrong twin, caught only by the differential
+///     lane. So a bare `fma` now falls through to `UsesRewriteFold`'s
+///     undeclared-call classification, where it is either a `uses(fma)`-declared
+///     helper (rewritten to that helper's twin — an explicit declaration wins
+///     over the shim) or a targeted rejection naming both fixes. Every other
+///     syntactic form (`f32::fma(..)`, `x.fma(..)`, `<f32 as Float>::fma(..)`, a
+///     2- or 4-arg `fma`) is left for `FloatMethodCheck` to reject by name —
+///     none of them compiles on the `#[cube]` side in 0.10 either.
 #[derive(Default)]
-struct ShimRewriteFold<'a> {
-    /// `uses(...)`-declared helper names, and local bindings, in the item being
-    /// rewritten — the two ways the bare `fma` intrinsic name can be shadowed.
-    /// Empty in the white-box fold tests, which exercise the unshadowed path.
-    shadowing: Option<&'a HashSet<String>>,
+struct ShimRewriteFold {
     errors: Vec<syn::Error>,
 }
 
@@ -1466,25 +1497,7 @@ fn path_is_cubecl_rooted(path: &syn::Path) -> bool {
     path.segments.first().is_some_and(|s| s.ident == "cubecl")
 }
 
-impl ShimRewriteFold<'_> {
-    /// The error for a bare `fma(a, b, c)` whose name is shadowed in this item.
-    fn shadowed_fma_error(span: proc_macro2::Span) -> syn::Error {
-        syn::Error::new(
-            span,
-            "`fma` here is ambiguous: it names the cubecl intrinsic \
-             `cubecl::prelude::fma` (which vericl rewrites to its GPU-verified host \
-             shim), but this item also declares `fma` as a `uses(...)` helper or a \
-             local binding, which shadows the glob-imported intrinsic on the \
-             `#[cube]` side. vericl will not guess which one the kernel resolves to — \
-             rename the helper/binding, or call the intrinsic as \
-             `cubecl::prelude::fma(...)`",
-        )
-    }
-
-    fn shadowed(&self, name: &str) -> bool {
-        self.shadowing.is_some_and(|s| s.contains(name))
-    }
-
+impl ShimRewriteFold {
     fn rewrite_call(&mut self, mut call: ExprCall) -> Expr {
         // Peel redundant parens/groups around the callee so a parenthesised
         // intrinsic `(f32::cast_from)(x)` / `(u32::mul_hi)(a, b)` classifies
@@ -1526,20 +1539,14 @@ impl ShimRewriteFold<'_> {
             let b = &call.args[1];
             return syn::parse_quote!(::vericl::host_shims::mul_hi(#a, #b));
         }
-        // `fma(a, b, c)` — the free-function intrinsic. Bare (the glob-imported
-        // spelling, guarded against shadowing) or explicitly cubecl-rooted.
-        if method == "fma" && call.args.len() == 3 {
-            let bare = segs.len() == 1 && ep.path.leading_colon.is_none();
-            if bare && self.shadowed("fma") {
-                self.errors.push(Self::shadowed_fma_error(last.ident.span()));
-                return Expr::Call(call);
-            }
-            if bare || path_is_cubecl_rooted(&ep.path) {
-                let a = &call.args[0];
-                let b = &call.args[1];
-                let c = &call.args[2];
-                return syn::parse_quote!(::vericl::host_shims::fma(#a, #b, #c));
-            }
+        // `cubecl::…::fma(a, b, c)` — the free-function intrinsic, in its
+        // explicitly qualified spelling. The BARE form is deliberately not
+        // recognized here; see this struct's doc.
+        if method == "fma" && call.args.len() == 3 && path_is_cubecl_rooted(&ep.path) {
+            let a = &call.args[0];
+            let b = &call.args[1];
+            let c = &call.args[2];
+            return syn::parse_quote!(::vericl::host_shims::fma(#a, #b, #c));
         }
         Expr::Call(call)
     }
@@ -1555,7 +1562,7 @@ impl ShimRewriteFold<'_> {
     }
 }
 
-impl Fold for ShimRewriteFold<'_> {
+impl Fold for ShimRewriteFold {
     fn fold_expr(&mut self, expr: Expr) -> Expr {
         // Post-order: rewrite nested intrinsics (and the arguments of this
         // call) first, then this node — so `f32::cast_from(a.mul_hi(b))`
@@ -1972,6 +1979,27 @@ impl Fold for UsesRewriteFold<'_> {
                 } else if !self.locals.contains(&name)
                     && !KNOWN_HOST_SAFE_FREE_FNS.contains(&name.as_str())
                 {
+                    // A bare call whose name is also a cubecl free-function
+                    // intrinsic gets the extra half of the diagnosis: the
+                    // intrinsic is reachable, but only under its qualified
+                    // spelling (see `ShimRewriteFold`'s doc, round-10 major 3).
+                    let intrinsic_note = if BARE_SHADOWABLE_INTRINSICS.contains(&name.as_str()) {
+                        format!(
+                            " — note: `{name}` is also the name of cubecl's free-function \
+                             intrinsic `cubecl::prelude::{name}`, which every `#[cube]` item \
+                             glob-imports. vericl does not rewrite the BARE spelling to its \
+                             GPU-verified host shim, because a user item named `{name}` anywhere \
+                             in this scope wins over the glob import and a proc macro cannot see \
+                             the enclosing scope (measured: a `#[cube] fn {name}` beside the \
+                             kernel gave a twin that computed 5.0 where the device computed \
+                             1005.0). Write `cubecl::prelude::{name}(...)` for the intrinsic — \
+                             that spelling compiles inside `#[cube]` too and IS rewritten to the \
+                             shim — or `uses({name})` if you mean your own \
+                             #[vericl::helper]-annotated function"
+                        )
+                    } else {
+                        String::new()
+                    };
                     self.errors.push(syn::Error::new(
                         span,
                         format!(
@@ -1979,7 +2007,7 @@ impl Fold for UsesRewriteFold<'_> {
                              local binding, a declared helper, or a known host-safe free \
                              function; if `{name}` is a #[vericl::helper]-annotated function \
                              this item calls, add it to a `uses({name})` clause; otherwise \
-                             this construct may be outside the vericl v0 subset"
+                             this construct may be outside the vericl v0 subset{intrinsic_note}"
                         ),
                     ));
                 }
@@ -2156,21 +2184,29 @@ fn is_pinnable_config_expr(e: &Expr) -> bool {
     }
 }
 
-/// The root identifier a method call's receiver chain bottoms out in —
-/// `cfg` for `cfg.tile().m`, `x` for `(&x[i]).foo()`, `None` for anything that
-/// isn't rooted in a plain single-segment name. Used by `FloatMethodCheck` to
-/// tell a config method call from a Float method call (design R6).
-fn receiver_root_ident(mut e: &Expr) -> Option<String> {
+/// The identifier a method call's receiver *directly* names — `cfg` for
+/// `cfg.dot()` and for `(&cfg).dot()`, and `None` for `cfg.tile().dot()`,
+/// `cfg.tile.dot()` or anything else with a link in between.
+///
+/// **Why direct, not the chain root (round-10 review, moderate 5).** This
+/// drives `FloatMethodCheck`'s config exemption, whose justification is
+/// "`vericl::config!` already ran the same reject list over this method's body".
+/// That justification holds for exactly one link: the method the config type
+/// declares. It does **not** transfer to what that method *returns* — measured
+/// with `cfg.gainf().erf()`, where `gainf` returns `f32` and `erf` is
+/// cubecl's `unexpanded!()` intrinsic: keying the exemption on the chain ROOT
+/// exempted the whole chain, and the twin panicked at run time instead of being
+/// rejected at `erf`'s span. Config method return types are gated in
+/// `vericl::config!` (G13) to primitives and block-declared types, so a later
+/// link is either a primitive method — which this name list is exactly right
+/// for — or another config method, which must then be written as one more
+/// method on the config (where it is hashed and gated) rather than as a chain.
+fn direct_receiver_ident(mut e: &Expr) -> Option<String> {
     loop {
         match e {
             Expr::Paren(p) => e = &p.expr,
             Expr::Group(g) => e = &g.expr,
-            Expr::Field(f) => e = &f.base,
-            Expr::MethodCall(m) => e = &m.receiver,
-            Expr::Index(i) => e = &i.expr,
-            Expr::Unary(u) => e = &u.expr,
             Expr::Reference(r) => e = &r.expr,
-            Expr::Try(t) => e = &t.expr,
             Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
                 return Some(p.path.segments[0].ident.to_string());
             }
@@ -3109,19 +3145,14 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     }
 
     // Rewrite recognized GPU-intrinsic calls (`f32::cast_from`, `T::mul_hi`,
-    // `fma`) to their GPU-verified `::vericl::host_shims::` equivalents BEFORE
-    // the reject check below — a recognized call is rewritten away, an
-    // unrecognized one (e.g. a non-f32 cast target) survives to be rejected by
-    // name. The shadowing set is the set of names that, on the `#[cube]` side,
-    // would win over cubecl's glob-imported prelude: `uses(...)`-declared
-    // helpers, this item's params, and its local bindings (see
-    // `ShimRewriteFold`'s doc — only the bare free-function `fma` spelling is
-    // shadowable, and it errors rather than guessing).
-    let shim_shadow: HashSet<String> = collect_locals(&ref_block, &params)
-        .into_iter()
-        .chain(used_names.iter().cloned())
-        .collect();
-    let mut shim_rewrite = ShimRewriteFold { shadowing: Some(&shim_shadow), errors: Vec::new() };
+    // `cubecl::…::fma`) to their GPU-verified `::vericl::host_shims::`
+    // equivalents BEFORE the reject check below — a recognized call is
+    // rewritten away, an unrecognized one (e.g. a non-f32 cast target) survives
+    // to be rejected by name. Every recognized shape is qualified or a method
+    // call, never a bare single-segment name a user item could shadow: see
+    // `ShimRewriteFold`'s doc for why a BARE `fma` is left for the
+    // undeclared-call classification in `UsesRewriteFold` instead.
+    let mut shim_rewrite = ShimRewriteFold::default();
     ref_block = shim_rewrite.fold_block(ref_block);
     if let Some(combined) = shim_rewrite.errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
@@ -4201,14 +4232,10 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
     }
 
     // Rewrite recognized GPU-intrinsic calls to their `::vericl::host_shims::`
-    // equivalents before the reject check — same as a kernel twin, shadowing
-    // set included (a helper can declare its own `uses(...)` sub-helpers and
-    // locals, so the bare-`fma` hazard is identical here).
-    let shim_shadow: HashSet<String> = collect_locals(&ref_block, &params)
-        .into_iter()
-        .chain(used_names.iter().cloned())
-        .collect();
-    let mut shim_rewrite = ShimRewriteFold { shadowing: Some(&shim_shadow), errors: Vec::new() };
+    // equivalents before the reject check — same as a kernel twin, including
+    // the bare-`fma` exclusion (a helper's scope can declare its own `fma` just
+    // as a kernel's can).
+    let mut shim_rewrite = ShimRewriteFold::default();
     ref_block = shim_rewrite.fold_block(ref_block);
     if let Some(combined) = shim_rewrite.errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
@@ -6381,16 +6408,6 @@ mod tests {
         out
     }
 
-    /// The same fold with `fma` shadowed by a `uses(...)` helper / local
-    /// binding of that name — returns the (unrewritten) tokens and the errors.
-    fn shim_shadowed(src: &str) -> (String, Vec<String>) {
-        let expr: Expr = syn::parse_str(src).expect("valid expr");
-        let shadow: HashSet<String> = ["fma".to_string()].into_iter().collect();
-        let mut fold = ShimRewriteFold { shadowing: Some(&shadow), errors: Vec::new() };
-        let out = fold.fold_expr(expr).to_token_stream().to_string().replace(' ', "");
-        (out, fold.errors.iter().map(|e| e.to_string()).collect())
-    }
-
     /// `f32::cast_from(x)` rewrites to the verified `cast_to_f32` shim; the
     /// source type is left to Rust trait dispatch (`CastToF32`).
     #[test]
@@ -6436,8 +6453,7 @@ mod tests {
     /// one every `#[cube]` kernel writes) and explicitly cubecl-rooted — both
     /// rewrite to the GPU-verified `fma` shim, and nest with the other shims.
     #[test]
-    fn shim_rewrite_fma_bare_and_qualified() {
-        assert_eq!(shim("fma(a, b, c)"), "::vericl::host_shims::fma(a,b,c)");
+    fn shim_rewrite_fma_qualified_only() {
         assert_eq!(
             shim("cubecl::prelude::fma(a, b, c)"),
             "::vericl::host_shims::fma(a,b,c)"
@@ -6447,15 +6463,24 @@ mod tests {
             "::vericl::host_shims::fma(a,b,c)"
         );
         // Paren-evasion (the round-3/4 F1 standard): a parenthesised callee
-        // classifies exactly like the bare form.
-        assert_eq!(shim("(fma)(a, b, c)"), "::vericl::host_shims::fma(a,b,c)");
+        // classifies exactly like the unparenthesised one.
+        assert_eq!(
+            shim("(cubecl::prelude::fma)(a, b, c)"),
+            "::vericl::host_shims::fma(a,b,c)"
+        );
         // Nesting, in both directions — the two-product residual idiom the
         // shim exists for, with a cast_from operand.
         assert_eq!(
-            shim("fma(hi, f32::cast_from(n), -(hi * f32::cast_from(n)))"),
+            shim("cubecl::prelude::fma(hi, f32::cast_from(n), -(hi * f32::cast_from(n)))"),
             "::vericl::host_shims::fma(hi,::vericl::host_shims::cast_to_f32(n),-(hi*::vericl::\
              host_shims::cast_to_f32(n)))"
         );
+        // The BARE spelling is deliberately left alone (round-10 major 3): a
+        // user item named `fma` in the kernel's scope wins over cubecl's glob
+        // import, and this fold cannot see that scope. It falls through to
+        // `UsesRewriteFold`'s undeclared-call classification instead.
+        assert_eq!(shim("fma(a, b, c)"), "fma(a,b,c)");
+        assert_eq!(shim("(fma)(a, b, c)"), "fma(a,b,c)");
     }
 
     /// Everything that is NOT the free-function intrinsic is left untouched by
@@ -6480,52 +6505,61 @@ mod tests {
         }
     }
 
-    /// The shadowing guard. A BARE `fma` is the glob-imported prelude name, so
-    /// a `uses(...)` helper or a local binding of that name WINS over it on the
-    /// `#[cube]` side (Rust: an item/explicit import shadows a glob import).
-    /// Rewriting to the shim there would silently produce a twin that computes
-    /// something the kernel does not, so it errors instead — and the explicitly
-    /// cubecl-rooted spelling still rewrites, since it cannot be shadowed.
+    /// Round-10 review, major 3 — the bare-`fma` shadow hole, closed by
+    /// **rejecting** rather than guessing.
+    ///
+    /// The previous guard checked `uses(...)` names and `collect_locals`'
+    /// `PatIdent`s, neither of which contains a user's own ITEM named `fma`
+    /// declared beside the kernel. Measured with a `#[cube] pub fn fma(a,b,c) {
+    /// a*b + c + 1000.0 }`: the twin computed `5.0` from the host shim while the
+    /// device computed `1005.0` from the user's function — a silently wrong
+    /// twin. A bare `fma` therefore reaches `UsesRewriteFold`'s undeclared-call
+    /// classification, which rejects it and names both fixes.
     #[test]
-    fn shim_rewrite_fma_shadowing_guard() {
-        let (out, errs) = shim_shadowed("fma(a, b, c)");
-        assert_eq!(out, "fma(a,b,c)", "a shadowed bare `fma` must NOT be rewritten");
-        assert_eq!(errs.len(), 1, "exactly one targeted error: {errs:?}");
-        assert!(errs[0].contains("ambiguous"), "got: {}", errs[0]);
-        assert!(
-            errs[0].contains("cubecl::prelude::fma(...)"),
-            "the error must name the disambiguating spelling: {}",
-            errs[0]
-        );
-
-        // The qualified spelling is unambiguous even when the bare name is
-        // shadowed — that is exactly why the error suggests it.
-        let (out, errs) = shim_shadowed("cubecl::prelude::fma(a, b, c)");
-        assert_eq!(out, "::vericl::host_shims::fma(a,b,c)");
-        assert!(errs.is_empty(), "the qualified spelling must not error: {errs:?}");
-
-        // A shadowed name at the WRONG arity is not the intrinsic at all — it
-        // is an ordinary helper call, and the guard must stay quiet.
-        let (out, errs) = shim_shadowed("fma(a, b)");
-        assert_eq!(out, "fma(a,b)");
-        assert!(errs.is_empty(), "wrong arity must not trip the guard: {errs:?}");
-    }
-
-    /// End-to-end through `expand`: the shadowing guard's error really reaches
-    /// the caller (a kernel with a local binding named `fma`), and the
-    /// unshadowed bare intrinsic really expands (the `fma_axpy_map` example
-    /// exercises the full compile+prove+differential path).
-    #[test]
-    fn fma_shadowed_by_local_binding_is_rejected_end_to_end() {
+    fn bare_fma_is_rejected_with_both_fixes_named() {
         let func: ItemFn = syn::parse_str(
             "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
-             if ABSOLUTE_POS < y.len() { let fma = 2.0f32; \
+             if ABSOLUTE_POS < y.len() { \
              y[ABSOLUTE_POS] = fma(x[ABSOLUTE_POS], 2.0f32, 1.0f32); } }",
         )
         .expect("valid fn");
         let err = expand(quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0)), &func)
-            .expect_err("a locally-shadowed `fma` must not be silently rewritten");
-        assert!(err.to_string().contains("ambiguous"), "got: {err}");
+            .expect_err("a bare `fma` must not be silently rewritten to the host shim");
+        let msg = err.to_string();
+        assert!(msg.contains("call to `fma`"), "got: {msg}");
+        assert!(
+            msg.contains("cubecl::prelude::fma(...)"),
+            "the error must name the intrinsic spelling: {msg}"
+        );
+        assert!(msg.contains("uses(fma)"), "the error must name the helper route: {msg}");
+    }
+
+    /// The other half of major 3: an explicit `uses(fma)` declaration WINS over
+    /// the shim — composing a user helper that happens to be named `fma` is a
+    /// legitimate program, and it now works (before, it was rejected as
+    /// "ambiguous"). The qualified spelling still reaches the shim in the same
+    /// item, so both meanings are expressible side by side.
+    #[test]
+    fn uses_declared_fma_helper_wins_over_the_shim() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { \
+             y[ABSOLUTE_POS] = fma(x[ABSOLUTE_POS], 2.0f32, 1.0f32) \
+                             + cubecl::prelude::fma(x[ABSOLUTE_POS], 1.0f32, 0.0f32); } }",
+        )
+        .expect("valid fn");
+        let out = expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0), uses(fma)),
+            &func,
+        )
+        .expect("uses(fma) must compose a user helper named `fma`")
+        .to_string()
+        .replace(' ', "");
+        assert!(out.contains("fma_vericl_ref("), "the helper call must be rewritten: {out}");
+        assert!(
+            out.contains("::vericl::host_shims::fma("),
+            "the qualified intrinsic must still reach the shim: {out}"
+        );
     }
 
     /// `x.fma(a, b)` / `f32::fma(a, b, c)` reach `FloatMethodCheck` and are
@@ -7333,6 +7367,56 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("host-callability of `F::dot`"), "got: {s}");
         assert!(s.contains("also bound as a local"), "the note must explain the ambiguity: {s}");
+    }
+
+    /// Round-10 review, moderate 5 — the exemption is ONE LINK deep.
+    ///
+    /// `cfg.gainf().erf()` was accepted before this because the exemption keyed
+    /// on the receiver chain's ROOT: `gainf` returns an `f32`, `erf` is
+    /// cubecl's `unexpanded!()` intrinsic, and the twin panicked at run time
+    /// where every comparable vericl gate is a compile-time rejection. Only the
+    /// first link — the method the config type declares, gated where it is
+    /// declared — is exempt.
+    #[test]
+    fn the_config_exemption_covers_only_the_first_link_of_a_chain() {
+        let attr = quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0),
+                          instantiate(cfg = P3Cfg { gain: 2 }));
+
+        // The escape: a reject-listed method on a config method's RESULT.
+        let chained: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: P3Cfg) { \
+             if ABSOLUTE_POS < y.len() { \
+             y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * cfg.gainf().erf(); } }",
+        )
+        .expect("valid fn");
+        let err = expand(attr.clone(), &chained)
+            .expect_err("the second link of a config-rooted chain must be checked");
+        assert!(err.to_string().contains("host-callability of `F::erf`"), "got: {err}");
+
+        // A FIELD access under the method is a link too — same rejection.
+        let field: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: P3Cfg) { \
+             if ABSOLUTE_POS < y.len() { \
+             y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * cfg.inner.erf(); } }",
+        )
+        .expect("valid fn");
+        assert!(
+            expand(attr.clone(), &field).is_err(),
+            "a field access under the method is not the first link either"
+        );
+
+        // Positive control, unchanged: the direct call is still exempt, through
+        // a reference and through redundant parens.
+        for src in ["cfg.erf()", "(cfg).erf()", "(&cfg).erf()"] {
+            let good: ItemFn = syn::parse_str(&format!(
+                "pub fn k(x: &Array<f32>, y: &mut Array<f32>, #[comptime] cfg: P3Cfg) {{ \
+                 if ABSOLUTE_POS < y.len() {{ \
+                 y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * {src}; }} }}"
+            ))
+            .expect("valid fn");
+            expand(attr.clone(), &good)
+                .unwrap_or_else(|e| panic!("`{src}` is the first link and must be exempt: {e}"));
+        }
     }
 
     /// A kernel WITHOUT a config param keeps the old receiver-blind behavior

@@ -41,12 +41,12 @@
 //!   addressing domain, on wgpu and cubecl-cpu, including the real idiom
 //!   `f32::cast_from(ABSOLUTE_POS)`.
 //! - **bool→f32** is exactly `true → 1.0`, `false → +0.0` on both lanes.
-//! - **fma f32** is bit-exact on cubecl-cpu everywhere, and bit-exact on
-//!   wgpu/Metal on every triple with no subnormal operand or result. **One
-//!   measured divergence class: Metal flushes subnormals to zero** (78 of 7972
-//!   probe triples, all exactly `ftz(fma(ftz a, ftz b, ftz c))`), so the shim is
-//!   bit-exact *outside* the subnormal domain and flush-to-zero-divergent
-//!   inside it. See [`fma_f32`] and the ground-truth test's header.
+//! - **fma f32** is bit-exact on cubecl-cpu everywhere, subnormals and the
+//!   underflow boundary included. On wgpu/Metal it is bit-exact outside a
+//!   characterized **flush-to-zero domain** (4974 of 21996 probe triples), and
+//!   inside that domain the device's answer is given exactly by the model in
+//!   [`fma_f32`]'s doc. See that doc for the model and for what "characterized"
+//!   is asserted to mean.
 //!
 //! If a future backend's rounding or high-word semantics were to diverge from
 //! these, the ground-truth test fails loudly and the shim — not the test —
@@ -230,23 +230,47 @@ pub fn mul_hi<T: MulHi>(a: T, b: T) -> T {
 /// → `llvm_ods::intr_fma`).
 ///
 /// **Measured tier (the honest one, not the hoped-for one).** Against the real
-/// intrinsic over 7972 triples — boundary, ±0, ±inf, NaN, subnormal,
-/// cancellation-heavy two-product residuals, random:
+/// intrinsic over **21996 triples** — boundary, ±0, ±inf, NaN, subnormal, the
+/// underflow boundary in both directions, an 18³ cross-product over the values
+/// straddling the normal/subnormal border, cancellation-heavy two-product
+/// residuals, random:
 ///
-/// - cubecl-cpu: **bit-exact everywhere**, subnormals included.
-/// - wgpu/Metal: **bit-exact on every triple with no subnormal operand or
-///   result**; on the 78 triples that touch the subnormal range the backend
-///   **flushes denormals to zero** and the host does not. The divergence is not
-///   approximate — it is exactly `gpu == ftz(fma_f32(ftz a, ftz b, ftz c))`,
-///   asserted as a model in the ground-truth test rather than tolerated as
-///   noise. A twin whose kernel genuinely computes in the subnormal range must
+/// - **cubecl-cpu (LLVM `llvm.fma`): bit-exact on all 21996**, subnormals and
+///   the underflow boundary included. This backend does not flush.
+/// - **wgpu/Metal: bit-exact on 17022 of 21996.** The other **4974** are a
+///   characterized flush-to-zero domain, on which the device's answer is
+///   *exactly*:
+///
+///   ```text
+///   metal_fma(a, b, c) =
+///       let (a, b, c) = (ftz a, ftz b, ftz c)          // subnormal operands -> ±0
+///       if 0 < |exact(a*b + c)| < f32::MIN_POSITIVE     // EXACT, pre-rounding
+///           then ±0 with the sign of the exact value
+///           else fma_f32(a, b, c)
+///   ```
+///
+///   **The underflow decision is made on the exact pre-rounding magnitude, not
+///   on the rounded result** — this is the round-10 review's correction and it
+///   is not a nicety. The two rules differ on an exact magnitude in the
+///   half-ulp band `[MIN_POSITIVE − 2^-150, MIN_POSITIVE)`, which rounds *up*
+///   to the smallest normal: `fma(2^-126, 2^-126, −2^-126)` has all-normal
+///   operands, a normal shim result of `−2^-126`, and a device result of `−0`.
+///   The previous "flush the rounded result" model got 0 of 8688 such triples
+///   right; this one got 8688 of 8688, and it is now asserted over the whole
+///   corpus rather than only where shim and device already disagreed.
+///
+///   A twin whose kernel genuinely computes at or below that boundary must
 ///   therefore compare with a tolerance, not `max_ulp = 0`; every other twin is
-///   bit-exact. This is the same shape of finding as the `to_unit_interval`
-///   Metal reciprocal-multiply (1 ULP): a real backend property, recorded.
+///   bit-exact. Same shape of finding as the `to_unit_interval` Metal
+///   reciprocal-multiply (1 ULP): a real backend property, recorded.
 ///
-/// **Discrimination.** If this shim were the naive `a*b + c`, the ground-truth
-/// test would fail on 3654/7972 triples on wgpu and 3576/7972 on cubecl-cpu.
-/// The verdict above is not vacuous.
+/// **Discrimination.** Three ways the verdict is kept non-vacuous, all
+/// asserted in `host_shim_gpu_ground_truth.rs`: the naive `a*b + c` substitute
+/// would fail on 8508/21996 triples on wgpu and 3782/21996 on cubecl-cpu;
+/// exactly one of the two candidate models (this flush model, or the raw shim)
+/// must explain each lane with **zero** mismatches while the other mismatches
+/// somewhere; and nine mutations of the flush model plus the superseded
+/// pre-round/post-round variant were injected and all ten fail the test.
 #[inline]
 pub fn fma_f32(a: f32, b: f32, c: f32) -> f32 {
     a.mul_add(b, c)

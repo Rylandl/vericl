@@ -434,8 +434,17 @@ subnormal, cancellation-heavy residuals, random):
   the subnormal range diverge, and all 78 are *exactly* flush-to-zero
   (`gpu == ftz(fma(ftz a, ftz b, ftz c))`) — asserted as a model, not averaged into a tolerance.
 
-So a twin computing in the normal range is bit-exact; one that genuinely computes in the subnormal
-range must use a tolerance. Same shape of finding as the Metal reciprocal-multiply 1-ULP result:
+> **SUPERSEDED by the round-10 review (critical 2).** The model above is wrong and the
+> "bit-exact with no subnormal operand or result" boundary with it. Metal decides underflow on
+> the **exact pre-rounding** magnitude, not on the rounded result, so an all-normal triple whose
+> exact value lands in the half-ulp band below `MIN_POSITIVE` is flushed even though it rounds to
+> a normal — `fma(2^-126, 2^-126, -2^-126)` gives `-2^-126` on the host and `-0` on the device.
+> Corrected model, a 21996-triple corpus that reaches the band, and a whole-corpus (rather than
+> divergence-only) assertion: `crates/vericl/src/host_shims.rs` and
+> `crates/vericl-examples/tests/host_shim_gpu_ground_truth.rs`.
+
+So a twin computing in the normal range is bit-exact; one that genuinely computes at or below the
+underflow boundary must use a tolerance. Same shape of finding as the Metal reciprocal-multiply 1-ULP result:
 a real backend property, recorded rather than smoothed over.
 
 The private phasor kernels sit at `abs = 1e-5` / `1e-3` — **not** because of the shim (the fused

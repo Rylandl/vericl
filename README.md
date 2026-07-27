@@ -232,14 +232,32 @@ which is where the defects live.
 **The subset, exactly.** Accepted: field access, method calls at any depth, `match`/`if` on a
 comptime scrutinee, `comptime!` blocks over a config, config-driven loop bounds and index
 arithmetic, nested config types (declared in the same block), `uses(...)` composition, generics,
-`Vector`, and cooperative kernels. Rejected, each with a targeted message: a config type not declared
-with `vericl::config!`; a non-pinnable `instantiate(...)` value; `#[cube]` on a config impl; a
-non-host-callable call in a config method; a **reference**-typed `#[comptime]` parameter (it must be
-taken by value); a generic config type; a field whose type is neither a scalar primitive nor declared
-in the same block; and, inside the block, a `static`, a `mod`, or any macro invocation — including
-the `macro_rules!`-generated config families CubeCL's own `cubek-std` uses, which must be written out
-so that what is hashed is what the type actually is. The prover is untouched: a struct-comptime
-kernel's IR is *byte-identical* to the same kernel written with plain comptime scalars.
+`Vector`, cooperative kernels, and a type alias for a scalar in `#[comptime]` position. Rejected,
+each with a targeted message: a config type not declared with `vericl::config!`; a non-pinnable
+`instantiate(...)` value; `#[cube]` on a config impl; a non-host-callable call in a config method; a
+**reference**-typed `#[comptime]` parameter (it must be taken by value); a generic config type; a
+field or **return type** that is neither a scalar primitive nor declared in the same block; a call or
+associated-item read that resolves *outside* the block in any syntactic form — `helper(x)`,
+`Self::helper(x)`, `self.helper()`, `Self::K`, or a user extension trait's `self.m.boost()`; an
+**impure** reach (`std::env`, `std::process`, `std::time`, `std::fs`, `std::io`, `rand`-likes, and
+`std::mem` for target-dependence); a **custom derive**; a `use` that rebinds `core`/`std`/`alloc`/a
+primitive name, or a glob `use`; and, inside the block, a `static`, a `mod`, or any macro invocation
+— including the `macro_rules!`-generated config families CubeCL's own `cubek-std` uses, which must be
+written out so that what is hashed is what the type actually is. The prover is untouched: a
+struct-comptime kernel's IR is *byte-identical* to the same kernel written with plain comptime
+scalars.
+
+**Two limits worth knowing before you start.** A config type must be *declared* inside a
+`vericl::config!` block, so a **third-party** config type is inexpressible in v1 — Rust's orphan rule
+would let you write `impl ConfigIdentity for TheirCfg`, but VeriCL never emits a bare impl, because a
+hash over tokens you did not write certifies nothing and the gates would have nothing to walk. The
+workaround is a clean-room port of the parts you use (that is exactly what the ecosystem
+spot-validation does with `cubek-std`'s `TileSize`). And `const`-evaluable **does not mean
+source-determined**: a pin derived from `option_env!`/`cfg!` is const-evaluable and can still differ
+between two builds of identical source. VeriCL hashes the pin's *expression text* (it is inside the
+contract-attribute tokens), not the environment that resolved it, so such evidence is per-build
+deterministic rather than per-source reproducible — `ir_hash` under `prove: true` is what catches the
+drift. If cross-build reproducibility matters, write the value out.
 
 **The residual, stated plainly.** Rust allows an inherent `impl` for a local type anywhere in the
 crate, so a second impl block written *outside* the `vericl::config!` invocation escapes both the
@@ -602,29 +620,48 @@ trait error in the twin. Loud, never a silently wrong value.
 |---|---|---|
 | `f32::cast_from(x)`, `x: u32`/`i32`/`usize`/`bool`/`f32` | `cast_to_f32` | bit-exact, both lanes (`bool` is exactly `true → 1.0`, `false → +0.0`; `usize` is cubecl's `AddressType`, verified across the whole u32 domain including `> 2^24`) |
 | `T::mul_hi(a, b)` / `a.mul_hi(b)`, `T = u32` | `mul_hi` | bit-exact, both lanes |
-| `fma(a, b, c)`, `f32` | `fma` (Rust `f32::mul_add`) | bit-exact on cubecl-cpu everywhere; bit-exact on wgpu/Metal outside the subnormal range — see below |
+| `cubecl::prelude::fma(a, b, c)`, `f32` | `fma` (Rust `f32::mul_add`) | bit-exact on cubecl-cpu everywhere; bit-exact on wgpu/Metal outside a characterized flush-to-zero domain (4974 of 21996 probe triples) — see below |
 
 **`a * b + c` is not a substitute for `fma(a, b, c)`, and this is measured, not asserted.** The
 unfused form rounds twice where `fma` rounds once, and for the two-product idiom
 `fma(h, x, -(h*x))` — the exact rounding error of a rounded product, the primitive under every
 compensated accumulator — the unfused rewrite is identically `0.0` where the fused answer is the
 entire signal. Over the ground-truth corpus the naive host substitute would diverge from the real
-GPU intrinsic on 3654 of 7972 triples on wgpu and 3576 of 7972 on cubecl-cpu; the public
+GPU intrinsic on 8508 of 21996 triples on wgpu and 3782 of 21996 on cubecl-cpu; the public
 `fma_two_product_residual` / `unfused_two_product_residual` example pair shows the same gap on the
 device (residual non-zero on 1023 of 1024 inputs vs exactly zero).
 
 **The one divergence class, recorded rather than smoothed over.** On wgpu/Metal the `fma` shim is
-bit-exact on every probe triple with no subnormal operand or result; on the 78 triples that touch
-the subnormal range the backend flushes denormals to zero and the host does not. The divergence is
-not approximate — it is exactly `ftz(fma(ftz a, ftz b, ftz c))`, and the ground-truth test asserts
-that model instead of widening a tolerance. A kernel computing in the normal range is bit-exact
-(`compare(max_ulp = 0)`); one that genuinely computes in the subnormal range needs a tolerance.
+bit-exact on 17022 of 21996 probe triples. The other 4974 are a **flush-to-zero domain**, and on it
+the device's answer is given exactly by:
 
-**Shadowing.** `fma` is glob-imported from `cubecl::prelude`, so a `uses(...)` helper or a local
-binding of that name wins over it on the `#[cube]` side. VeriCL will not guess which one a bare
-`fma(a, b, c)` meant: it raises a targeted error naming both escapes (rename, or write
-`cubecl::prelude::fma(...)`, which the rewrite also recognizes and which does compile inside
-`#[cube]`).
+```text
+metal_fma(a, b, c) =
+    let (a, b, c) = (ftz a, ftz b, ftz c)           // subnormal operands -> ±0
+    if 0 < |exact(a*b + c)| < f32::MIN_POSITIVE     // EXACT, before rounding
+        then ±0 with the sign of the exact value
+        else fma(a, b, c)
+```
+
+The underflow decision is made on the **exact pre-rounding magnitude**, not on the rounded result.
+The distinction is measurable, not pedantic: `fma(2^-126, 2^-126, -2^-126)` has all-normal operands
+and rounds to the normal `-2^-126` on the host, while the device returns `-0`. The ground-truth
+test asserts this model over *every* triple on both lanes (not just where host and device already
+disagree), requires exactly one of "this model" / "no flush at all" to explain each lane with zero
+mismatches, and is discriminated by ten injected mutations of the model — all of which fail it.
+A kernel computing in the normal range is bit-exact (`compare(max_ulp = 0)`); one that genuinely
+computes at or below the underflow boundary needs a tolerance.
+
+**Only the qualified spelling is rewritten.** `fma` is glob-imported from `cubecl::prelude`, and a
+glob import is the weakest binding in Rust: a `uses(...)` helper, a local binding, or **an ordinary
+item named `fma` anywhere in the kernel's scope** wins over it on the `#[cube]` side, and a proc
+macro cannot see the enclosing scope. VeriCL therefore does not rewrite a **bare** `fma(a, b, c)` at
+all — measured, a `#[cube] fn fma` declared beside a kernel produced a twin computing `5.0` where
+the device computed `1005.0`. A bare call falls through to the ordinary undeclared-call rejection,
+which names both fixes: write `cubecl::prelude::fma(...)` for the intrinsic (that spelling compiles
+inside `#[cube]` and *is* rewritten to the verified shim), or `uses(fma)` if you mean your own
+`#[vericl::helper]`. An explicit `uses(fma)` declaration wins over the shim, so composing a helper
+that happens to be named `fma` is a legal program.
 
 ## Claims and trust boundaries
 

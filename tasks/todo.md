@@ -2485,12 +2485,31 @@ an item/explicit import beats a glob import). Rewriting there would be a silentl
 twin, so it errors, naming both escapes. The suggested escape was verified to actually
 compile inside `#[cube]` rather than assumed.
 
+> **SUPERSEDED by the round-10 review (major 3).** The guard's shadowing set was
+> `uses(...)` names plus `collect_locals`' `PatIdent`s, and neither contains a user's own
+> ITEM named `fma` declared beside the kernel — which also beats the glob import. Measured:
+> a `#[cube] pub fn fma(a,b,c) { a*b + c + 1000.0 }` gave a twin computing 5.0 where the
+> device computed 1005.0. The BARE form is no longer rewritten at all; it falls through to
+> the undeclared-call classification, and `uses(fma)` composing a user helper of that name
+> now WORKS instead of being rejected as ambiguous. See the round-10 record.
+
 *Ground truth* (`tests/host_shim_gpu_ground_truth.rs`, 7972 triples, both lanes): cubecl-cpu
 bit-exact everywhere; wgpu/Metal bit-exact outside the subnormal range, and **78 subnormal
 divergences that are ALL exactly flush-to-zero** — asserted as a model
 (`gpu == ftz(fma(ftz a, ftz b, ftz c))`), not absorbed into a tolerance. Discrimination is
 measured in-test: the naive `a*b + c` host substitute would fail on 3654/7972 (wgpu) and
 3576/7972 (cpu), and injecting it makes BOTH lanes fail loudly (done, then reverted).
+
+> **SUPERSEDED by the round-10 review (critical 2).** Two of the sentences above are false.
+> The model is not `ftz(fma(ftz a, ftz b, ftz c))`: the device decides underflow on the
+> **exact pre-rounding** magnitude, so an all-normal triple whose exact result lands in the
+> half-ulp band below `MIN_POSITIVE` is flushed even though it rounds to a normal
+> (`fma(2^-126, 2^-126, -2^-126)`: shim `-2^-126`, device `-0`). And "bit-exact outside the
+> subnormal range" is therefore false too — those counterexamples have no subnormal operand
+> and no subnormal result. The 7972-triple corpus never reached that band, and the assertion
+> only checked the model where shim and device already disagreed, so four distinct wrong
+> models passed it. Corrected model, corpus (21996 triples) and whole-corpus assertion: see
+> the round-10 record at the end of this file.
 
 **2. `CastToF32` source extension** — `usize` (cubecl's `AddressType`; verified across the
 whole u32 domain including `> 2^24`, plus the real `f32::cast_from(ABSOLUTE_POS)` idiom) and
@@ -2587,6 +2606,18 @@ block"). Three companion gates close the same escape by other routes, each of wh
 **G9** rejects reading a `const`/`static` declared outside the block; **G8** rejects any macro
 invocation in a body (`anything!(fma(a,b,c))` would otherwise evade G3 and G4 wholesale, since a
 macro's tokens are opaque to `syn`'s visitors); **G7** rejects `static`/`mod`/`macro_rules!` items;
+
+> **SUPERSEDED by the round-10 review (critical 1).** Both sentences overclaimed. G4 checked only
+> CALL-expression paths, not method syntax, so `self.combine()` with `combine` in an out-of-block
+> impl passed every gate (two blocks with byte-identical in-block tokens computed ×24 and ×11 with
+> identical `CONFIG_HASH`es and identical recorded kernel identities). G9 checked only the path
+> ROOT, so `Self::K` read an out-of-block associated const the same way (×24 vs ×15). G4 now
+> resolves the receiver's type for method calls (and restricts non-block receivers to the `std`
+> inherent surface, so a user extension trait on a primitive rejects); G9 now checks the TAIL of a
+> `Self::`/`T::` path against what the block declares. Four further gates were added in the same
+> family — G10 purity, G11 custom derives, G12 path-root rebinding, G13 return types. See the
+> round-10 record.
+
 and a struct-literal check rejects constructing an undeclared type. Two further gates close the
 design's own §7 *deferral* rather than merely documenting it: **G6** requires every field type to be
 a scalar primitive or a type declared in the SAME block (so a nested config in a sibling block cannot
@@ -2698,3 +2729,208 @@ milestone introduces, and it is the price of the hash meaning what it says.
 **Gates:** full workspace test green on default and `--features cpu`; clippy clean on both,
 all targets; demo-defects exit 0 (every defect caught); evidence updated last.
 
+## Round-10 adversarial review (2026-07-27) — 2 CRITICAL, 2 major, 2 moderate — ALL CLOSED
+
+Verdict on entry: **not clean**. The struct-comptime soundness milestone and the `fma` shim batch
+both shipped claims that a determined attack falsified. Two criticals, both of the same shape — a
+gate that was described as closing an escape and did not — plus a wrong-but-asserted backend model.
+Every finding below is closed in code, every probe the review preserved now flips, and each flipped
+probe left behind a permanent regression.
+
+### CRITICAL 1 — three in-block identity escapes, all now rejected at macro time
+
+`vericl::config!`'s module doc claimed "G4/G9 mean the in-block half cannot silently call into
+[an out-of-block impl]". Three ways it could:
+
+| probe | escape | measured before | now |
+|---|---|---|---|
+| **P1** | `self.combine()` — G4 walked **call-expression paths only**, never method syntax | two `config!` blocks with byte-identical tokens computed **×24 and ×11**, with identical `CONFIG_HASH`, identical `SOURCE_HASH`, and identical recorded `identity()`; stored evidence for one verified FRESH against the other | compile error at `combine`'s span naming the receiver's type |
+| **P5a** | `self.m.boost()` — a user extension trait `impl Boost for u32` written outside the block, reached in method form on a **primitive** field | `m` silently became `m * 7` | compile error naming the extension-trait route |
+| **P7** | `Self::K` — G9 checked the path **root** only, so an associated `const` in an out-of-block impl was readable | **×24 vs ×15**, identical `CONFIG_HASH`, identical `identity()` | compile error naming the missing associated item |
+
+The fix is receiver/tail **resolution**, not a longer name list. `BodyGate` now carries a three-valued
+type environment (`RTy::{Prim, Decl(name), Unknown}`) built from the block's own declarations —
+struct fields, method return types, `let` bindings typed in source order, `Self`, casts, literals — so
+a method call is admitted on exactly two grounds: the receiver resolves to a type **this block
+declares** and the block declares that method for it, or the name is on `STD_METHOD_ALLOWLIST`.
+That list is the `std` *inherent* surface, and the soundness argument is the one
+`FLOAT_METHOD_WHITELIST` already rests on: Rust resolves an inherent method before any trait method,
+so on a primitive receiver an allowlisted name cannot be silently rebound by a user trait, while a
+name that is *not* in std (`boost`) is exactly the case that can be — which is why it is rejected.
+User-extensible conversion traits (`into`/`from`/`try_into`/`as_ref`/`to_owned`) are deliberately
+absent from the list even though they are "std".
+
+Resolution also **removed** a false positive rather than adding one: `self.window().dot()` inside a
+block now compiles, because the receiver resolves to a declared type that declares `dot`. Before, the
+`FLOAT_METHOD_REJECT` name check fired on it blind.
+
+Three further gates in the same family, each a live escape the review found or the fix implied:
+
+- **G11, custom derives** — the unhashed-impl sibling of G7's macro rejection. `#[derive(Foo)]` puts
+  the *invocation* in the hash and leaves `Foo`'s definition — which decides what impls and
+  associated items the type has — outside it. Allowlisted: the nine `std` derives, whose expansion is
+  fixed by the language; their associated items (`default`, `clone`, `cmp`, …) are registered so
+  `Self::default()` resolves. Cost paid in-repo: `EvasiveCfg` derived `CubeType` for a `#[cube]`
+  out-of-block impl, so the residual demonstrator was rewritten as a **plain** out-of-block impl —
+  verified to reproduce the residual exactly (`reference_panic = Some("Unexpanded Cube functions
+  should not be called. ")`, `pass() == false`, kernel still launches).
+- **G12, path-root rebinding** (probe P5b) — `use crate::evil as core;` inside the block re-pointed
+  G4/G9's allowlisted root at user code and `core::cmp::max(self.m, 1)` evaluated to `self.m * 100`.
+  A `use` may no longer bind `core`/`std`/`alloc`/`Self`/a primitive name, and a glob `use` (which
+  could bind one invisibly) is rejected.
+- **G13, return types** — gated exactly like field types, so the kernel-side chain rule below has
+  something to compose with.
+
+### CRITICAL 2 — the asserted fma flush-to-zero model was FALSE
+
+`host_shims::fma_f32` documented, and the ground-truth test asserted, `gpu == ftz(fma(ftz a, ftz b,
+ftz c))` — flush the **rounded** result — together with "bit-exact on every triple with no subnormal
+operand or result". Both are wrong. Metal decides underflow on the **exact, pre-rounding** magnitude,
+so an exact result in the half-ulp band `[MIN_POSITIVE − 2^-150, MIN_POSITIVE)` — which rounds *up*
+to the smallest normal — is flushed anyway:
+
+```text
+fma(0x00800000, 0x00800000, 0x80800000)   shim = 0x80800000 (−2^-126)   device = 0x80000000 (−0)
+```
+
+All-normal operands, a normal shim result, a zero device result: the counterexample lands in the
+**bit-exact tier**, not in the documented subnormal one. Head-to-head over the reviewer's 32000-triple
+near-boundary family the two models disagreed on 8688 triples and the device sided with the amended
+model **8688 / 8688** and with the shipped model **0 / 8688**.
+
+Two independent defects made it invisible, and both are fixed:
+
+1. **The corpus never reached the band.** It is now 7972 → **21996** triples: the half-ulp band built
+   from all-normal operands (a tiny product against `±MIN_POSITIVE`), an explicit ladder of `2^-140 …
+   2^-163` products straddling the `2^-150` rounding boundary in both signs and both directions,
+   twelve exact-boundary triples, an 18³ cross-product over the values straddling the
+   normal/subnormal border, and 8000 randomized near-boundary cancellations.
+2. **The assertion only checked the model where shim and device already disagreed** — 78 of 7972
+   triples, blind on the other 7894. Each lane is now scored against **both** candidate semantics
+   over the whole corpus, and exactly one must explain it with **zero** mismatches while the other
+   mismatches somewhere. That single gate carries three claims: fully characterized, non-vacuous, and
+   bit-exact outside the flush domain.
+
+Measured after the fix, both lanes green: **wgpu** — flush model 0 / 21996, identity model 4974
+(flush domain 4974, bit-exact tier 17022); **cpu** — identity model 0 / 21996, flush model 4974, i.e.
+cubecl-cpu genuinely does not flush and the amended model correctly degrades to identity there.
+Naive-`a*b + c` discrimination: 8508 / 21996 (wgpu), 3782 / 21996 (cpu).
+
+The exactness is computed exactly, not in `f64`: `f64` rounds `2^-126 − 2^-252` back to `2^-126` and
+gets the answer wrong. `p = a*b` is exact in `f64`, and Knuth's two-sum then represents `p + c`
+exactly as an unevaluated `s + err`, which is enough to compare against `2^-126`.
+
+**Mutation-tested live** (`scratchpad/mutate_fma.py`, patches the model, runs the wgpu lane, restores
+byte-for-byte): **10 / 10 mutants caught**, including all four the previous assertion missed —
+dropping the addend's input flush, unfusing the inner product, flushing the intermediate product, and
+**the superseded model itself**.
+
+### MAJOR 3 — the bare-`fma` shadow hole
+
+`ShimRewriteFold`'s shadowing guard covered `uses(...)` names and `collect_locals`' `PatIdent`s.
+Neither contains a user's own **item** named `fma` declared beside the kernel — which also beats
+cubecl's glob import, and which a proc macro structurally cannot see. Measured with `#[cube] pub fn
+fma(a, b, c) { a*b + c + 1000.0 }`: the twin computed **5.0** from the host shim while the device
+computed **1005.0** from the user's function. A silently wrong twin, caught only by the differential
+lane.
+
+Closed by **not guessing**: a BARE `fma` is no longer rewritten at all. It falls through to
+`UsesRewriteFold`'s undeclared-call classification, which either rewrites it (when `uses(fma)`
+declares it — an explicit declaration wins over the shim) or rejects it with a message naming both
+fixes. `FloatMethodCheck` no longer name-checks a bare single-segment callee either, since every
+`FLOAT_METHOD_REJECT` name except `fma` is a trait method that can only be spelled `T::m`/`x.m`.
+Consequences, both deliberate:
+
+- **`uses(fma)` composing a user helper named `fma` now WORKS** — it used to be rejected as
+  "ambiguous". Pinned end-to-end by `tests/fma_name_composition.rs`, which computes `1006 + 5` from
+  the helper and the qualified intrinsic in one kernel body and passes the wgpu differential.
+- **The intrinsic must be written `cubecl::prelude::fma(...)`** — the spelling the old error already
+  recommended, verified to compile inside `#[cube]`. Two in-repo examples were updated
+  (`poly3_horner`, `fma_two_product_residual`), which is the honest cost and is why both kernels'
+  identities moved.
+
+### MAJOR 4 — purity, and the build-environment caveat
+
+`std::env::var("…")` in a config method passed all nine gates; flipping the variable changed the
+twin's answer from `2.0` to `4.0` with the kernel's recorded identity unmoved (probe P2). **G10** is a
+module-prefix denylist over `core`/`std`/`alloc` (`env`, `process`, `time`, `fs`, `io`, `net`,
+`thread`, `sync`, `collections`, `random`, …) plus rand-like crate roots, leaving the pure
+computational surface (`core::cmp`, `core::f32::consts`, primitives' associated functions) allowed.
+`mem` is on the list for a different reason, stated in its own diagnosis: `size_of::<usize>()` is 8 on
+the host and 4 in a kernel's addressing regime, so a config built on it would not describe the kernel
+it configures.
+
+The **pin** half is a documentation fix, because the behaviour is correct and the claim was
+imprecise. `const` guarantees one value per *build*, not a function of the source: a pin derived from
+`option_env!` is const-evaluable and can differ between two builds of identical source (probe P5c).
+Stated exactly, in README, guide §5.1 and here: the pin's **expression text** is inside the
+contract-attribute tokens `SOURCE_HASH` hashes, so editing the pin re-stales evidence — the
+environment that resolved it is not hashed and cannot be, so such evidence is **per-build
+deterministic, not per-source reproducible**, and `ir_hash` under `prove: true` is what catches the
+drift.
+
+### MODERATE 5 — the chain rule
+
+`FloatMethodCheck`'s config exemption keyed on the receiver chain's **root**, so
+`cfg.gainf().erf()` — where `gainf` returns `f32` and `erf` is cubecl's `unexpanded!()` intrinsic —
+was exempted whole and panicked at run time (probe P3). The exemption's justification is
+"`vericl::config!` already ran this list over that method's body", which covers exactly one link.
+`receiver_root_ident` → `direct_receiver_ident`: only a receiver that *is* the config parameter
+(through parens/references) is exempt; every later link is checked normally, and `erf` is now
+rejected at its own span. G13 (return types) is what makes the split compose — a config method can
+only hand back a primitive (whose methods the name list covers) or a block-declared type. The in-repo
+cost: `config_mode_scale`'s `cfg.window().dot()` became `cfg.dot()`, with the chain moved into
+`StageCfg` where it is hashed and gated — which is the documented workaround, demonstrated in code
+that compiles.
+
+### MODERATE 6 — honesty and the alias
+
+- **Orphan-rule consequence, now stated** in README, guide §5.1 and the `config` module doc: a config
+  type must be *declared* inside a `vericl::config!` block, so a third-party comptime config type is
+  inexpressible in v1. VeriCL never emits a bare `impl ConfigIdentity`, because a hash over tokens you
+  did not write certifies nothing and the gates would have nothing to walk. The clean-room port is the
+  workaround, and it is the only version that means anything.
+- **Scalar type aliases** (`type Taps = u32;` in `#[comptime]` position) used to produce a
+  `ConfigIdentity`-not-implemented error telling the author to wrap `Taps` in `vericl::config!` —
+  impossible advice, and wrong about what the type is. The macro cannot see through an alias, but
+  **rustc can**, so the resolution now happens at trait selection: each scalar primitive carries
+  `CONFIG_HASH = "vericl-scalar:<ty>"`. The alias compiles and is *not* identity-invisible —
+  retargeting it at another primitive moves the folded hash. An alias for a struct still needs that
+  struct declared, and a second `on_unimplemented` note names the alias case explicitly.
+
+### Surfaces that HELD under this round's attack
+
+- **The pin's const-evaluability gate** — `cfg = cfg_from_env()` is still `E0015` at the value's span;
+  P5c is a caveat on what `const` means, not a hole in the gate.
+- **`ir_hash`** — every config-derived value that reaches the device still moves it; the P1/P7
+  identity escapes were invisible to `source_hash` only, and `prove: true` suites would have caught
+  the behaviour change.
+- **The out-of-block residual's loud-failure backstop** — unchanged and re-verified after the
+  demonstrator was rewritten without `#[cube]`/`CubeType`.
+- **G3/G5/G6/G7/G8** and the pinnable-expression recognizer — no evasion found.
+- **P4 (a config method in `assumes(...)`)** — real, and now benign: with CRITICAL 1 closed the
+  in-block half cannot reach an out-of-block impl, so the assumption's meaning is inside
+  `CONFIG_HASH`. It stays on the record because the *residual* (an out-of-block impl) still reaches
+  a host-only surface `ir_hash` cannot see.
+- **The uses(...)/helper composition machinery, the slice/vector/coop gates, the interpreter
+  cross-check** — untouched by this round and still green.
+
+### Tests, counts, gates
+
+- `vericl-macros` unit tests **92 → 103**: eight new `config` gates/negatives (out-of-block method
+  through method syntax, extension-trait-on-primitive, receiver resolution through fields/returns/
+  `let`s, out-of-block associated const in read and call form, custom derives, impure std modules,
+  root rebinding, return types, bare imported call) and three kernel-side (bare `fma` rejection
+  naming both fixes, `uses(fma)` composing a helper, the one-link chain rule with its positive
+  controls).
+- Two new integration files: `tests/fma_name_composition.rs` (the 5.0-vs-1005.0 kernel, as the
+  direction that can run) and `tests/config_scalar_alias.rs`.
+- Ground truth: 7972 → **21996** triples, whole-corpus two-model adjudication, both lanes.
+- **Identity-affecting changes, expected and reported:** four kernels re-hashed —
+  `fma_poly3_map` and `fma_two_product_residual` (bare → qualified `fma`), `config_window_sum` and
+  `config_mode_scale` (the `StageCfg::dot` method added to the block moves `CONFIG_HASH`). Evidence
+  renewed last, after every gate was green.
+
+**Gates:** full workspace test green on `--features wgpu` and `--features cpu`; clippy clean on both,
+all targets, zero warnings; demo-defects exit 0; the two config examples and both lanes green;
+`VERICL_UPDATE` run last.
