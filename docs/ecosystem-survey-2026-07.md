@@ -473,3 +473,42 @@ ecosystem's remaining mass sits.
 - The View pure/mixed split does not reproduce the Slice addendum's ~14 pure + 38 mixed; the *mixed*
   figure lands near 38 in every variant, the *pure* figure is dominated by whether `Coordinates` is in
   the signal set. Reported as measured with the definition stated, not tuned to match.
+
+## Addendum — shim-and-small-gate batch (2026-07-27): re-census target 4 is CLOSED
+
+The re-census's spot-validation left one shortlisted item cleanly rejected: the third of the three
+cubek-random distribution cores, the **Bernoulli per-value map**, whose only blocker was a
+`cast_from` with a **`bool`** source (`E::cast_from(float_random < prob)`, pinned at `E = f32`).
+The rejection was correct — `bool: CastToF32 is not satisfied` — and the fix was one trait impl
+behind GPU ground truth.
+
+Re-measured today, in the same annotation crate, non-destructively (the original eight evidence
+entries and the six re-census additions are byte-identical; the probe stays behind its
+`--features probe_bernoulli` gate and adds no evidence entry):
+
+- the kernel **compiles**, differential-**passes** at every swept size (1, 7, 256, 1000, 4096) at
+  **`max_ulp = 0`**, and its bounds proof discharges at **`Proved{5}`**;
+- so all three cubek-random distribution cores — uniform, normal (Box–Muller), Bernoulli — are now
+  annotatable, differential-green and bounds-proved, through five composed `#[vericl::helper]`s.
+
+Ground truth for the new source types, measured in a real `#[cube]` kernel on **wgpu and
+cubecl-cpu** (`crates/vericl-examples/tests/host_shim_gpu_ground_truth.rs`):
+
+- **`bool → f32`** is exactly `true → 1.0`, `false → +0.0` on both lanes — including the `+0.0`
+  sign bit, which is what makes `max_ulp = 0` legitimate rather than merely convenient.
+- **`usize → f32`** matches `x as f32` bit-for-bit across the whole u32 addressing domain on both
+  lanes, `> 2^24` included, and so does the real idiom `f32::cast_from(ABSOLUTE_POS)`. (`usize` in
+  a `#[cube]` body is cubecl's `AddressType` — `u32` storage for any buffer of at most `u32::MAX`
+  elements — so the host `as f32` agrees with the device conversion in the regime real kernels
+  run in, and remains round-to-nearest-even above it.)
+
+**One finding, and it is not about the shim.** The probe kernel had been written with
+`compare(exact)` — the *integer* compare mode — on an `f32` output. That contract bug was
+invisible for as long as the kernel could not compile, and surfaced on the first run
+(`compare(exact) is for integer kernels; an f32 array needs max_ulp = N or abs = X`). It is now
+`max_ulp = 0`. A rejection can hide a second defect behind it; "cleanly rejected" is weaker
+evidence than "runs and passes", and this is a concrete instance of the gap.
+
+Also cleared by this batch, from the re-census's `cast_from` three-bucket accounting: the
+`usize`-source rows move from "definitely still rejected" to shimmed. The **non-`f32` cast
+TARGET** rows (e.g. `u32::cast_from(...)`) are unchanged and remain the honest residual.

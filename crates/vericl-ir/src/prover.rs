@@ -228,6 +228,19 @@
 //!   The side-obligations (`checked_mul`, `cast_int`) are internal modeling
 //!   preconditions, deliberately *not* counted in `Prover::obligations`.
 //!
+//!   *Taint provenance in the diagnostic (message-only).* An index that becomes
+//!   unmodelable **because** one of these side-obligations failed used to read
+//!   as a bare "depends on a construct outside the vericl v0 subset", which
+//!   names the symptom and not the cause — the 2026-07-24 re-census hit exactly
+//!   this on real code (the same defect surfaced as an actionable
+//!   counterexample or as a bare `OutOfSubset` depending only on buffer size).
+//!   `Prover::taint_why` now records the failing construct for `checked_mul`
+//!   and `divmod_int`, propagates it across further integer arithmetic, and the
+//!   index-resolution failure quotes it. It is **diagnostics only**: no
+//!   modeling decision reads it, the pre-existing wording is preserved verbatim
+//!   as the message prefix, and a taint the prover cannot attribute gets no
+//!   invented explanation (`untraceable_taint_keeps_the_generic_message`).
+//!
 //!   *Why this over full QF_BV (approach (a)).* QF_BV would model wraparound
 //!   for free but rewrite every existing encoding — bounds obligations, the
 //!   length/element/gather assumes, the two-thread race walk, the cooperative
@@ -799,6 +812,8 @@ fn prove_bounds_freedom_impl(
             HashSet::new()
         },
         walk_depth: 0,
+        taint_why: HashMap::new(),
+        pending_taint_reason: None,
     };
 
     let buffer_tys: Vec<Type> =
@@ -901,6 +916,8 @@ fn prove_race_freedom_detailed(
         coop_barrier_seen: false,
         coop_varying: varying,
         walk_depth: 0,
+        taint_why: HashMap::new(),
+        pending_taint_reason: None,
     };
 
     let buffer_tys: Vec<Type> =
@@ -1063,6 +1080,28 @@ struct Prover<'a, 'b> {
     /// the only one that recognises a `terminate!()` (§4.3/§7.4: the guard is
     /// top-level). Incremented on entry, decremented on exit.
     walk_depth: u32,
+    /// **Diagnostics only.** Why a particular variable is tainted, when the
+    /// prover knows a specific, nameable cause — currently the undischarged
+    /// no-overflow side-obligation of an integer `*` (`checked_mul`) and the
+    /// undischarged non-zero/non-negative side-obligation of an integer `/`
+    /// or `%` (`divmod_int`), plus one-hop-at-a-time inheritance through
+    /// further integer arithmetic on an already-explained value.
+    ///
+    /// Read at exactly one kind of site: the `OutOfSubset` text emitted when
+    /// an index (or a `len()`-style consumer) cannot resolve, so the message
+    /// names the originating construct instead of the generic "outside the
+    /// vericl v0 subset". **Never consulted by any modeling decision** — no
+    /// verdict, obligation count, or counterexample depends on it, and an
+    /// entry being absent only ever costs a less specific sentence. Cleared
+    /// by `set_var` on every write, so a stale reason can never outlive the
+    /// value it explains.
+    taint_why: HashMap<VariableKind, String>,
+    /// Out-parameter for the side-obligation helpers: set by `checked_mul` /
+    /// `divmod_int` at the exact branch where THIS instruction's taint has a
+    /// nameable cause, then taken by `process_arithmetic` after `bind_out`
+    /// (which must run first, since `set_var` clears `taint_why`). Always
+    /// `None` between instructions.
+    pending_taint_reason: Option<String>,
 }
 
 /// Which of the two symbolic threads a race walk is currently resolving
@@ -1823,9 +1862,38 @@ impl<'a, 'b> Prover<'a, 'b> {
     /// branch happens to be where it's lazily resolved).
     fn set_var(&mut self, kind: VariableKind, val: Option<SExpr>) {
         self.memo.insert(kind, val);
+        // Any write invalidates whatever diagnostic provenance the previous
+        // value carried (see `taint_why`); a caller that still has a reason for
+        // the NEW value records it after this returns.
+        self.taint_why.remove(&kind);
         if let Some(frame) = self.write_log_stack.last_mut() {
             frame.insert(kind);
         }
+    }
+
+    /// Record why `kind` is tainted — diagnostics only, see `taint_why`.
+    fn note_taint_reason(&mut self, kind: VariableKind, why: String) {
+        self.taint_why.insert(kind, why);
+    }
+
+    /// The recorded reason for `kind`, rendered as a message suffix (empty when
+    /// the prover has nothing specific to say, which is the common case).
+    fn taint_detail(&self, kind: VariableKind) -> String {
+        match self.taint_why.get(&kind) {
+            Some(why) => format!(" — {why}"),
+            None => String::new(),
+        }
+    }
+
+    /// Propagate a recorded reason across one arithmetic hop: `p = a*b` taints
+    /// with a reason, then `idx = p + 1` taints *because* `p` did, and the
+    /// index's message should still name the multiply. Chains transitively,
+    /// since every hop copies. Left operand first (arbitrary but deterministic).
+    fn inherited_taint_reason(&self, a: &Variable, b: &Variable) -> Option<String> {
+        self.taint_why
+            .get(&a.kind)
+            .or_else(|| self.taint_why.get(&b.kind))
+            .cloned()
     }
 
     fn taint_out(&mut self, inst: &Instruction) {
@@ -1859,6 +1927,7 @@ impl<'a, 'b> Prover<'a, 'b> {
             self.taint_out(inst);
             return Ok(());
         }
+        self.pending_taint_reason = None;
         let val = match a {
             // Add/Sub are modeled *faithfully* under finite-width wraparound
             // (`wrap_to_range`): the SMT term equals the real hardware value at
@@ -1873,11 +1942,29 @@ impl<'a, 'b> Prover<'a, 'b> {
             // cannot wrap — else taint. This is the case the round-2 adversarial
             // review's `a*b == 2^32` divisor construction lands in.
             Arithmetic::Mul(b) => self.checked_mul(b, &out.ty)?,
-            Arithmetic::Div(b) => self.divmod_int(b, |s, l, r| s.div(l, r))?,
-            Arithmetic::Modulo(b) => self.divmod_int(b, |s, l, r| s.modulo(l, r))?,
+            Arithmetic::Div(b) => self.divmod_int(b, "/", |s, l, r| s.div(l, r))?,
+            Arithmetic::Modulo(b) => self.divmod_int(b, "%", |s, l, r| s.modulo(l, r))?,
             _ => None,
         };
         self.bind_out(inst, val);
+        // Diagnostics only (see `taint_why`): if this instruction tainted, keep
+        // whatever nameable cause we have — either the side-obligation this
+        // instruction itself failed to discharge, or the one an operand already
+        // carried. Recorded AFTER `bind_out`, whose `set_var` clears the slot.
+        if val.is_none() {
+            let reason = self.pending_taint_reason.take().or_else(|| match a {
+                Arithmetic::Add(b)
+                | Arithmetic::Sub(b)
+                | Arithmetic::Mul(b)
+                | Arithmetic::Div(b)
+                | Arithmetic::Modulo(b) => self.inherited_taint_reason(&b.lhs, &b.rhs),
+                _ => None,
+            });
+            if let Some(why) = reason {
+                self.note_taint_reason(out.kind, why);
+            }
+        }
+        self.pending_taint_reason = None;
         Ok(())
     }
 
@@ -1948,6 +2035,16 @@ impl<'a, 'b> Prover<'a, 'b> {
         let ge = self.smt.gte(product, min);
         let in_range = self.smt.and(ge, le);
         if !self.try_discharge(in_range)? {
+            // Diagnostics only (see `taint_why`): this is the specific,
+            // nameable cause the 2026-07-24 re-census asked for — an index that
+            // becomes unmodelable *because* a multiply might wrap reads as a
+            // bare "outside the subset" otherwise.
+            self.pending_taint_reason = Some(format!(
+                "it is the result of an integer `*` whose no-overflow side-obligation did not \
+                 discharge: under the live path conditions the product can leave the `{out_ty}` \
+                 range and wrap, so it is not modeled (constrain the operands — an \
+                 `assumes(...)` clause or a guard that bounds them — to discharge it)"
+            ));
             return Ok(None);
         }
         Ok(Some(product))
@@ -2025,6 +2122,7 @@ impl<'a, 'b> Prover<'a, 'b> {
     fn divmod_int(
         &mut self,
         b: &cubecl::ir::BinaryOperator,
+        op: &str,
         f: impl FnOnce(&Context, SExpr, SExpr) -> SExpr,
     ) -> Result<Option<SExpr>, Stop> {
         if !is_modeled_int(&b.lhs.ty) || !is_modeled_int(&b.rhs.ty) {
@@ -2043,6 +2141,15 @@ impl<'a, 'b> Prover<'a, 'b> {
         let side_obligation = self.smt.and(rhs_nonzero, nonneg);
 
         if !self.try_discharge(side_obligation)? {
+            // Diagnostics only (see `taint_why`), same discipline as
+            // `checked_mul`: name the construct rather than leaving the
+            // consumer's message generic.
+            self.pending_taint_reason = Some(format!(
+                "it is the result of an integer `{op}` whose side-obligation did not discharge: \
+                 the divisor is not provably non-zero (or an operand is not provably \
+                 non-negative) under the live path conditions, so the result is not modeled \
+                 (guard the divisor, or bound it with an `assumes(...)` clause, to discharge it)"
+            ));
             return Ok(None);
         }
         Ok(Some(f(self.smt, l, r)))
@@ -2242,11 +2349,19 @@ impl<'a, 'b> Prover<'a, 'b> {
         }
         let aref = self.array_ref(&list)?;
         let (len, name) = self.array_len_and_name(&aref)?;
-        let idx = self.value_of(&io.index).ok_or_else(|| {
-            Stop::OutOfSubset(format!(
-                "read index for `{name}[...]` depends on a construct outside the vericl v0 subset"
-            ))
-        })?;
+        let idx = match self.value_of(&io.index) {
+            Some(idx) => idx,
+            None => {
+                // Provenance, when the prover has a specific cause on file (see
+                // `taint_why`) — message only, the verdict is the same
+                // `OutOfSubset` it always was.
+                let detail = self.taint_detail(io.index.kind);
+                return Err(Stop::OutOfSubset(format!(
+                    "read index for `{name}[...]` depends on a construct outside the vericl v0 \
+                     subset{detail}"
+                )));
+            }
+        };
         self.access(&aref, false, idx, &name, io.index.kind, len)?;
         // The value *read* from the array is normally unknown (this checker has
         // no model of array contents) — taint, don't bind. The one exception:
@@ -2312,12 +2427,16 @@ impl<'a, 'b> Prover<'a, 'b> {
         }
         let aref = self.array_ref(&list)?;
         let (len, name) = self.array_len_and_name(&aref)?;
-        let idx = self.value_of(&io.index).ok_or_else(|| {
-            Stop::OutOfSubset(format!(
-                "write index for `{name}[...] = ...` depends on a construct outside the vericl v0 \
-                 subset"
-            ))
-        })?;
+        let idx = match self.value_of(&io.index) {
+            Some(idx) => idx,
+            None => {
+                let detail = self.taint_detail(io.index.kind);
+                return Err(Stop::OutOfSubset(format!(
+                    "write index for `{name}[...] = ...` depends on a construct outside the \
+                     vericl v0 subset{detail}"
+                )));
+            }
+        };
         self.access(&aref, true, idx, &name, io.index.kind, len)?;
         // Write invalidation (module docs): a write to a global array's
         // elements invalidates that array's element-range assumption for every
@@ -8269,6 +8388,129 @@ mod tests {
                 );
             }
             other => panic!("expected OutOfSubset (reinterpret-slice), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Taint provenance in `OutOfSubset` text (message-only; 2026-07-24
+    // re-census residual: "surface the failed `checked_mul`
+    // side-obligation instead of the generic out-of-subset text").
+    // -----------------------------------------------------------------
+
+    /// The re-census's private finding (a), reduced to its skeleton: an
+    /// unbounded anchor feeds an interleaving `*2`, whose no-overflow
+    /// side-obligation cannot discharge, so the index is unmodelable.
+    #[cube(launch)]
+    fn prover_test_mul_wrap_index(y: &mut Array<f32>) {
+        let idx = ABSOLUTE_POS * 2usize;
+        y[idx] = 1.0f32;
+    }
+
+    /// The same, one arithmetic hop further away — the index is not itself the
+    /// multiply's output, it is derived from it. Provenance must still reach
+    /// the message.
+    #[cube(launch)]
+    fn prover_test_mul_wrap_index_indirect(y: &mut Array<f32>) {
+        let idx = ABSOLUTE_POS * 2usize + 1usize;
+        y[idx] = 1.0f32;
+    }
+
+    /// A taint with NO nameable cause: the index is an array element, and the
+    /// prover has no model of array contents (no element-range assume here).
+    /// The message must stay exactly the generic one — provenance is only ever
+    /// added when the prover actually knows something.
+    #[cube(launch)]
+    fn prover_test_untraceable_index(x: &Array<u32>, y: &mut Array<f32>) {
+        let idx = x[0usize];
+        y[idx as usize] = 1.0f32;
+    }
+
+    fn out_of_subset_reason_single_output(
+        expand: impl FnOnce(&mut cubecl::ir::Scope, cubecl::prelude::NativeExpand<Array<f32>>),
+    ) -> String {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        expand(&mut builder.scope, y);
+        let def = builder.build(KernelSettings::default());
+        let buffers = [BufferParam { name: "y", is_output: true }];
+        match prove_bounds_freedom(&def, &buffers, &[]) {
+            ProveResult::OutOfSubset { reason } => reason,
+            other => panic!("expected OutOfSubset (index tainted, never Proved), got {other:?}"),
+        }
+    }
+
+    /// The verdict is unchanged (`OutOfSubset`, as before) and the message now
+    /// NAMES the construct that caused it: the integer `*` whose no-overflow
+    /// side-obligation did not discharge, plus what to do about it.
+    #[test]
+    fn checked_mul_taint_names_the_originating_multiply() {
+        let reason = out_of_subset_reason_single_output(|scope, y| {
+            prover_test_mul_wrap_index::expand(scope, y);
+        });
+        assert!(
+            reason.starts_with("write index for `y[...] = ...` depends on a construct outside"),
+            "the pre-existing wording must be preserved verbatim as the prefix: {reason}"
+        );
+        assert!(
+            reason.contains("integer `*`") && reason.contains("no-overflow side-obligation"),
+            "the message must name the originating construct: {reason}"
+        );
+        assert!(
+            reason.contains("assumes(...)"),
+            "the message must say what would discharge it: {reason}"
+        );
+    }
+
+    /// Provenance survives an arithmetic hop (`(pos*2) + 1`): the message still
+    /// names the multiply, not the add it was inherited through.
+    #[test]
+    fn checked_mul_taint_provenance_is_inherited_one_hop() {
+        let reason = out_of_subset_reason_single_output(|scope, y| {
+            prover_test_mul_wrap_index_indirect::expand(scope, y);
+        });
+        assert!(
+            reason.contains("integer `*`") && reason.contains("no-overflow side-obligation"),
+            "provenance must propagate through the following `+`: {reason}"
+        );
+    }
+
+    /// NEGATIVE CONTROL: a taint the prover cannot attribute keeps the generic
+    /// message, with no invented explanation appended.
+    #[test]
+    fn untraceable_taint_keeps_the_generic_message() {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let x =
+            <Array<u32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_untraceable_index::expand(&mut builder.scope, x, y);
+        let def = builder.build(KernelSettings::default());
+        let buffers = [
+            BufferParam { name: "x", is_output: false },
+            BufferParam { name: "y", is_output: true },
+        ];
+        // `x.len() == 1` makes the `x[0]` read itself provable, so the walk
+        // reaches the tainted *use* rather than refuting earlier.
+        let assumes = [Assume::LenEqConst { a: "x", value: 1 }];
+        match prove_bounds_freedom(&def, &buffers, &assumes) {
+            ProveResult::OutOfSubset { reason } => {
+                assert_eq!(
+                    reason,
+                    "write index for `y[...] = ...` depends on a construct outside the vericl v0 \
+                     subset",
+                    "an unattributable taint must not gain a fabricated explanation"
+                );
+            }
+            other => panic!("expected OutOfSubset (array-element index), got {other:?}"),
         }
     }
 }

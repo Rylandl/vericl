@@ -2462,3 +2462,73 @@ sweep and genericized in passing — one private type/field name in
 record and composition-validation note). Wording only; no claim changed. A
 full-repo sweep for the private project name and its kernel/file identifiers is
 now clean.
+
+## Shim-and-small-gate batch — DONE 2026-07-27
+
+The re-census's own RECOMMENDED NEXT MILESTONE (above), built and re-measured. Four
+changes, at the nine-round bar; **review round 10 attacks this batch together with the
+upcoming struct-typed `#[comptime]` milestone** (the re-census's next-ranked item), the
+same "one review over two related batches" pattern round 7 used for quick-wins 1+2.
+
+**1. `fma`/`mul_add` host shim** (`crates/vericl/src/host_shims.rs`: `fma_f32`, the `Fma`
+trait, the generic `fma`). `cubecl::prelude::fma` is a free function whose body is
+`unexpanded!()`, so a twin cannot call it and a `#[vericl::helper]` is no escape. It is on
+`FLOAT_METHOD_REJECT` so every spelling is rejected by default; the ONE recognized
+free-function form escapes only by being rewritten (`ShimRewriteFold`) to the GPU-verified
+shim. Bare `fma(a,b,c)` (the glob-imported spelling) and explicitly cubecl-rooted
+`cubecl::prelude::fma(a,b,c)` both rewrite; paren-evaded callees peel per the round-7
+standard; `f32::fma`, `.fma(..)` and wrong arities stay rejected by name.
+
+*Shadowing guard.* Unlike `mul_hi`, the BARE form is the intrinsic here, so a `uses(...)`
+helper or a local binding named `fma` genuinely shadows it on the `#[cube]` side (Rust:
+an item/explicit import beats a glob import). Rewriting there would be a silently wrong
+twin, so it errors, naming both escapes. The suggested escape was verified to actually
+compile inside `#[cube]` rather than assumed.
+
+*Ground truth* (`tests/host_shim_gpu_ground_truth.rs`, 7972 triples, both lanes): cubecl-cpu
+bit-exact everywhere; wgpu/Metal bit-exact outside the subnormal range, and **78 subnormal
+divergences that are ALL exactly flush-to-zero** — asserted as a model
+(`gpu == ftz(fma(ftz a, ftz b, ftz c))`), not absorbed into a tolerance. Discrimination is
+measured in-test: the naive `a*b + c` host substitute would fail on 3654/7972 (wgpu) and
+3576/7972 (cpu), and injecting it makes BOTH lanes fail loudly (done, then reverted).
+
+**2. `CastToF32` source extension** — `usize` (cubecl's `AddressType`; verified across the
+whole u32 domain including `> 2^24`, plus the real `f32::cast_from(ABSOLUTE_POS)` idiom) and
+`bool` (`true → 1.0`, `false → +0.0`, sign bit included). Non-`f32` cast TARGETS remain
+rejected: an honest residual, not an oversight.
+
+**3. `wrapping` on a tuple-returning helper** — the helper return-type gate now accepts a
+tuple whose every component is an integer (`is_wrapping_return_type`, recursive), which
+carries exactly the guarantee the scalar gate did: no float arithmetic can occur in the
+body. `WrappingFold` already covered tuple construction (nothing about `Expr::Tuple` is
+special to it); the gate was the only obstacle. A single float component anywhere still
+rejects, nested or not. Per-item interaction rule unchanged.
+
+**4. Prover diagnostic (message-only)** — `Prover::taint_why` records the construct behind a
+`checked_mul` / div-mod side-obligation failure, propagates it across further integer
+arithmetic, and the index-resolution `OutOfSubset` quotes it. The pre-existing wording is
+preserved verbatim as the prefix; an unattributable taint gets no invented explanation
+(negative control). **Zero verdict changes** — every prover test, obligation count and
+counterexample is byte-identical, and the private hardened kernel still proves at the same
+55 obligations.
+
+**Public surface.** Five new suite-wired example kernels — `fma_poly3_map` (three nested
+`fma`s inside a composed helper), `fma_two_product_residual` (the shape that makes the shim
+necessary), `index_ramp_map` (`usize` source), `bernoulli_indicator_map` (`bool` source, the
+Bernoulli value map), `counter_split_map` (non-wrapping kernel destructuring a wrapping
+tuple helper) — all bit-exact/exact with `Proved` bounds on both lanes, plus the
+`unfused_two_product_residual` negative control (not suite-wired).
+
+**Backend note corrected.** Metal contracts `a*b + c` into one FMA *when the addend is
+independent*; when the addend IS the product, CSE collapses `t - t` first and no contraction
+happens. Both are now pinned by tests; the earlier note read as if the first fact were
+general.
+
+**Private validation (2026-07-27, `vericl-dogfood` round 3, additive — round-1/2 sources
+and evidence untouched): 6/22 → 19/22 faithful.** Thirteen private items re-annotated
+byte-for-byte, all differentials green; new `evidence/round3.json` (7 entries) plus an
+8-test verdict probe. Details, per-item table and the three remaining non-faithful items in
+`docs/dogfood-2026-07.md`'s addendum. **Ecosystem: re-census target 4 CLOSED** — the last
+cubek-random distribution core (Bernoulli) compiles, is differential-green at `max_ulp = 0`
+and `Proved{5}`; its probe contract also turned out to carry a `compare(exact)`-on-f32 bug
+that the rejection had been hiding (see the survey addendum).

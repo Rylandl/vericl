@@ -1552,6 +1552,208 @@ pub fn vec_add_off_by_one<N: Size>(
     }
 }
 
+// ===========================================================================
+// Shim-and-small-gate batch (2026-07 coverage re-census): the GPU-verified
+// `fma` shim, the `CastToF32` source extension (`usize`, `bool`), and
+// `wrapping` on a tuple-returning helper.
+// ===========================================================================
+//
+// `cubecl::prelude::fma` is a free function whose body is `unexpanded!()` — a
+// host call panics — so, like `cast_from`/`mul_hi`, the reference twin cannot
+// call it and the macro rewrites it to a GPU-verified host shim
+// (`::vericl::host_shims::fma`, Rust's IEEE-754 `f32::mul_add`). What makes the
+// shim *necessary* rather than convenient: the obvious substitute `a*b + c`
+// rounds TWICE where `fma` rounds once, and the difference is not noise — see
+// `fma_two_product_residual` below, where the unfused rewrite is identically
+// zero and the fused answer is the entire signal.
+//
+// Tier, measured in `tests/host_shim_gpu_ground_truth.rs` over 7972 triples:
+// bit-exact vs. the real intrinsic on cubecl-cpu everywhere, and bit-exact on
+// wgpu/Metal on every triple with no subnormal operand or result (Metal
+// flushes subnormals to zero; the host does not — 78 triples, all exactly
+// flush-to-zero). Both kernels below keep their arithmetic in the normal range
+// by construction (see each one's `gen(...)` justification), so both carry the
+// bit-exact `compare(max_ulp = 0)` that tier earns.
+
+/// A cubic polynomial in Horner form, evaluated with three **nested** fused
+/// multiply-adds — the standard shape of a hardware-friendly function
+/// approximation (and the reason `fma` is in every GPU ISA). Each `fma` rounds
+/// once, so the whole evaluation has three roundings rather than six; a twin
+/// that rewrote them as `c*x + d` would have a different error profile from the
+/// kernel it claims to model.
+///
+/// Exercises the shim rewrite **inside a `#[vericl::helper]`** (the kernel below
+/// exercises it in a kernel body) and its nesting: the fold is post-order, so
+/// the inner `fma`s are rewritten before the outer one.
+#[vericl::helper]
+#[cube]
+pub fn poly3_horner(x: f32) -> f32 {
+    // A tame, exactly-representable coefficient set: the point here is the
+    // rounding structure, not the polynomial.
+    let c3 = 0.5f32;
+    let c2 = -0.25f32;
+    let c1 = 0.125f32;
+    let c0 = 1.0f32;
+    fma(fma(fma(c3, x, c2), x, c1), x, c0)
+}
+
+/// FLAGSHIP (`fma` shim): Horner evaluation of a cubic through three nested
+/// fused multiply-adds, via a composed helper. Bit-exact (`max_ulp = 0`) —
+/// justified: with `|x| <= 2` and these coefficients every intermediate is in
+/// `[-3, 3]`, so no operand or result is anywhere near the subnormal range
+/// where wgpu/Metal's flush-to-zero is the one measured divergence from the
+/// host shim.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(x in -2.0..=2.0, y in 0.0..=0.0),
+    uses(poly3_horner)
+)]
+#[cube(launch)]
+pub fn fma_poly3_map(x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = poly3_horner(x[ABSOLUTE_POS]);
+    }
+}
+
+/// FLAGSHIP (why `fma` is a shim and not a rewrite): the **two-product
+/// residual** `fma(h, x, -(h*x))`, which is the EXACT rounding error of the
+/// rounded product `h*x` — the primitive underneath every double-single /
+/// compensated accumulator. Rewriting it as `h*x - (h*x)` yields exactly `0.0`
+/// for every input: not an approximation of this kernel, a different algorithm
+/// with 100% relative error. (Measured on one shape: fused `8.23e-7`, unfused
+/// `0.0` — pinned in `host_shims`' unit tests.)
+///
+/// Bit-exact (`max_ulp = 0`) — justified: `h ∈ [2^-10, 1]` and `x ∈ [1, 4096]`
+/// give `|h*x| ∈ [2^-10, 4096]`, whose rounding residual is either exactly zero
+/// or at least ~2^-34 in magnitude — far above the subnormal boundary `2^-126`,
+/// so the flush-to-zero divergence class cannot be reached from these ranges.
+#[vericl::kernel(
+    assumes(h.len() == y.len(), x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(h in 0.0009765625..=1.0, x in 1.0..=4096.0, y in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn fma_two_product_residual(h: &Array<f32>, x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let hi = h[ABSOLUTE_POS];
+        let xi = x[ABSOLUTE_POS];
+        let product = hi * xi;
+        y[ABSOLUTE_POS] = fma(hi, xi, -product);
+    }
+}
+
+/// NEGATIVE CONTROL (`fma` is not `a*b + c`, measured on real hardware): the
+/// same residual written with the unfused `hi*xi - product`. It is not a
+/// less-accurate version of the kernel above — it is a **different function**,
+/// and the device agrees: measured on wgpu/Metal and on cubecl-cpu, this kernel
+/// returns identically `0.0` on every input, while `fma_two_product_residual`
+/// returns the true residual (non-zero on 1023 of 1024 probe inputs). Its twin
+/// computes the unfused expression too and matches it bit-exactly — vericl
+/// models the kernel that was written, which is exactly why the twin must not
+/// paraphrase `fma` as `a*b + c`: the paraphrase would be faithful to a kernel
+/// nobody wrote.
+///
+/// **The backend detail here is NOT the FMA-contraction one** recorded for
+/// `vec_madd_bitexact`, and conflating them would be wrong. Metal *does*
+/// contract `a*b + c` into one fused instruction when the addend is
+/// independent — that is what `vec_madd_bitexact`'s bit-exact failure shows,
+/// and what the ground-truth probe measures (its unfused `a*b + c` kernel
+/// differs from the fused intrinsic on 0 of 7972 triples). Here the addend IS
+/// the product, so common-subexpression elimination collapses `t - t` to zero
+/// before any contraction can apply. Both behaviours are pinned by
+/// `fused_and_unfused_residual_kernels_compute_different_functions_on_gpu` in
+/// `tests/conformance.rs`. Kept OUT of the conformance suite.
+#[vericl::kernel(
+    assumes(h.len() == y.len(), x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(h in 0.0009765625..=1.0, x in 1.0..=4096.0, y in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn unfused_two_product_residual(h: &Array<f32>, x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let hi = h[ABSOLUTE_POS];
+        let xi = x[ABSOLUTE_POS];
+        let product = hi * xi;
+        y[ABSOLUTE_POS] = hi * xi - product;
+    }
+}
+
+/// `CastToF32` extension, `usize` source: `f32::cast_from(ABSOLUTE_POS)` — the
+/// generic index-to-float conversion (a ramp, a normalized coordinate, a
+/// per-element weight). `ABSOLUTE_POS` is `usize`-typed in cubecl, which on the
+/// device is `AddressType` (`u32` for any buffer of at most `u32::MAX`
+/// elements), and the shim's `x as f32` agrees with that bit-for-bit over the
+/// whole u32 domain — verified against the real intrinsic on both lanes,
+/// including the `> 2^24` range where the rounding is observable. Both the cast
+/// and the add are correctly rounded on each side, so `max_ulp = 0`.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(x in -1.0..=1.0, y in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn index_ramp_map(x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = x[ABSOLUTE_POS] + f32::cast_from(ABSOLUTE_POS);
+    }
+}
+
+/// `CastToF32` extension, `bool` source: the **Bernoulli value map**
+/// `f32::cast_from(u < p)` — a uniform draw turned into a 0/1 indicator, the
+/// third of the standard distribution cores (the re-census measured this exact
+/// shape being cleanly *rejected* with `bool: CastToF32 is not satisfied`; it is
+/// the reason the impl exists). `true → 1.0`, `false → +0.0`, verified against
+/// the real intrinsic on both lanes, so `max_ulp = 0`.
+#[vericl::kernel(
+    assumes(u.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(u in 0.0..=1.0, y in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn bernoulli_indicator_map(u: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = f32::cast_from(u[ABSOLUTE_POS] < 0.25f32);
+    }
+}
+
+/// `wrapping` on a **tuple-returning** helper: one counter step producing two
+/// decorrelated words (a split-hash / two-stream counter shape). Wrap-on-
+/// overflow is the intent, matching WGSL — and the fold covers the whole body
+/// *including the returned tuple's own arithmetic*: all three of `z*a`,
+/// `+ b`, and `z*c` become `wrapping_*` in the twin.
+///
+/// Before this batch the helper gate required an integer *scalar* return, so
+/// this shape was rejected outright; the gate now accepts a tuple whose every
+/// component is an integer, which carries exactly the same "no float
+/// arithmetic can occur in this body" guarantee the scalar gate did. A single
+/// float component still rejects.
+#[vericl::helper(wrapping)]
+#[cube]
+pub fn counter_split(z: u32) -> (u32, u32) {
+    let a = z * 1664525u32;
+    (a + 1013904223u32, z * 2654435761u32)
+}
+
+/// FLAGSHIP (tuple-returning `wrapping` helper): a NON-wrapping kernel that
+/// destructures the wrapping helper's tuple and mixes the two words. The
+/// per-item interaction rule is unchanged — each item governs only its own
+/// body, and integers cross the call boundary as plain values — so the kernel
+/// needs no `wrapping` clause of its own (its only arithmetic is `^`, which
+/// cannot overflow). Exact `u32` compare, bounds `Proved`.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(exact),
+    uses(counter_split)
+)]
+#[cube(launch)]
+pub fn counter_split_map(x: &Array<u32>, y: &mut Array<u32>) {
+    if ABSOLUTE_POS < y.len() {
+        let (lo, hi) = counter_split(x[ABSOLUTE_POS]);
+        y[ABSOLUTE_POS] = lo ^ hi;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3411,6 +3613,144 @@ mod tests {
         // The wrapping sibling on the same input does NOT panic — it wraps.
         let wrapped = lcg_step_vericl_ref(u32::MAX);
         assert_eq!(wrapped, u32::MAX.wrapping_mul(1664525).wrapping_add(1013904223));
+    }
+
+    // -----------------------------------------------------------------
+    // Shim-and-small-gate batch: `fma`, `CastToF32` usize/bool, tuple
+    // `wrapping`. Each twin pinned against an independently written host
+    // computation (not against the GPU — that is the conformance suite's
+    // job — so a shim regression shows up here too).
+    // -----------------------------------------------------------------
+
+    /// The `fma` shim path in a HELPER twin: three nested fused multiply-adds,
+    /// each with a single rounding. Pinned against `f32::mul_add` written out
+    /// by hand — and, crucially, shown to DIFFER from the unfused Horner
+    /// evaluation on real inputs, so the test would catch a twin that
+    /// paraphrased `fma` as `c*x + d`.
+    #[test]
+    fn poly3_horner_twin_is_fused_not_unfused() {
+        let unfused = |x: f32| ((0.5f32 * x - 0.25) * x + 0.125) * x + 1.0;
+        let fused = |x: f32| 0.5f32.mul_add(x, -0.25).mul_add(x, 0.125).mul_add(x, 1.0);
+        let mut differ = 0;
+        for i in 0..2000 {
+            let x = -2.0 + (i as f32) * 0.002;
+            let got = poly3_horner_vericl_ref(x);
+            assert_eq!(got.to_bits(), fused(x).to_bits(), "x={x}");
+            if got.to_bits() != unfused(x).to_bits() {
+                differ += 1;
+            }
+        }
+        assert!(
+            differ > 100,
+            "the fused and unfused evaluations must differ on many inputs, else this pin is \
+             vacuous (differed on {differ} of 2000)"
+        );
+    }
+
+    /// The flagship `fma` kernel twin routes through the helper and honors the
+    /// guard (threads past `y.len()` write nothing).
+    #[test]
+    fn fma_poly3_map_twin_matches_and_respects_guard() {
+        let x: Vec<f32> = vec![-2.0, -0.5, 0.0, 0.125, 1.75, 2.0];
+        let mut y = vec![-99.0f32; x.len()];
+        fma_poly3_map_vericl::reference(&x, &mut y, 256); // threads >> len
+        for (i, &v) in x.iter().enumerate() {
+            let want = 0.5f32.mul_add(v, -0.25).mul_add(v, 0.125).mul_add(v, 1.0);
+            assert_eq!(y[i].to_bits(), want.to_bits(), "x={v}");
+        }
+    }
+
+    /// The two-product residual twin computes the EXACT rounding error of the
+    /// rounded product — and its unfused sibling computes exactly zero. The
+    /// single most load-bearing property of the `fma` shim, pinned on the
+    /// generated twins rather than on `host_shims` directly.
+    #[test]
+    fn two_product_residual_twin_is_exact_and_unfused_sibling_is_zero() {
+        let h: Vec<f32> = (0..256).map(|i| 0.0009765625 + (i as f32) * 0.003_9).collect();
+        let x: Vec<f32> = (0..256).map(|i| 1.0 + (i as f32) * 15.997).collect();
+        let mut y_fused = vec![0f32; h.len()];
+        let mut y_unfused = vec![0f32; h.len()];
+        fma_two_product_residual_vericl::reference(&h, &x, &mut y_fused, h.len());
+        unfused_two_product_residual_vericl::reference(&h, &x, &mut y_unfused, h.len());
+        let mut nonzero = 0;
+        for i in 0..h.len() {
+            // The residual is exact: `h*x` (rounded) plus the residual
+            // reproduces the true product in f64, to the bit.
+            let exact = (h[i] as f64) * (x[i] as f64);
+            let rounded = (h[i] * x[i]) as f64;
+            assert_eq!(
+                y_fused[i] as f64,
+                exact - rounded,
+                "residual must be the exact rounding error at i={i}"
+            );
+            assert_eq!(y_unfused[i], 0.0, "the unfused sibling collapses to zero at i={i}");
+            if y_fused[i] != 0.0 {
+                nonzero += 1;
+            }
+        }
+        assert!(nonzero > 200, "residual non-zero on {nonzero}/256 — too few to be meaningful");
+    }
+
+    /// `CastToF32` usize source: the twin's `f32::cast_from(ABSOLUTE_POS)`
+    /// becomes the verified `usize` shim over the thread index, including
+    /// above 2^24 where the rounding is observable (`16_777_217 → 16_777_216`).
+    #[test]
+    fn index_ramp_twin_casts_the_thread_index() {
+        let n = 8usize;
+        let x: Vec<f32> = vec![0.5; n];
+        let mut y = vec![0f32; n];
+        index_ramp_map_vericl::reference(&x, &mut y, n);
+        for (i, got) in y.iter().enumerate() {
+            assert_eq!(got.to_bits(), (0.5f32 + i as f32).to_bits(), "i={i}");
+        }
+        // The shim itself, at the boundary the GPU ground truth also probes.
+        assert_eq!(
+            vericl::host_shims::cast_from_usize_f32(16_777_217).to_bits(),
+            16_777_216.0f32.to_bits(),
+            "round-to-nearest-even above 2^24"
+        );
+    }
+
+    /// `CastToF32` bool source: the Bernoulli value map is exactly the 0/1
+    /// indicator of the predicate.
+    #[test]
+    fn bernoulli_indicator_twin_is_zero_or_one() {
+        let u: Vec<f32> = vec![0.0, 0.1, 0.249_999_98, 0.25, 0.3, 1.0];
+        let mut y = vec![-1.0f32; u.len()];
+        bernoulli_indicator_map_vericl::reference(&u, &mut y, u.len());
+        for (i, &v) in u.iter().enumerate() {
+            let want = if v < 0.25 { 1.0f32 } else { 0.0f32 };
+            assert_eq!(y[i].to_bits(), want.to_bits(), "u={v}");
+        }
+        // `false` is POSITIVE zero, matching the intrinsic's bit pattern.
+        assert_eq!(y[3].to_bits(), 0u32);
+    }
+
+    /// `wrapping` on a TUPLE-returning helper: BOTH components wrap, including
+    /// the arithmetic written inside the returned tuple expression. A checked
+    /// twin would panic on these inputs instead.
+    #[test]
+    fn counter_split_twin_wraps_both_components() {
+        for &z in &[0u32, 1, 0xFFFF_FFFF, 0x1234_5678, u32::MAX / 2, u32::MAX] {
+            let (lo, hi) = counter_split_vericl_ref(z);
+            assert_eq!(lo, z.wrapping_mul(1664525).wrapping_add(1013904223), "lo at z={z}");
+            assert_eq!(hi, z.wrapping_mul(2654435761), "hi at z={z}");
+        }
+    }
+
+    /// The non-wrapping kernel composing the wrapping tuple helper — the
+    /// interaction rule, unchanged: the helper wraps internally, the kernel
+    /// destructures and mixes, and nothing panics.
+    #[test]
+    fn counter_split_map_twin_matches_hand_computed() {
+        let x: Vec<u32> = vec![0, 1, 0xFFFF_FFFF, 0xDEAD_BEEF, u32::MAX];
+        let mut y = vec![0u32; x.len()];
+        counter_split_map_vericl::reference(&x, &mut y, x.len());
+        for (i, &z) in x.iter().enumerate() {
+            let lo = z.wrapping_mul(1664525).wrapping_add(1013904223);
+            let hi = z.wrapping_mul(2654435761);
+            assert_eq!(y[i], lo ^ hi, "z={z}");
+        }
     }
 
     /// Feature 3: the `comptime!` block is evaluated at expansion — the twin

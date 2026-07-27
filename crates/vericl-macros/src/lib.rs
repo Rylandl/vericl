@@ -230,6 +230,19 @@ const FLOAT_METHOD_WHITELIST: &[&str] = &[
 /// no possible per-type override; same empirically for `reinterpret`. Both
 /// rejected here for the same reason as the Float/Numeric names above.
 ///
+/// `fma` is a third mechanism again: in cubecl 0.10 it is neither a `Float`
+/// method nor a `Cast` one but a **free function**, `cubecl::prelude::fma<C:
+/// CubePrimitive>(a, b, c)`, whose body is `unexpanded!()` — so it panics on a
+/// host call exactly like the others (there is no `Float::fma` and no `.fma()`
+/// method form in 0.10: `cubecl-core-0.10.0/src/frontend/operation/fma.rs` is
+/// the only definition, verified by grep over the whole crate). It is on this
+/// list so that EVERY syntactic form of it is rejected by default; the single
+/// recognized free-function form escapes only by being rewritten to the
+/// GPU-verified host shim first (see `ShimRewriteFold`). Rejecting the rest is
+/// not pedantry: `a*b + c` is not `fma(a, b, c)` — the fused form rounds once,
+/// and for the two-product idiom `fma(hi, x, -(hi*x))` the unfused rewrite is
+/// identically zero where the true answer is the entire signal.
+///
 /// Calling any of these in a reference twin body is rejected at macro time
 /// rather than silently trusted — see `FloatMethodCheck`.
 const FLOAT_METHOD_REJECT: &[&str] = &[
@@ -248,6 +261,7 @@ const FLOAT_METHOD_REJECT: &[&str] = &[
     "from_vec",
     "cast_from",
     "reinterpret",
+    "fma",
 ];
 
 /// One entry inside a `gen(...)` contract clause: either a per-parameter
@@ -1096,6 +1110,34 @@ fn is_wrapping_integer_type(ty: &Type) -> bool {
     matches!(last.ident.to_string().as_str(), "u32" | "i32" | "u64" | "i64")
 }
 
+/// `true` for a `wrapping` helper's admissible RETURN type: an integer scalar
+/// (`is_wrapping_integer_type`) or a **tuple of admissible types**.
+///
+/// Why the tuple widening is sound at exactly the same strength as the scalar
+/// case. `WrappingFold`'s only job is to rewrite `+`/`-`/`*`/`<<`/`>>` (and
+/// their assign forms) to their `wrapping_*` equivalents, and the reason the
+/// gate exists at all is that the fold is *untyped*: applied to a body that
+/// computes floats it would silently change float semantics rather than model
+/// wrap-on-overflow. The gate is therefore a proxy for "no float arithmetic can
+/// occur in this body" — parameters are all integers, so no float can enter,
+/// and the return type is all integers, so no float can leave. A tuple whose
+/// every component is an integer carries exactly the same guarantee: it is
+/// integer data in an aggregate, and `WrappingFold` folds the tuple-construction
+/// expression's components like any other sub-expression (nothing about
+/// `Expr::Tuple` is special to the fold — see the fold's post-order
+/// `fold_expr`). A single float component and the guarantee is gone, which is
+/// why the recursion rejects the whole type on the first non-integer leaf.
+///
+/// The empty tuple `()` is admissible (vacuously all-integer) — the explicit
+/// spelling of the already-admissible "no `->` at all" case (`ReturnType::
+/// Default`), e.g. a helper that only writes through an `&mut Array<u32>`.
+fn is_wrapping_return_type(ty: &Type) -> bool {
+    match ty {
+        Type::Tuple(t) => t.elems.iter().all(is_wrapping_return_type),
+        _ => is_wrapping_integer_type(ty),
+    }
+}
+
 /// The scalar kinds `gen(...)` knows how to generate: the float types
 /// (`f32`, and `f64` — the latter with `vericl::rng::SplitMix64`'s 53-bit
 /// `next_f64_range`/`fill_f64` path) and the integer types the `wrapping`
@@ -1339,11 +1381,60 @@ impl Fold for FloatMethodCheck {
 ///     left untouched (it cannot be the cubecl intrinsic, which is always
 ///     `T::mul_hi`/`x.mul_hi`; leaving it lets it classify as a possible
 ///     `uses(...)` helper in the later pass instead of being hijacked here).
+///   - `fma(a, b, c)` — bare, three arguments — and the explicitly qualified
+///     `cubecl::…::fma(a, b, c)`  →  `::vericl::host_shims::fma(a, b, c)`, via
+///     the `Fma` trait (f32 is the sole verified type). Unlike `mul_hi`, the
+///     BARE form is the intrinsic here: cubecl 0.10 defines `fma` only as the
+///     free function `cubecl::prelude::fma`, glob-imported by every `#[cube]`
+///     kernel. That makes shadowing a real hazard rather than a theoretical
+///     one, so the rewrite is guarded: if `fma` also names a `uses(...)`-listed
+///     helper or a local binding in this item, the call is NOT rewritten and a
+///     targeted error is raised instead (`shadowed_fma_error`). Guessing which
+///     one the `#[cube]` side resolved to is exactly the class of silent wrong
+///     twin this macro exists to prevent. Every other syntactic form
+///     (`f32::fma(..)`, `x.fma(..)`, `<f32 as Float>::fma(..)`, a 2- or 4-arg
+///     `fma`) is left for `FloatMethodCheck` to reject by name — none of them
+///     compiles on the `#[cube]` side in 0.10 either.
 #[derive(Default)]
-struct ShimRewriteFold;
+struct ShimRewriteFold<'a> {
+    /// `uses(...)`-declared helper names, and local bindings, in the item being
+    /// rewritten — the two ways the bare `fma` intrinsic name can be shadowed.
+    /// Empty in the white-box fold tests, which exercise the unshadowed path.
+    shadowing: Option<&'a HashSet<String>>,
+    errors: Vec<syn::Error>,
+}
 
-impl ShimRewriteFold {
-    fn rewrite_call(mut call: ExprCall) -> Expr {
+/// `true` if a path's FIRST segment is `cubecl` (`cubecl::prelude::fma`,
+/// `::cubecl::prelude::fma`) — the qualified spelling of the free-function
+/// intrinsic, verified to compile inside `#[cube]` (cubecl's `fn fma` and its
+/// `mod fma { fn expand }` are re-exported side by side, which is what makes
+/// the macro's `path::to::fma(..)` -> `path::to::fma::expand(..)` rewrite
+/// resolve). Used only to widen `fma` recognition beyond the bare form; a path
+/// rooted anywhere else is not the cubecl intrinsic and is left alone.
+fn path_is_cubecl_rooted(path: &syn::Path) -> bool {
+    path.segments.first().is_some_and(|s| s.ident == "cubecl")
+}
+
+impl ShimRewriteFold<'_> {
+    /// The error for a bare `fma(a, b, c)` whose name is shadowed in this item.
+    fn shadowed_fma_error(span: proc_macro2::Span) -> syn::Error {
+        syn::Error::new(
+            span,
+            "`fma` here is ambiguous: it names the cubecl intrinsic \
+             `cubecl::prelude::fma` (which vericl rewrites to its GPU-verified host \
+             shim), but this item also declares `fma` as a `uses(...)` helper or a \
+             local binding, which shadows the glob-imported intrinsic on the \
+             `#[cube]` side. vericl will not guess which one the kernel resolves to — \
+             rename the helper/binding, or call the intrinsic as \
+             `cubecl::prelude::fma(...)`",
+        )
+    }
+
+    fn shadowed(&self, name: &str) -> bool {
+        self.shadowing.is_some_and(|s| s.contains(name))
+    }
+
+    fn rewrite_call(&mut self, mut call: ExprCall) -> Expr {
         // Peel redundant parens/groups around the callee so a parenthesised
         // intrinsic `(f32::cast_from)(x)` / `(u32::mul_hi)(a, b)` classifies
         // exactly like the bare form — the round-3/4 F1 paren-evasion standard
@@ -1384,6 +1475,21 @@ impl ShimRewriteFold {
             let b = &call.args[1];
             return syn::parse_quote!(::vericl::host_shims::mul_hi(#a, #b));
         }
+        // `fma(a, b, c)` — the free-function intrinsic. Bare (the glob-imported
+        // spelling, guarded against shadowing) or explicitly cubecl-rooted.
+        if method == "fma" && call.args.len() == 3 {
+            let bare = segs.len() == 1 && ep.path.leading_colon.is_none();
+            if bare && self.shadowed("fma") {
+                self.errors.push(Self::shadowed_fma_error(last.ident.span()));
+                return Expr::Call(call);
+            }
+            if bare || path_is_cubecl_rooted(&ep.path) {
+                let a = &call.args[0];
+                let b = &call.args[1];
+                let c = &call.args[2];
+                return syn::parse_quote!(::vericl::host_shims::fma(#a, #b, #c));
+            }
+        }
         Expr::Call(call)
     }
 
@@ -1398,14 +1504,14 @@ impl ShimRewriteFold {
     }
 }
 
-impl Fold for ShimRewriteFold {
+impl Fold for ShimRewriteFold<'_> {
     fn fold_expr(&mut self, expr: Expr) -> Expr {
         // Post-order: rewrite nested intrinsics (and the arguments of this
         // call) first, then this node — so `f32::cast_from(a.mul_hi(b))`
         // rewrites both layers.
         let expr = syn::fold::fold_expr(self, expr);
         match expr {
-            Expr::Call(call) => Self::rewrite_call(call),
+            Expr::Call(call) => self.rewrite_call(call),
             Expr::MethodCall(mc) => Self::rewrite_method(mc),
             other => other,
         }
@@ -2755,11 +2861,27 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         return Err(combined);
     }
 
-    // Rewrite recognized GPU-intrinsic calls (`f32::cast_from`, `T::mul_hi`) to
-    // their GPU-verified `::vericl::host_shims::` equivalents BEFORE the reject
-    // check below — a recognized call is rewritten away, an unrecognized one
-    // (e.g. a non-f32 cast target) survives to be rejected by name.
-    ref_block = ShimRewriteFold.fold_block(ref_block);
+    // Rewrite recognized GPU-intrinsic calls (`f32::cast_from`, `T::mul_hi`,
+    // `fma`) to their GPU-verified `::vericl::host_shims::` equivalents BEFORE
+    // the reject check below — a recognized call is rewritten away, an
+    // unrecognized one (e.g. a non-f32 cast target) survives to be rejected by
+    // name. The shadowing set is the set of names that, on the `#[cube]` side,
+    // would win over cubecl's glob-imported prelude: `uses(...)`-declared
+    // helpers, this item's params, and its local bindings (see
+    // `ShimRewriteFold`'s doc — only the bare free-function `fma` spelling is
+    // shadowable, and it errors rather than guessing).
+    let shim_shadow: HashSet<String> = collect_locals(&ref_block, &params)
+        .into_iter()
+        .chain(used_names.iter().cloned())
+        .collect();
+    let mut shim_rewrite = ShimRewriteFold { shadowing: Some(&shim_shadow), errors: Vec::new() };
+    ref_block = shim_rewrite.fold_block(ref_block);
+    if let Some(combined) = shim_rewrite.errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
 
     // Rewrite core-`Slice` creation methods to Rust subslices (§4.1) BEFORE the
     // Float-method reject check (so `.slice()`/`.to_slice()` are gone by then)
@@ -3662,9 +3784,13 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
 
     // `wrapping` on a helper: the same integer-only gate a kernel gets (the
     // `WrappingFold` is untyped, so folding `+`/`-`/`*` to `wrapping_*` must
-    // not silently touch float math). Every value parameter — and the return
-    // type — must be an integer scalar or integer Array. A #[comptime] param
-    // participates in the body like any other value, so it is gated too.
+    // not silently touch float math). Every value parameter must be an integer
+    // scalar or integer Array; the return type must be an integer scalar **or a
+    // tuple of them** (`is_wrapping_return_type` — a multi-output wrapping
+    // helper such as a split hash/counter step, the shape the 2026-07-24
+    // re-census measured as the sole blocker on two private kernels). A
+    // #[comptime] param participates in the body like any other value, so it is
+    // gated too.
     if spec.wrapping.is_some() {
         for p in &params {
             let (ok, ty_span) = match &p.kind {
@@ -3690,11 +3816,13 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
             let ty: Type = syn::parse2(ty).map_err(|e| {
                 syn::Error::new(func.sig.output.span(), format!("internal error: {e}"))
             })?;
-            if !is_wrapping_integer_type(&ty) {
+            if !is_wrapping_return_type(&ty) {
                 return Err(syn::Error::new(
                     func.sig.output.span(),
                     "`wrapping` is outside the vericl v0 subset for this helper: the return type \
-                     must be an integer scalar (u32/i32/u64/i64) when `wrapping` is declared",
+                     must be an integer scalar (u32/i32/u64/i64), or a tuple whose every \
+                     component is one, when `wrapping` is declared — the fold is untyped and \
+                     must not silently touch float math",
                 ));
             }
         }
@@ -3751,8 +3879,21 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
     }
 
     // Rewrite recognized GPU-intrinsic calls to their `::vericl::host_shims::`
-    // equivalents before the reject check — same as a kernel twin.
-    ref_block = ShimRewriteFold.fold_block(ref_block);
+    // equivalents before the reject check — same as a kernel twin, shadowing
+    // set included (a helper can declare its own `uses(...)` sub-helpers and
+    // locals, so the bare-`fma` hazard is identical here).
+    let shim_shadow: HashSet<String> = collect_locals(&ref_block, &params)
+        .into_iter()
+        .chain(used_names.iter().cloned())
+        .collect();
+    let mut shim_rewrite = ShimRewriteFold { shadowing: Some(&shim_shadow), errors: Vec::new() };
+    ref_block = shim_rewrite.fold_block(ref_block);
+    if let Some(combined) = shim_rewrite.errors.into_iter().reduce(|mut a, b| {
+        a.combine(b);
+        a
+    }) {
+        return Err(combined);
+    }
 
     // Core-`Slice` creation-method rewrite (§4.1) — the same pass a kernel twin
     // gets, so a `#[vericl::helper] fn f(s: &Slice<F>)` body indexing/iterating
@@ -5885,7 +6026,20 @@ mod tests {
 
     fn shim(src: &str) -> String {
         let expr: Expr = syn::parse_str(src).expect("valid expr");
-        ShimRewriteFold.fold_expr(expr).to_token_stream().to_string().replace(' ', "")
+        let mut fold = ShimRewriteFold::default();
+        let out = fold.fold_expr(expr).to_token_stream().to_string().replace(' ', "");
+        assert!(fold.errors.is_empty(), "unexpected shim-rewrite error for `{src}`");
+        out
+    }
+
+    /// The same fold with `fma` shadowed by a `uses(...)` helper / local
+    /// binding of that name — returns the (unrewritten) tokens and the errors.
+    fn shim_shadowed(src: &str) -> (String, Vec<String>) {
+        let expr: Expr = syn::parse_str(src).expect("valid expr");
+        let shadow: HashSet<String> = ["fma".to_string()].into_iter().collect();
+        let mut fold = ShimRewriteFold { shadowing: Some(&shadow), errors: Vec::new() };
+        let out = fold.fold_expr(expr).to_token_stream().to_string().replace(' ', "");
+        (out, fold.errors.iter().map(|e| e.to_string()).collect())
     }
 
     /// `f32::cast_from(x)` rewrites to the verified `cast_to_f32` shim; the
@@ -5918,9 +6072,127 @@ mod tests {
         for src in ["f64::cast_from(x)", "u32::cast_from(x)", "mul_hi(a,b)"] {
             let expr: Expr = syn::parse_str(src).unwrap();
             let before = expr.to_token_stream().to_string();
-            let after = ShimRewriteFold.fold_expr(expr).to_token_stream().to_string();
+            let after =
+                ShimRewriteFold::default().fold_expr(expr).to_token_stream().to_string();
             assert_eq!(after, before, "`{src}` must be left untouched");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // fma: the free-function intrinsic's shim rewrite, its shadowing
+    // guard, and the by-name rejection of every other spelling.
+    // -----------------------------------------------------------------
+
+    /// The two recognized spellings of the intrinsic — bare (the glob-imported
+    /// one every `#[cube]` kernel writes) and explicitly cubecl-rooted — both
+    /// rewrite to the GPU-verified `fma` shim, and nest with the other shims.
+    #[test]
+    fn shim_rewrite_fma_bare_and_qualified() {
+        assert_eq!(shim("fma(a, b, c)"), "::vericl::host_shims::fma(a,b,c)");
+        assert_eq!(
+            shim("cubecl::prelude::fma(a, b, c)"),
+            "::vericl::host_shims::fma(a,b,c)"
+        );
+        assert_eq!(
+            shim("::cubecl::prelude::fma(a, b, c)"),
+            "::vericl::host_shims::fma(a,b,c)"
+        );
+        // Paren-evasion (the round-3/4 F1 standard): a parenthesised callee
+        // classifies exactly like the bare form.
+        assert_eq!(shim("(fma)(a, b, c)"), "::vericl::host_shims::fma(a,b,c)");
+        // Nesting, in both directions — the two-product residual idiom the
+        // shim exists for, with a cast_from operand.
+        assert_eq!(
+            shim("fma(hi, f32::cast_from(n), -(hi * f32::cast_from(n)))"),
+            "::vericl::host_shims::fma(hi,::vericl::host_shims::cast_to_f32(n),-(hi*::vericl::\
+             host_shims::cast_to_f32(n)))"
+        );
+    }
+
+    /// Everything that is NOT the free-function intrinsic is left untouched by
+    /// the fold, so `FloatMethodCheck` rejects it by name (none of these
+    /// compiles on the `#[cube]` side in cubecl 0.10 either — `fma` is only
+    /// ever the free function there).
+    #[test]
+    fn shim_rewrite_leaves_non_intrinsic_fma_spellings_untouched() {
+        for src in [
+            "f32::fma(a, b, c)",       // no such associated fn in 0.10
+            "x.fma(b, c)",             // no such method in 0.10
+            "fma(a, b)",               // wrong arity
+            "fma(a, b, c, d)",         // wrong arity
+            "mylib::math::fma(a,b,c)", // rooted somewhere that is not cubecl
+        ] {
+            let expr: Expr = syn::parse_str(src).unwrap();
+            let before = expr.to_token_stream().to_string();
+            let mut fold = ShimRewriteFold::default();
+            let after = fold.fold_expr(expr).to_token_stream().to_string();
+            assert_eq!(after, before, "`{src}` must be left untouched");
+            assert!(fold.errors.is_empty(), "`{src}` must not raise a shim error");
+        }
+    }
+
+    /// The shadowing guard. A BARE `fma` is the glob-imported prelude name, so
+    /// a `uses(...)` helper or a local binding of that name WINS over it on the
+    /// `#[cube]` side (Rust: an item/explicit import shadows a glob import).
+    /// Rewriting to the shim there would silently produce a twin that computes
+    /// something the kernel does not, so it errors instead — and the explicitly
+    /// cubecl-rooted spelling still rewrites, since it cannot be shadowed.
+    #[test]
+    fn shim_rewrite_fma_shadowing_guard() {
+        let (out, errs) = shim_shadowed("fma(a, b, c)");
+        assert_eq!(out, "fma(a,b,c)", "a shadowed bare `fma` must NOT be rewritten");
+        assert_eq!(errs.len(), 1, "exactly one targeted error: {errs:?}");
+        assert!(errs[0].contains("ambiguous"), "got: {}", errs[0]);
+        assert!(
+            errs[0].contains("cubecl::prelude::fma(...)"),
+            "the error must name the disambiguating spelling: {}",
+            errs[0]
+        );
+
+        // The qualified spelling is unambiguous even when the bare name is
+        // shadowed — that is exactly why the error suggests it.
+        let (out, errs) = shim_shadowed("cubecl::prelude::fma(a, b, c)");
+        assert_eq!(out, "::vericl::host_shims::fma(a,b,c)");
+        assert!(errs.is_empty(), "the qualified spelling must not error: {errs:?}");
+
+        // A shadowed name at the WRONG arity is not the intrinsic at all — it
+        // is an ordinary helper call, and the guard must stay quiet.
+        let (out, errs) = shim_shadowed("fma(a, b)");
+        assert_eq!(out, "fma(a,b)");
+        assert!(errs.is_empty(), "wrong arity must not trip the guard: {errs:?}");
+    }
+
+    /// End-to-end through `expand`: the shadowing guard's error really reaches
+    /// the caller (a kernel with a local binding named `fma`), and the
+    /// unshadowed bare intrinsic really expands (the `fma_axpy_map` example
+    /// exercises the full compile+prove+differential path).
+    #[test]
+    fn fma_shadowed_by_local_binding_is_rejected_end_to_end() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { let fma = 2.0f32; \
+             y[ABSOLUTE_POS] = fma(x[ABSOLUTE_POS], 2.0f32, 1.0f32); } }",
+        )
+        .expect("valid fn");
+        let err = expand(quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0)), &func)
+            .expect_err("a locally-shadowed `fma` must not be silently rewritten");
+        assert!(err.to_string().contains("ambiguous"), "got: {err}");
+    }
+
+    /// `x.fma(a, b)` / `f32::fma(a, b, c)` reach `FloatMethodCheck` and are
+    /// rejected by name (the `FLOAT_METHOD_REJECT` entry), so no spelling of
+    /// `fma` can reach a host twin except through the verified shim.
+    #[test]
+    fn non_intrinsic_fma_spelling_is_rejected_by_name_end_to_end() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { \
+             y[ABSOLUTE_POS] = x[ABSOLUTE_POS].fma(2.0f32, 1.0f32); } }",
+        )
+        .expect("valid fn");
+        let err = expand(quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0)), &func)
+            .expect_err("`.fma(..)` is not host-callable and must be rejected");
+        assert!(err.to_string().contains("fma"), "the rejection must name it: {err}");
     }
 
     // -----------------------------------------------------------------
@@ -6344,6 +6616,65 @@ mod tests {
         let err = expand_helper(quote!(wrapping), &func)
             .expect_err("wrapping with a float return must be rejected");
         assert!(err.to_string().contains("return type"), "unexpected message: {err}");
+    }
+
+    /// The gate accepts a TUPLE of integers as a wrapping helper's return type
+    /// (re-census wall #3 — the sole blocker on two private kernels), and the
+    /// fold covers the WHOLE body including the tuple-construction expression:
+    /// both components wrap.
+    #[test]
+    fn helper_wrapping_accepts_integer_tuple_return_and_folds_both_components() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn split(z: u32, k: u32) -> (u32, u32) { let m = z * k; (m + 1u32, z * 3u32) }",
+        )
+        .expect("valid fn");
+        let out = expand_helper(quote!(wrapping), &func)
+            .expect("a tuple-of-integers return must be accepted")
+            .to_string();
+        // `z * k`, `m + 1`, and `z * 3` — the last two INSIDE the returned
+        // tuple — all fold.
+        assert_eq!(
+            out.matches("wrapping_mul").count(),
+            2,
+            "both `*`s (one of them inside the tuple) must fold: {out}"
+        );
+        assert_eq!(
+            out.matches("wrapping_add").count(),
+            1,
+            "the `+` inside the tuple must fold: {out}"
+        );
+
+        // Nested tuples are integers all the way down, so they are admissible
+        // on the same argument; the unit type is the explicit spelling of the
+        // already-admissible "no return type".
+        for (ret, body) in [
+            ("(u32, (i32, u64))", "(z * 2u32, (1i32, 2u64))"),
+            ("()", "let _a = z * 2u32;"),
+        ] {
+            let src = format!("pub fn f(z: u32) -> {ret} {{ {body} }}");
+            let func: ItemFn = syn::parse_str(&src).expect("valid fn");
+            assert!(
+                expand_helper(quote!(wrapping), &func).is_ok(),
+                "`-> {ret}` must be admissible for a wrapping helper"
+            );
+        }
+    }
+
+    /// NEGATIVE (the per-positive control): one float component anywhere in the
+    /// returned tuple and the guarantee the gate stands for — "no float
+    /// arithmetic can occur in this body" — is gone, so the whole type is
+    /// rejected, nested or not.
+    #[test]
+    fn helper_wrapping_rejects_tuple_with_a_float_component() {
+        for ret in ["(u32, f32)", "(f32, u32)", "(u32, (i32, f64))"] {
+            let src = format!("pub fn f(z: u32) -> {ret} {{ let _a = z * 2u32; }}");
+            let func: ItemFn = syn::parse_str(&src).expect("valid fn");
+            let err = match expand_helper(quote!(wrapping), &func) {
+                Ok(_) => panic!("`-> {ret}` must be rejected"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("return type"), "unexpected message: {err}");
+        }
     }
 
     // -----------------------------------------------------------------

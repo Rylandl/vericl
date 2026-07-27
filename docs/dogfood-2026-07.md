@@ -359,3 +359,101 @@ assume.
   f32/f64/u32/i32/u64/i64 scalar parameters`); a runtime `u32` scalar works end to end, and `#[cube]`
   helper `usize` params work. The wall is the missing `usize` numeric-kind row, not runtime scalars
   as a class.
+
+## Addendum — shim-and-small-gate batch (2026-07-27)
+
+The re-census's recommended next milestone, built and re-measured against the same private
+codebase. Four changes: a GPU-ground-truthed **`fma` host shim**, **`CastToF32` extended to
+`usize` and `bool` sources**, **`wrapping` accepted on a tuple-of-integers-returning helper**,
+and a **message-only prover diagnostic** that names the construct behind a `checked_mul` /
+div-mod taint.
+
+### Headline: 6/22 → **19/22 faithful**
+
+Thirteen private `#[cube]` items were re-annotated at full fidelity — body byte-for-byte the
+private source, only the contract attribute added — and every one of them passes its
+differential on wgpu. The re-census's own projection for this batch was "6/22 → ~18-19/22";
+the measured result is the top of that range.
+
+| Private item (by role/shape) | Before | After | Evidence |
+|---|---|---|---|
+| extended-precision double-single phasor helper (5 `fma`s + a `usize`-source cast) | **no honest annotation at any fidelity** | FAITHFUL | differential + `Proved{4}` behind a driver |
+| CW freqshift synthesis kernel | near-faithful (1 substitution) | FAITHFUL | differential + `Proved{3}` |
+| counter-based RNG round helper (`(u32, u32)`, wrap-intent) | near-faithful (bump hoisted out) | FAITHFUL | differential + `Proved{3}` |
+| per-sample emitter accumulator helper | distilled (phasor dropped) | FAITHFUL | differential; bounds `OutOfSubset` (anchor, see below) |
+| resident inner-loop kernel | distilled | FAITHFUL | differential; hardened sibling `Proved{55}` |
+| per-tap sample helper | distilled | FAITHFUL | differential (via its callers) |
+| per-emitter sample helper | distilled | FAITHFUL | differential + verdict recorded, behind a driver |
+| R-wide scalar fold kernel | distilled + restructured | FAITHFUL | differential; verdict recorded |
+| on-device envelope freqshift kernel | distilled | FAITHFUL | differential + `Proved` |
+| uploaded-envelope inner loop (single) | distilled | FAITHFUL | differential + `Proved` |
+| uploaded-envelope inner loop (multi-emitter) | distilled | FAITHFUL | differential + `Proved` |
+| classified-output truth kernel | distilled | FAITHFUL | differential; verdict recorded |
+| dual-polarization R-wide fold kernel | distilled | FAITHFUL | differential; verdict recorded |
+
+The three that remain non-faithful: one still needs a **non-`f32` cast target**
+(`u32::cast_from(usize)` / `u32::cast_from(bool)` in a 64-bit counter carry) — a real residual
+this batch deliberately did not take; and two carry round-1 distillations blocked by the
+re-census's walls #5 (an injectivity/permutation element assume) and #6 (2-D dispatch), neither
+of which this batch touched.
+
+**One structural correction found while porting.** Round 2's distilled R-wide fold routed its
+per-tap loop through the per-emitter helper; the private kernel inlines that loop and calls the
+per-tap helper directly. The faithful version here matches the private structure, and the
+per-emitter helper — a genuinely separate private item with its own call sites — got its own
+faithful annotation plus a driver. Round 2's "everything else is faithful" wording did not call
+that restructure out.
+
+### Why `fma` had to be a shim, measured twice
+
+`cubecl::prelude::fma` is a free function whose body is `unexpanded!()`: a host call panics, so a
+twin cannot make it, and there is no `uses(...)` escape. The tempting rewrite is `a*b + c`, and it
+is unsound for the shape that needs it — the two-product residual `fma(h, x, -(h*x))` is the
+*exact* rounding error of the rounded product, while the unfused form is identically `0.0`.
+
+- On the **host**, over the ground-truth corpus, the naive `a*b + c` diverges from the real GPU
+  intrinsic on **3654 of 7972** triples on wgpu and **3576 of 7972** on cubecl-cpu (~46%).
+- On the **device**, the two spellings are different functions too: the public
+  `fma_two_product_residual` / `unfused_two_product_residual` pair returns the true residual
+  (non-zero on 1023 of 1024 probe inputs) vs exactly `0.0`.
+
+A backend note recorded in the re-census needed narrowing: Metal contracts `a*b + c` into one
+fused instruction **when the addend is independent** (that is the `vec_madd_bitexact` finding, and
+the ground-truth probe's "unfused kernel differs from the fused intrinsic on 0 of 7972 triples").
+When the addend *is* the product, common-subexpression elimination collapses `t - t` before
+contraction can apply, and the unfused kernel really is unfused. Both behaviours are now pinned by
+tests; neither generalizes to the other.
+
+### The measured fma tier, and the one divergence class
+
+Against the real intrinsic in a real `#[cube]` kernel, 7972 triples (boundary, ±0, ±inf, NaN,
+subnormal, cancellation-heavy residuals, random):
+
+- **cubecl-cpu: bit-exact everywhere**, subnormals included.
+- **wgpu/Metal: bit-exact on every triple with no subnormal operand or result**; the 78 that touch
+  the subnormal range diverge, and all 78 are *exactly* flush-to-zero
+  (`gpu == ftz(fma(ftz a, ftz b, ftz c))`) — asserted as a model, not averaged into a tolerance.
+
+So a twin computing in the normal range is bit-exact; one that genuinely computes in the subnormal
+range must use a tolerance. Same shape of finding as the Metal reciprocal-multiply 1-ULP result:
+a real backend property, recorded rather than smoothed over.
+
+The private phasor kernels sit at `abs = 1e-5` / `1e-3` — **not** because of the shim (the fused
+arithmetic feeding them is bit-exact) but because their last two operations are `cos`/`sin`, whose
+wgpu implementations are not required to match Rust's `libm`.
+
+### The prover diagnostic, validated on the shape that motivated it
+
+The re-census's private finding (a) asked for the failed `checked_mul` side-obligation to be
+surfaced instead of the generic out-of-subset text. It now is — and the first place it fired was
+the faithful composed kernels above, whose element-derived source anchor is exactly that shape:
+
+> read index for `…[...]` depends on a construct outside the vericl v0 subset — it is the result of
+> an integer `*` whose no-overflow side-obligation did not discharge: under the live path conditions
+> the product can leave the `u32` range and wrap, so it is not modeled (constrain the operands — an
+> `assumes(...)` clause or a guard that bounds them — to discharge it)
+
+Message-only: every verdict, obligation count and counterexample is unchanged, and the hardened
+sibling that adds the guard the production pipeline already carries still proves at **exactly the
+same 55 obligations** the distilled version did — restoring the real phasor changed the fidelity,
+not the proof.

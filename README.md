@@ -482,6 +482,50 @@ backend — the honest claim is an absolute error bound (`|e-a| <= abs + rel*|e|
 declared input ranges in `assumes(...)`. The tolerance is part of the contract and is recorded as
 an assumption in the evidence, exactly as the claim model requires.
 
+### GPU-verified host shims: `fma`, `cast_from`, `mul_hi`
+
+Some CubeCL intrinsics have no host implementation at all. `Cast::cast_from`, `Numeric::mul_hi`
+and the free function `cubecl::prelude::fma` are all `unexpanded!()` — calling one from ordinary
+Rust panics — so the derived reference twin cannot simply call them, and a `#[vericl::helper]` is
+no escape hatch (the helper's twin would panic too). Writing them out by hand is worse: the
+semantics are *GPU*-defined.
+
+So `#[vericl::kernel]` / `#[vericl::helper]` rewrite a recognized intrinsic call in the twin (and
+only the twin — the `#[cube]` item is re-emitted untouched) to a shim in
+`vericl::host_shims`, and **every shim is pinned against the real intrinsic run in a real `#[cube]`
+kernel**, on wgpu and on cubecl-cpu, in
+`crates/vericl-examples/tests/host_shim_gpu_ground_truth.rs`. An unrecognized spelling is not
+guessed at — it is rejected by name, and an unsupported operand type is a `CastToF32`/`MulHi`/`Fma`
+trait error in the twin. Loud, never a silently wrong value.
+
+| Intrinsic | Shim | Measured tier |
+|---|---|---|
+| `f32::cast_from(x)`, `x: u32`/`i32`/`usize`/`bool`/`f32` | `cast_to_f32` | bit-exact, both lanes (`bool` is exactly `true → 1.0`, `false → +0.0`; `usize` is cubecl's `AddressType`, verified across the whole u32 domain including `> 2^24`) |
+| `T::mul_hi(a, b)` / `a.mul_hi(b)`, `T = u32` | `mul_hi` | bit-exact, both lanes |
+| `fma(a, b, c)`, `f32` | `fma` (Rust `f32::mul_add`) | bit-exact on cubecl-cpu everywhere; bit-exact on wgpu/Metal outside the subnormal range — see below |
+
+**`a * b + c` is not a substitute for `fma(a, b, c)`, and this is measured, not asserted.** The
+unfused form rounds twice where `fma` rounds once, and for the two-product idiom
+`fma(h, x, -(h*x))` — the exact rounding error of a rounded product, the primitive under every
+compensated accumulator — the unfused rewrite is identically `0.0` where the fused answer is the
+entire signal. Over the ground-truth corpus the naive host substitute would diverge from the real
+GPU intrinsic on 3654 of 7972 triples on wgpu and 3576 of 7972 on cubecl-cpu; the public
+`fma_two_product_residual` / `unfused_two_product_residual` example pair shows the same gap on the
+device (residual non-zero on 1023 of 1024 inputs vs exactly zero).
+
+**The one divergence class, recorded rather than smoothed over.** On wgpu/Metal the `fma` shim is
+bit-exact on every probe triple with no subnormal operand or result; on the 78 triples that touch
+the subnormal range the backend flushes denormals to zero and the host does not. The divergence is
+not approximate — it is exactly `ftz(fma(ftz a, ftz b, ftz c))`, and the ground-truth test asserts
+that model instead of widening a tolerance. A kernel computing in the normal range is bit-exact
+(`compare(max_ulp = 0)`); one that genuinely computes in the subnormal range needs a tolerance.
+
+**Shadowing.** `fma` is glob-imported from `cubecl::prelude`, so a `uses(...)` helper or a local
+binding of that name wins over it on the `#[cube]` side. VeriCL will not guess which one a bare
+`fma(a, b, c)` meant: it raises a targeted error naming both escapes (rename, or write
+`cubecl::prelude::fma(...)`, which the rewrite also recognizes and which does compile inside
+`#[cube]`).
+
 ## Claims and trust boundaries
 
 VeriCL must say exactly what a result establishes. These are different claims and are never

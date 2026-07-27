@@ -12,6 +12,7 @@
 //! of this suite — they belong to the `conform` binary's demo-defects mode,
 //! which shows the checks catching them on purpose.
 
+use cubecl::Runtime;
 use vericl_examples::*;
 
 vericl::suite! {
@@ -114,7 +115,114 @@ vericl::suite! {
         // convention are `sequential_slice_mut_scale` + `scratchpad/slicemut`
         // (twin unit test + scratch compile-fail control; not suite-wired).
         slice_scale_inplace,
+        // --- Shim-and-small-gate batch (2026-07 coverage re-census) ---
+        // The GPU-verified `fma` shim: `cubecl::prelude::fma` is a free
+        // function that panics on a host call, and the obvious `a*b + c`
+        // substitute rounds twice where it rounds once. Both kernels are
+        // bit-exact (`max_ulp = 0`) — the tier the ground truth earns outside
+        // the subnormal domain (Metal flushes denormals; both `gen(...)` ranges
+        // keep every operand and result well clear of it).
+        //
+        // `fma_poly3_map`: three NESTED fma's (Horner) inside a composed
+        // `#[vericl::helper]` — the shim rewrite's helper site and its
+        // post-order nesting.
+        fma_poly3_map,
+        // `fma_two_product_residual`: `fma(h, x, -(h*x))`, the exact rounding
+        // error of a rounded product — the shape whose unfused rewrite is
+        // identically zero, i.e. the reason this is a shim and not a
+        // source-level rewrite.
+        fma_two_product_residual,
+        // `CastToF32` source extension. `index_ramp_map` casts the
+        // `usize`-typed `ABSOLUTE_POS` (cubecl's `AddressType`, u32 storage);
+        // `bernoulli_indicator_map` casts a `bool` predicate (`true → 1.0`) —
+        // the Bernoulli value map, the third distribution core. Both bit-exact.
+        index_ramp_map,
+        bernoulli_indicator_map,
+        // `wrapping` on a TUPLE-returning helper: a non-wrapping kernel
+        // destructuring a wrapping two-word counter step. Exact u32 + proved
+        // bounds; the per-item interaction rule is unchanged.
+        counter_split_map,
     ],
     evidence: "evidence/vericl.json",
     extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime),
+}
+
+/// NEGATIVE CONTROL for the `fma` shim — the measured answer to "why not just
+/// rewrite `fma(a, b, c)` to `a*b + c` in the twin?".
+///
+/// `fma_two_product_residual` (suite-wired) and `unfused_two_product_residual`
+/// differ by exactly that rewrite: `fma(hi, xi, -product)` vs
+/// `hi*xi - product`, where `product` is the rounded `hi*xi`. This test runs
+/// BOTH on the same inputs and pins the gap **on the device**:
+///
+/// - the fused kernel returns the true rounding residual of `hi*xi` — non-zero
+///   on essentially every input, and bit-exactly what the `fma` shim computes;
+/// - the unfused kernel returns identically `0.0`, and its twin (which computes
+///   the unfused expression too) matches it bit-exactly.
+///
+/// So the rewrite is not a tolerance question, it is a different function, and
+/// the difference is 100% of the answer. Both twins are faithful — each models
+/// the kernel that was actually written — which is exactly the property the
+/// shim buys: vericl reproduces `fma` as `fma`, not as an algebraic
+/// paraphrase.
+///
+/// **Measured backend detail, corrected here** (it is not the same fact as the
+/// FMA-contraction one recorded for `vec_madd_bitexact`): Metal contracts
+/// `a*b + c` into a single fused instruction when `c` is *independent* — that is
+/// what `vec_madd_bitexact`'s bit-exact failure and the ground-truth probe's
+/// "unfused kernel differs from the fused intrinsic on 0 of 7972 triples"
+/// both show. Here the addend IS the product, so common-subexpression
+/// elimination collapses `t - t` to zero *before* any contraction can apply,
+/// and the unfused kernel is genuinely unfused on the GPU. Both behaviours are
+/// pinned: this test would fail if either changed.
+#[test]
+fn fused_and_unfused_residual_kernels_compute_different_functions_on_gpu() {
+    let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
+    let n = 4096usize;
+    let seed = 0x5EED_1234u64;
+
+    // Both kernels' twins track their own GPU kernel bit-exactly (`max_ulp = 0`).
+    let fused =
+        fma_two_product_residual_vericl::conformance_case::<cubecl::wgpu::WgpuRuntime>(
+            &client, n, seed, 64,
+        );
+    assert!(fused.pass(), "the fused kernel's shim-routed twin must be bit-exact: {fused:?}");
+    let unfused =
+        unfused_two_product_residual_vericl::conformance_case::<cubecl::wgpu::WgpuRuntime>(
+            &client, n, seed, 64,
+        );
+    assert!(
+        unfused.pass(),
+        "the unfused kernel's twin must also be faithful — vericl models what was written, and \
+         if THIS fails the backend has started contracting `t - t` and the finding recorded in \
+         `host_shims::fma_f32` must be re-measured: {unfused:?}"
+    );
+
+    // …and they are different functions. Compare the two twins' VALUES over
+    // the declared input range (the differential above only says each twin
+    // matches its own kernel; this says the two kernels are not the same
+    // computation). Inputs are drawn independently of `conformance_case`'s
+    // stream on purpose — the claim is about the functions over the declared
+    // `gen(...)` range, not about one particular draw.
+    let m = 1024usize;
+    let h: Vec<f32> = (0..m).map(|i| 0.0009765625 + (i as f32) * 0.000_97).collect();
+    let x: Vec<f32> = (0..m).map(|i| 1.0 + (i as f32) * 3.997).collect();
+    let mut y_fused = vec![0f32; m];
+    let mut y_unfused = vec![0f32; m];
+    fma_two_product_residual_vericl::reference(&h, &x, &mut y_fused, m);
+    unfused_two_product_residual_vericl::reference(&h, &x, &mut y_unfused, m);
+    assert!(
+        y_unfused.iter().all(|v| *v == 0.0),
+        "the unfused rewrite collapses to exactly zero, by construction"
+    );
+    let nonzero = y_fused.iter().filter(|v| **v != 0.0).count();
+    assert!(
+        nonzero > m / 2,
+        "the fused residual must be genuinely non-zero on most inputs, else this control is \
+         vacuous (got {nonzero} of {m})"
+    );
+    println!(
+        "fma discrimination: fused residual non-zero on {nonzero}/{m} inputs, unfused rewrite \
+         exactly 0.0 on all {m} — a 100% relative error, not a tolerance gap"
+    );
 }
