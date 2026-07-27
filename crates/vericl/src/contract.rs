@@ -280,6 +280,70 @@ pub trait ConfigIdentity {
     const CONFIG_HASH: &'static str;
 }
 
+/// Identity of a struct used as a **runtime** (non-`#[comptime]`) `CubeType`
+/// kernel/helper parameter, or constructed as a struct literal in a kernel or
+/// helper body — implemented **only** by the `vericl::cube_struct! { … }` item
+/// macro.
+///
+/// # Why this trait exists
+///
+/// This is [`ConfigIdentity`]'s argument moved one parameter position over, and
+/// it closes a hole that was **live** rather than hypothetical. A kernel's
+/// `SOURCE_HASH` covers its own tokens plus the contract attribute tokens; a
+/// runtime struct type's *definition* — its field names, field types, field
+/// **order**, and any `#[cube] impl` method reachable from the body — is in
+/// neither.
+///
+/// Measured before this trait existed (`docs/design-cubetype-args.md` §4.1,
+/// probe V3/V4): a `#[vericl::helper] fn use_pair(p: Pair) -> u32` was accepted
+/// with **no diagnostic at all**, and editing `#[cube] impl Pair { fn fold }`
+/// from `self.a * self.b` to `self.a + self.b` moved the reference twin from
+/// `[3, 6, 9, 12]` to `[4, 5, 6, 7]` while the kernel's `SOURCE_HASH`, the
+/// helper's `SOURCE_HASH` **and** `identity().source_hash` all stayed
+/// bit-identical. Recorded evidence verified FRESH against a different computed
+/// function.
+///
+/// There is a second, launch-side hazard the hash also covers: CubeCL generates
+/// `<Name>Launch::new(…)` **positionally** in field-declaration order
+/// (`generate_struct.rs:92-114`), so swapping two same-typed fields in the
+/// *declaration* changes what the kernel computes with the kernel body and the
+/// launch-call text byte-unchanged (§4.3, probe X2). Under
+/// `vericl::cube_struct!` VeriCL emits that constructor itself from the declared
+/// field order — so the reorder stays *correct*, and
+/// [`STRUCT_HASH`](StructIdentity::STRUCT_HASH) moving is what makes the stored
+/// evidence correctly stale.
+///
+/// # Do not implement this by hand
+///
+/// A hand-written impl can claim any hash it likes, including a constant one,
+/// which reintroduces exactly the hole the trait closes. Only
+/// `vericl::cube_struct!` derives a hash that covers the definition — and only
+/// it emits the `CubeType`/`CubeLaunch` derives and the launch constructor from
+/// the field order it hashed.
+///
+/// # Enums
+///
+/// `vericl::cube_struct!` emits `StructIdentity` for the **structs** it
+/// declares, never for an enum: a payload-carrying runtime enum lowers to a tag
+/// plus every variant's payload and has no twin model in the v1 subset, and a
+/// unit enum's place in the subset is as a `#[cube(comptime)]` *field* type
+/// (where it needs no `CubeType` derive at all). A declared enum therefore gets
+/// [`ConfigIdentity`] only, and naming it in runtime parameter position lands on
+/// the message below.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is used as a runtime CubeType parameter but is not declared with a `vericl::cube_struct!` block",
+    label = "not a vericl cube struct",
+    note = "wrap the struct declaration in `vericl::cube_struct! {{ … }}` so vericl can fold the struct's definition into kernel identity, emit the CubeType/CubeLaunch derives, and build the launch argument from the declared field order — a field reorder or type change would otherwise alter what the kernel computes while leaving its recorded identity bit-identical",
+    note = "if `{Self}` is declared with `vericl::config!`, note that a config type is NOT a runtime parameter type: `vericl::config!` gates its methods for HOST-callability because a comptime config runs on the host, while a runtime parameter is device data. Declare it with `vericl::cube_struct!` instead — a `cube_struct!` type may also be used as a #[comptime] parameter, but the reverse is not sound",
+    note = "if `{Self}` is an ENUM, a payload-carrying runtime enum parameter is outside the vericl v0 subset (CubeCL lowers it to a tag plus every variant's payload, and the twin would need a matching host discriminant model); a `#[cube(comptime)]` unit-enum FIELD inside a `vericl::cube_struct!` type is supported instead"
+)]
+pub trait StructIdentity {
+    /// SHA-256 (as `"sha256:<hex>"`) over the entire `vericl::cube_struct!`
+    /// token block that declared this type. Folded into the kernel's or
+    /// helper's recorded `source_hash` by [`combine_source_hash`].
+    const STRUCT_HASH: &'static str;
+}
+
 /// Scalar primitives carry an identity naming the type itself — see
 /// [`ConfigIdentity`]'s "Scalar type aliases" section for why these exist and
 /// why a constant is the right value here (unlike a hand-written impl for a

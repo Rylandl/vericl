@@ -629,3 +629,130 @@ unmoved — and no body gate can walk an unexpanded macro. The expansion must be
 corpus, where a whole config-type family is macro-generated, that is the largest single friction the
 milestone introduces, and it is the price of the hash meaning what it says.
 
+
+## Addendum — `CubeType` struct-arg correction (2026-07-27): the 28 is 20, and 8 of the 28 needed nothing
+
+**The correction above's own #1-ranked gate was itself partly a classifier artifact.** This addendum
+is the second consecutive one of that shape, which is itself the finding: a lexical gate list measures
+what a classifier can see, and what it cannot see is exactly what compiles.
+
+**The bug.** `broad_cubetype_params` (`classify.py:407-453`) computes
+`q = re.sub(r'#\[[^\]]*\]', '', p)` and *then* types `q` — it strips `#[...]` attributes before
+deciding whether a parameter is a custom `CubeType`. So a `#[comptime] scheme: QuantScheme` is
+indistinguishable from a runtime `scheme: QuantScheme`. The struct-comptime addendum above demoted the
+`struct-typed #[comptime] param` row to **supported**; this row silently re-added the very same
+parameters under a different name.
+
+**Eight of the 28 have no other offending parameter at all** — they are gate-free on unmodified
+VeriCL, today, with no new feature:
+
+```text
+cubecl-std/quant/dequantize.rs:78                cast_masked              #[comptime] QuantScheme
+cubek-reduce/components/global/base.rs:22        reduce_count             #[comptime] VectorizationMode, VectorSize
+cubek-reduce/components/readers/base.rs:86       fill_coordinate_vector   #[comptime] VectorizationMode
+cubek-std/stage/stage_memory/swizzle.rs:40       as_swizzle_object        #[comptime] SwizzleMode
+cubek-std/tile/compute/matmul/interleaved.rs:107 interleaved_load_zeros   #[comptime] InterleavedMatmul
+cubek-std/tile/compute/matmul/register.rs:10     register_execute         #[comptime] RegisterMatmul
+cubek-std/tile/compute/matmul/register.rs:185    register_load_zeros      #[comptime] RegisterMatmul, StageIdent
+cubek-std/tile/data/interleaved.rs:93            interleaved_allocate_acc #[comptime] InterleavedMatmul, MatrixLayout
+```
+
+### The corrected numbers (re-run, not estimated)
+
+`classify.py` re-run with that one rule fixed (skip `#[comptime]`-attributed parameters) and
+everything else byte-identical:
+
+| Bucket | with the double count | corrected | Δ |
+|---|---:|---:|---:|
+| Items tripping zero blocking gates | 89 | **97** | **+8** |
+| …of which **plain non-test `fn`** | 12 | **20** | **+8** |
+| …of which impl/trait non-test | 71 | 72 | +1 |
+| Items with exactly one blocking gate | 158 | **174** | +16 |
+
+Reproduced independently while landing the milestone (`python3 recount.py` over the same six-crate
+scope, `464` device items): `97` gate-free with `fn_nontest 20` / `impl-trait 72`, `174` single-gate
+items, and every row of the ranking table below — including the corrected sole-blocker list of 20,
+site for site.
+
+**Correction 1b — the classifier never checks RETURN types, in either direction.** Two of the 20
+now-gate-free `fn`s return a `CubeType` struct (`-> Swizzle`, `-> Tile<A, Sc, ReadWrite>`), so the
+honest gate-free count is **18**, not 20. Of the 20 sole-blocked, three return tuples and two return
+`CubeType` containers. VeriCL did not gate helper return types either — `-> (u32, u32)` and `-> Pair`
+both compiled with no diagnostic — so this was a hole on *both* sides of the ledger. VeriCL's half is
+now closed (a struct/enum return is rejected; a tuple of scalars stays supported, because it is
+destructured at the call site and is shipped, suite-wired and differential-green).
+
+### The frontier re-ranks a second time
+
+| Gate | sole (recorded above) | sole (corrected) | sole non-test `fn` (corrected) |
+|---|---:|---:|---:|
+| View/Layout machinery | 57 | 57 | 0 |
+| `plane_*` | 14 | 21 | **9** |
+| **custom `CubeType` param (broad)** | **28** | **20** | **20** |
+| `comptime_type!` | 18 | 18 | 0 |
+| cmma / `Matrix` | 6 | 17 | **11** |
+| `CubeType`-arg (v0 name list) | 8 | 12 | 5 |
+| `comptime!{}` out of subset | 9 | 10 | 4 |
+
+It is still #1 for plain annotatable functions, but by **1.8×**, not the 9× recorded above (cmma 11,
+`plane_*` 9). The recorded "3.5× jump" and "9× the next-best bucket" figures in the previous addendum
+are **superseded by this one**.
+
+### Honest reach: v1 unlocks zero of the corrected 20
+
+Every one carries a co-gate the runtime-struct milestone does not touch, measured site by site
+(`docs/design-cubetype-args.md` §3.5): `Sequence` 3, device aggregates with
+`Slice`/`SharedMemory`/`View` fields 6, trait-generic or associated-type parameters 8, a runtime enum
+reached through a `#[cube] impl` method 2, cmma 1. Nineteen of the twenty are `#[cube]` **helpers**,
+not launch entry points, so their struct arguments are device-local values a caller built, not launch
+arguments — and of the struct *types* named, only `CubeMapping` and `RuntimeArgs` derive `CubeLaunch`
+at all.
+
+The closest miss is `cubek-reduce/components/readers/base.rs:65`, whose parameter type
+(`ReduceRequirements`, a struct whose only field is `#[cube(comptime)] coordinates: bool`) *is*
+admissible under v1 — only its `-> Value<Vector<u32, N>>` return blocks it.
+
+**Correction 2 — there is no struct-of-buffers in the ecosystem.** A field census over the six survey
+crates: **165** `CubeType`/`CubeLaunch` struct definitions, **25** deriving `CubeLaunch` (the only
+ones eligible as a launch argument), and **zero** of those 25 with an `Array` or `Tensor` field. The
+20 definitions that do carry `Array`/`Slice`/`SharedMemory` fields are all `CubeType`-only device
+aggregates. `docs/design-struct-comptime.md` §4.4 named "a twin representation for a
+struct-of-buffers" as this milestone's first prerequisite; it is a shape the corpus does not contain,
+and that paragraph now carries a correction marker.
+
+### What actually shipped, and what the corpus pays for it
+
+`vericl::cube_struct! { … }` (declaration + `STRUCT_HASH` + ten field gates), a `StructIdentity`
+requirement on every runtime struct type reachable from a kernel's or helper's signature **or body**,
+the positional launch constructor emitted from the hashed field order, and dotted
+`gen(p.f in …)`/`instantiate(p.c = …)` clauses. One **live** soundness hole closed: a runtime struct
+on a `#[vericl::helper]` was accepted with no diagnostic at all and in no hash, so a `#[cube] impl`
+edit moved the reference twin from `[3, 6, 9, 12]` to `[4, 5, 6, 7]` with the kernel's `SOURCE_HASH`,
+the helper's `SOURCE_HASH` and `identity().source_hash` all bit-identical. Plus two diagnostic
+corrections and one adjacent hole documented rather than inherited. Details and the residual:
+`docs/design-cubetype-args.md`, README "Runtime `CubeType` struct parameters".
+
+**Spot-validation — the wrapper this survey's own port had to drop, restored.** `cubek-random`'s
+`Uniform::inner_loop` takes `args: &Uniform` (`#[derive(CubeLaunch, CubeType)] struct Uniform
+{ lower_bound: f32, upper_bound: f32 }`), and the clean-room port's own comment lists "the trait-impl
++ `args: Uniform` CubeType wrapper" among the constructs it dropped, respelling the two bounds as
+loose `f32` parameters. The port no longer has to:
+
+| Kernel | Source | compare | wgpu/Metal | cubecl-cpu | Proved |
+|---|---|---|---|---|---|
+| `uniform_value_map` | cubek-random `uniform.rs:9` (`Uniform` restored) | `abs = 1e-4` | PASS | PASS | `Proved{2}` |
+| `stage_window_sum` | nested struct + `#[cube(comptime)]` field | `abs = 1e-4` | PASS | PASS | `Proved{3}` |
+| `accum_blend_map` | the device-local aggregate shape (19 of 20 sites) | `max_ulp = 0` | PASS | PASS | `Proved{2}` |
+
+Added non-destructively: every pre-existing evidence entry is byte-identical (the manifest diff is
+194 insertions, 0 deletions), three new entries added. The struct lane's `kernel_ir_hash` is
+byte-identical to the flattened lane's, asserted in-repo as a cubecl-upgrade tripwire.
+
+**The ergonomic cost, measured rather than glossed.** Two, both structural. A declared struct may have
+no `impl` block, so the corpus's method-heavy device aggregates (`RowWise::new_filled`,
+`StridedTile::new_contiguous`, `CubeMapping::cube_pos_to_xyz`) must be rewritten as
+`#[vericl::helper]` free functions — which is the better program, since a helper's twin is generated
+from the same tokens the device gets and its body is gated, but it is a rewrite. And every runtime
+field needs an explicit `gen(p.field in lo..=hi)`, including integers, because the kernel-side macro
+never learns the struct's fields and delegates coverage to rustc's struct-literal exhaustiveness
+check.

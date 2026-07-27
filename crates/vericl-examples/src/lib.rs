@@ -2077,6 +2077,383 @@ pub fn config_out_of_block_evasion(x: &Array<f32>, y: &mut Array<f32>, #[comptim
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime `CubeType` struct arguments — the `vericl::cube_struct!` milestone
+// (docs/design-cubetype-args.md).
+//
+// CubeCL lowers a runtime struct parameter as a POSITIONAL FLATTENING of its
+// fields at the struct's own parameter slot, in field declaration order
+// (measured three independent ways: bit-exact GPU output vs the flattened
+// spelling, buffer-for-buffer identical `KernelDefinition`, byte-identical
+// `kernel_ir_hash`), so the IR — and therefore the prover — cannot tell the two
+// spellings apart and needs no change at all.
+//
+// What the milestone adds is soundness, not capability. Before it, the helper
+// half of this shape was accepted with NO DIAGNOSTIC AT ALL and no identity
+// coverage: with a `#[cube] impl Pair { fn fold }` edited from `self.a * self.b`
+// to `self.a + self.b`, the reference twin moved from [3, 6, 9, 12] to
+// [4, 5, 6, 7] while the kernel's SOURCE_HASH, the helper's SOURCE_HASH and
+// `identity().source_hash` all stayed bit-identical, and evidence recorded
+// against the first build verified FRESH against the second (design §4.1). Each
+// kernel below folds its struct type's `STRUCT_HASH` into its recorded identity,
+// and each struct's `impl` surface is rejected at the declaration — see
+// `tests/cube_struct_identity.rs` for the flipped probe.
+// ---------------------------------------------------------------------------
+
+vericl::cube_struct! {
+    /// The parameter block of the restored `uniform_value_map` below — the real
+    /// ecosystem shape this milestone's ground truth is taken from.
+    /// `cubek-random/src/uniform.rs:9` declares
+    /// `#[derive(CubeLaunch, CubeType)] struct Uniform { lower_bound: f32,
+    /// upper_bound: f32 }`, and the survey's clean-room port had to **drop** it:
+    /// its own comment lists "the trait-impl + `args: Uniform` CubeType wrapper"
+    /// among the dropped constructs, respelling the two bounds as loose `f32`
+    /// parameters. This restores the wrapper — and folds its definition into the
+    /// port's identity.
+    ///
+    /// Note what is NOT written here: `#[derive(CubeType, CubeLaunch)]`.
+    /// `vericl::cube_struct!` emits the derive set itself (plus `Clone`/`Copy`
+    /// for the by-value twin binding) because an author-chosen derive set is a
+    /// silent capability switch — dropping `CubeLaunch` turns the type from
+    /// launchable to device-local with every kernel's tokens unchanged.
+    pub struct UniformArgs {
+        /// Lower bound of the generated uniform value.
+        pub lower_bound: f32,
+        /// Upper bound of the generated uniform value.
+        pub upper_bound: f32,
+    }
+}
+
+/// FLAGSHIP runtime-struct kernel: the survey's `uniform_value_map` port with
+/// its `args:` wrapper restored (design §8). Wired into `vericl::suite!` on both
+/// lanes, carrying `tested` (differential) + `proved` (SMT bounds).
+///
+/// The struct contributes **no buffer** — every field is a launch scalar — so
+/// `BUFFER_PARAMS` is `[("s", false), ("y", true)]`, exactly what the flattened
+/// spelling produces, and the bounds proof is the ordinary one. The launch
+/// argument is a `UniformArgsLaunch::new(lower_bound, upper_bound)` emitted from
+/// the field order `vericl::cube_struct!` hashed: CubeCL fills a launch struct
+/// **by position**, so a definition-only swap of two same-typed fields would
+/// otherwise change the computed function with the kernel body and the
+/// launch-call text byte-unchanged (design §4.3, measured). Here the constructor
+/// moves with the declaration, and `STRUCT_HASH` moves too — so the stored
+/// evidence goes correctly stale rather than silently describing another kernel.
+///
+/// `abs = 1e-4`, not `max_ulp = 0`: `unit * scale + args.lower_bound` is the
+/// FMA-contraction shape (Metal fuses a multiply-add whose addend is
+/// independent), the same tier and the same reason as the other
+/// contraction-shaped kernels here.
+#[vericl::kernel(
+    assumes(
+        s.len() == y.len(),
+        args.lower_bound.abs() <= 100.0,
+        args.upper_bound.abs() <= 100.0
+    ),
+    compare(abs = 1e-4),
+    gen(
+        args.lower_bound in -100.0..=100.0,
+        args.upper_bound in -100.0..=100.0,
+        y in 0.0..=0.0
+    ),
+    uses(to_unit_interval)
+)]
+#[cube(launch)]
+pub fn uniform_value_map(s: &Array<u32>, args: &UniformArgs, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let scale = args.upper_bound - args.lower_bound;
+        let unit = to_unit_interval(s[ABSOLUTE_POS]);
+        y[ABSOLUTE_POS] = unit * scale + args.lower_bound;
+    }
+}
+
+/// NEGATIVE CONTROL for `uniform_value_map`: the same kernel with the struct's
+/// two fields spelled as loose `f32` parameters — the spelling the survey's
+/// clean-room port was forced into.
+///
+/// Not suite-wired (it claims nothing the struct version does not); it exists so
+/// `cube_struct_identity.rs` can assert the design's central lowering claim as a
+/// **cheap tripwire**: a runtime struct parameter is exactly a positional
+/// flattening of its fields, so the two `kernel_ir_hash`es must be
+/// byte-identical. That equality is a property of
+/// `cubecl-macros`' `generate_struct.rs`, and if a future cubecl changes
+/// field-expansion order or makes `<Name>Launch::new` named, this fails loudly
+/// (design risk 9).
+#[vericl::kernel(
+    assumes(
+        s.len() == y.len(),
+        lower_bound.abs() <= 100.0,
+        upper_bound.abs() <= 100.0
+    ),
+    compare(abs = 1e-4),
+    gen(lower_bound in -100.0..=100.0, upper_bound in -100.0..=100.0, y in 0.0..=0.0),
+    uses(to_unit_interval)
+)]
+#[cube(launch)]
+pub fn uniform_value_map_flat(
+    s: &Array<u32>,
+    lower_bound: f32,
+    upper_bound: f32,
+    y: &mut Array<f32>,
+) {
+    if ABSOLUTE_POS < y.len() {
+        let scale = upper_bound - lower_bound;
+        let unit = to_unit_interval(s[ABSOLUTE_POS]);
+        y[ABSOLUTE_POS] = unit * scale + lower_bound;
+    }
+}
+
+vericl::cube_struct! {
+    /// A NESTED declared struct plus a `#[cube(comptime)]` field — the other two
+    /// thirds of the v1 field boundary, in one block.
+    ///
+    /// Both types must be declared in the SAME block: one block is one
+    /// `STRUCT_HASH`, so a nested type declared in a sibling block would
+    /// contribute its fields (and therefore the positional launch constructor's
+    /// shape) to what the kernel computes without contributing to its identity.
+    /// Gate CS2 enforces that rather than documenting it.
+    pub struct StageWindow {
+        /// Per-tap gain — a runtime field, generated per case.
+        pub gain: f32,
+        /// Accumulated tap count. A `#[cube(comptime)]` field keeps its
+        /// positional slot in `StageWindowLaunch::new` but takes the plain host
+        /// type and never reaches the device: it is pinned once by
+        /// `instantiate(cfg.window.taps = 3)` and becomes a constant loop bound
+        /// at expansion. Integer by necessity, not by choice — CubeCL's
+        /// generated `CompilationArg` derives `Hash`/`Eq` over every comptime
+        /// field, and no float type is either (measured).
+        #[cube(comptime)]
+        pub taps: u32,
+    }
+
+    /// The outer parameter block.
+    pub struct StageArgs {
+        /// The nested window.
+        pub window: StageWindow,
+        /// Additive bias — a runtime field of the outer struct.
+        pub bias: f32,
+    }
+}
+
+/// Nested declared struct + comptime field + dotted contract clauses at depth 2.
+/// Wired into `vericl::suite!` — `tested` + `proved` on both lanes.
+///
+/// `gen(cfg.window.gain in …)` and `instantiate(cfg.window.taps = 3)` are the
+/// milestone's only contract-surface change. They are resolved through a
+/// generated spec type, which is why a missing range is rustc's own
+/// `E0063: missing field` **naming the field** and a misspelled one is `E0560` —
+/// this macro never learns the struct's fields, so field coverage is delegated
+/// to the one component that does know them.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-4),
+    gen(
+        x in -10.0..=10.0,
+        y in 0.0..=0.0,
+        cfg.window.gain in 0.5..=2.0,
+        cfg.bias in -1.0..=1.0
+    ),
+    instantiate(cfg.window.taps = 3)
+)]
+#[cube(launch)]
+pub fn stage_window_sum(x: &Array<f32>, cfg: &StageArgs, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let mut acc = x[ABSOLUTE_POS];
+        // Loop bound from a comptime FIELD of a runtime struct: a plain host
+        // `u32` in the expand companion, so this lowers to a constant-bound
+        // `RangeLoop` exactly as a `#[comptime]` scalar parameter would.
+        for j in 1..cfg.window.taps {
+            let idx = ABSOLUTE_POS + j as usize;
+            if idx < x.len() {
+                acc += x[idx];
+            }
+        }
+        y[ABSOLUTE_POS] = acc * cfg.window.gain + cfg.bias;
+    }
+}
+
+vericl::cube_struct! {
+    /// A **device-local aggregate**: built inside a kernel body, never launched.
+    /// This is the shape the ecosystem actually uses — 19 of the corrected 20
+    /// sole-blocked sites are `#[cube]` helpers whose struct arguments are
+    /// values a caller built on the device, and 140 of the 165 surveyed struct
+    /// definitions derive `CubeType` only.
+    ///
+    /// It is also the shape that was **already accepted, ungated and unhashed**
+    /// (design §4.2 V3, §5.4 V6: 0/64 bit-differences and no diagnostic
+    /// anywhere). v1 does not invent the twin mapping — the author's own struct
+    /// IS the twin — it gates and hashes the one that already worked.
+    pub struct Accum {
+        /// Running value.
+        pub sum: f32,
+        /// Blend weight.
+        pub weight: f32,
+    }
+}
+
+/// Takes the device-local aggregate by value. Before this milestone a
+/// `#[vericl::helper]` with this signature compiled with **no diagnostic at
+/// all** and contributed nothing to any hash; now it folds
+/// `<Accum as vericl::StructIdentity>::STRUCT_HASH` into its own identity, and
+/// hence into every kernel that `uses(...)` it.
+#[vericl::helper]
+#[cube]
+pub fn accum_blend(acc: Accum) -> f32 {
+    acc.sum * acc.weight
+}
+
+/// The V6 shape end to end: a struct LITERAL in the kernel body (the body
+/// collection route) handed to a helper taking it by value (the signature
+/// route). Either route alone would leave the other open, which is why identity
+/// collection walks both. Wired into `vericl::suite!` — `tested` (bit-exact:
+/// one add and one multiply, no contraction shape) + `proved`.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(max_ulp = 0),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0),
+    uses(accum_blend)
+)]
+#[cube(launch)]
+pub fn accum_blend_map(x: &Array<f32>, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let acc = Accum { sum: x[ABSOLUTE_POS] + 1.0, weight: 0.5 };
+        y[ABSOLUTE_POS] = accum_blend(acc);
+    }
+}
+
+// --- The runtime-struct identity A/B, the flipped probe ---------------------
+//
+// The design's §4.1 measurement, reproduced as a permanent test. There, one
+// kernel built twice with only a `#[cube] impl Pair { fn fold }` body changed
+// computed a different function under a BIT-IDENTICAL recorded identity. Two
+// things changed:
+//
+// 1. that edit is now rejected outright — CS4 refuses an `impl` block inside a
+//    `vericl::cube_struct!` block, and the error names the measured divergence;
+// 2. the identity that stayed bit-identical now moves for every edit to the
+//    struct's DEFINITION, including the field REORDER that the positional
+//    `<Name>Launch::new` makes semantically load-bearing (design §4.3).
+//
+// Reproducing "the same kernel tokens, twice" needs the two copies to be
+// token-identical, so they live in two modules under the same names. The ONLY
+// difference between the modules is inside the `vericl::cube_struct!` block.
+// Not suite-wired — these are identity probes, not claim surfaces.
+
+/// Base variant: `Pair { a, b }`, twin computes `a * 3`.
+pub mod struct_identity_base {
+    use cubecl::prelude::*;
+
+    vericl::cube_struct! {
+        pub struct Pair {
+            pub a: u32,
+            pub b: u32,
+        }
+    }
+
+    #[vericl::helper]
+    #[cube]
+    pub fn fold_pair(p: Pair) -> u32 {
+        p.a * p.b
+    }
+
+    #[vericl::kernel(
+        assumes(x.len() == y.len()),
+        compare(exact),
+        gen(x in 0..=1000, y in 0..=0),
+        uses(fold_pair)
+    )]
+    #[cube(launch)]
+    pub fn pair_map(x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS < y.len() {
+            let p = Pair { a: x[ABSOLUTE_POS], b: 3 };
+            y[ABSOLUTE_POS] = fold_pair(p);
+        }
+    }
+}
+
+/// Reordered variant: byte-identical kernel and helper tokens, `Pair`'s two
+/// fields DECLARED in the other order. The twin still computes `a * 3` (VeriCL
+/// reads fields by name), and the launch constructor still fills them correctly
+/// (vericl emits it from the order it read) — but `STRUCT_HASH`, and therefore
+/// the kernel's recorded identity, must move.
+pub mod struct_identity_reordered {
+    use cubecl::prelude::*;
+
+    vericl::cube_struct! {
+        pub struct Pair {
+            pub b: u32,
+            pub a: u32,
+        }
+    }
+
+    #[vericl::helper]
+    #[cube]
+    pub fn fold_pair(p: Pair) -> u32 {
+        p.a * p.b
+    }
+
+    #[vericl::kernel(
+        assumes(x.len() == y.len()),
+        compare(exact),
+        gen(x in 0..=1000, y in 0..=0),
+        uses(fold_pair)
+    )]
+    #[cube(launch)]
+    pub fn pair_map(x: &Array<u32>, y: &mut Array<u32>) {
+        if ABSOLUTE_POS < y.len() {
+            let p = Pair { a: x[ABSOLUTE_POS], b: 3 };
+            y[ABSOLUTE_POS] = fold_pair(p);
+        }
+    }
+}
+
+// --- The pre-registered residual, made concrete and backstopped -------------
+//
+// Rust permits an inherent `impl` for a local type anywhere in the crate, so a
+// `#[cube] impl` written OUTSIDE the block is invisible to both `STRUCT_HASH`
+// and CS4 — `vericl::config!`'s risk 3, one parameter position over, and worse
+// in consequence: the device gets an expanded method body the twin's host method
+// need not match, so the failure mode is a numeric divergence rather than a
+// panic. Pinned by `tests/cube_struct_out_of_block_backstop.rs`.
+
+vericl::cube_struct! {
+    /// Declared, hashed, and gated — and with an out-of-block `#[cube] impl`
+    /// below that is none of those things.
+    pub struct EvasivePair {
+        /// First operand.
+        pub a: u32,
+        /// Second operand.
+        pub b: u32,
+    }
+}
+
+/// OUTSIDE the block: neither hashed nor gated. `#[cube]` emits both a host
+/// body (which the twin calls) and an expanded device body (which the kernel
+/// gets); nothing checks that they agree, and nothing folds this into identity.
+#[cube]
+impl EvasivePair {
+    /// The unhashed, ungated half.
+    pub fn fold(&self) -> u32 {
+        self.a * self.b
+    }
+}
+
+/// The evasion probe. Compiles — the declaration gate cannot see an impl written
+/// elsewhere — and is caught by the differential lane instead, because the
+/// value reaches a compared output. NOT suite-wired: a residual demonstrator,
+/// not a claim surface.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(exact),
+    gen(x in 0..=1000, y in 0..=0)
+)]
+#[cube(launch)]
+pub fn cube_struct_out_of_block_evasion(x: &Array<u32>, y: &mut Array<u32>) {
+    if ABSOLUTE_POS < y.len() {
+        let p = EvasivePair { a: x[ABSOLUTE_POS], b: 3 };
+        y[ABSOLUTE_POS] = p.fold();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

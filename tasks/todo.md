@@ -2934,3 +2934,130 @@ that compiles.
 **Gates:** full workspace test green on `--features wgpu` and `--features cpu`; clippy clean on both,
 all targets, zero warnings; demo-defects exit 0; the two config examples and both lanes green;
 `VERICL_UPDATE` run last.
+
+---
+
+## Runtime `CubeType` struct args — SOUNDNESS milestone — DONE 2026-07-27 (round 11)
+
+Design: `docs/design-cubetype-args.md` (measured against pinned `cubecl =0.10.0`, wgpu 29 / Metal on
+an M3, z3 4.16.0). The second consecutive #1-ranked frontier gate that resolved to "the gate does not
+exist; there is a hole instead" — and this one's hole was **live**, not hypothetical.
+
+### The hole this closes (reproduced, then flipped)
+
+A runtime `CubeType` struct parameter on a `#[vericl::helper]` was **silently accepted** — no
+diagnostic anywhere — with the struct's definition in **no hash**. With
+`#[cube] impl Pair { fn fold(&self) -> u32 }` edited from `self.a * self.b` to `self.a + self.b`, the
+reference twin moved from `[3, 6, 9, 12]` to `[4, 5, 6, 7]` while the kernel's `SOURCE_HASH`, the
+helper's `SOURCE_HASH` **and** `identity().source_hash` all stayed bit-identical, and evidence
+recorded against the first build verified FRESH against the second (design §4.1, probes V3/V4). A
+second hazard in the same family: `<Name>Launch::new` is **positional**, so swapping two same-typed
+fields in the *declaration* changed the computed function with the kernel body and the launch-call
+text byte-unchanged (§4.3, probe X2).
+
+Flipped in two independent places: the `#[cube] impl` edit is now rejected at the declaration, and
+every declaration edit — name, type, **order**, comptime-ness — moves the recorded identity.
+
+### What shipped
+
+- **`vericl::cube_struct! { … }`** (`crates/vericl-macros/src/cube_struct.rs`, 10 gates CS1–CS10):
+  re-emits each declared struct with the derives **the macro owns** (`CubeType`, `CubeLaunch`,
+  `Clone`, `Copy` — an author-chosen derive set is a silent capability switch), hashes the whole block
+  into `impl vericl::StructIdentity { const STRUCT_HASH }` (plus `ConfigIdentity` with the same hash,
+  so one type serves both parameter positions), and emits the positional `<T>Launch::new` and the
+  generation spec **from the field order it hashed**.
+- **The round-10 gate machinery is SHARED, not re-typed** — new `crates/vericl-macros/src/decl_block.rs`
+  holds the macro-agnostic half (the root-rebinding/glob gate from probe P5b, the std-derive
+  allowlist, the primitive/external-root name sets, the block hash), parameterized by macro name;
+  `config.rs` was refactored onto it with its 27 tests unchanged. What is *not* shared is each macro's
+  own subset decision (config's body gates have no counterpart — CS4 rejects `impl` blocks outright),
+  because one gate serving two different subsets is how a gate stops meaning anything.
+- **`ParamKind::Struct`** + the narrowing of `classify_param`'s `Type::Path(_) => Scalar` catch-all
+  (design §10.4 correction 1) — the catch-all *was* the silent acceptance.
+- **Identity folding from the signature AND the body**: `ParamKind::Struct` parameters, `Expr::Struct`
+  literals, and written-out `Type` positions (a `let p: Pair` annotation), deduplicated in
+  first-appearance order after the config hashes. Design risk 1 wanted all three; the body route is
+  what 19 of the corrected 20 ecosystem sites actually use.
+- **Dotted contract clauses** — `gen(p.field in lo..=hi)` and `instantiate(p.comptime_field = …)` at
+  any declared nesting depth, with category errors both ways.
+- **Zero prover / interpreter / `suite!` / evidence-schema changes**, as designed: a v1 struct is all
+  scalars, so it contributes no buffer and `BUFFER_PARAMS` is byte-unchanged.
+
+### The design decision that made it implementable
+
+The kernel-side macro **never learns the struct's fields** — it only sees the names the author wrote.
+So `cube_struct!` emits a hidden `<T>__VericlSpec` type and the kernel emits a *struct literal* of it
+built from the `gen`/`instantiate` clauses. Three gates fall out of one `const` item:
+
+1. **rustc's struct-literal exhaustiveness is the field-coverage gate** — a field with no range is
+   `E0063: missing field` naming it, a misspelled one is `E0560`, both at the kernel's own span, and
+   both work **across a crate boundary** where a macro-time registry could not;
+2. `const` is Rust's own purity guarantee on every pinned comptime value (E0015);
+3. there is exactly **one** binding, so `generate_case` and `kernel_definition()` provably read the
+   same tokens — design risk 6, structurally rather than by test.
+
+### Discrepancies with the design, reported not silently resolved
+
+1. **R2 over-rejected.** The design's §10.3 R2 rejects "a struct **or tuple**" return. A tuple of
+   scalars is shipped, suite-wired and differential-green (`fir_pair -> (F, F)`, and the `wrapping`
+   `counter_split -> (u32, u32)` behind `counter_split_map`), so that wording would have been a
+   regression dressed as a gate. Implemented for **struct/enum returns only**; a tuple of scalars
+   stays supported because it is destructured at the call site into values the compare modes compare.
+2. **R7 cannot be macro-authored.** The design puts the runtime-enum rejection "at the parameter's
+   span", but a proc macro has no name resolution and cannot tell a struct path from an enum path.
+   Resolved rustc-mediated: `cube_struct!` emits `StructIdentity` for structs only, so an enum in
+   runtime parameter position lands on the trait's `on_unimplemented`, which carries a dedicated enum
+   note. (Payload-carrying enums are *also* rejected at the declaration, where the macro can see them.)
+3. **`wrapping` × struct param: reject, not support.** §9's matrix says support. `WrappingFold` is
+   untyped and this macro cannot see a declared struct's field types (they live in a block it never
+   parsed), so it cannot certify they are all integers. Rejected with that reason stated; the §9 row
+   assumed the field types were visible on the kernel side.
+4. **Runtime field types narrowed to the six `NumKind` scalars.** §10.2 lists `usize`/`bool` as
+   admissible runtime field types; VeriCL has no scalar *draw* for either, so admitting them would
+   produce a struct parameter with no differential input. Both remain admissible as
+   `#[cube(comptime)]` fields.
+5. **Two gates added beyond CS1–CS8**: CS9 (named fields, at least one — the whole contract surface is
+   field-name-driven, and a unit struct has no definition an edit could move, which also closes design
+   risk 1's unit-struct route at the declaration instead of by an unreliable `Expr::Path` heuristic)
+   and CS10 (acyclic nesting graph — a recursive declared struct has no finite spec type).
+6. **Ergonomic note not in the design:** a `cube_struct!` block needs `cubecl::prelude` in scope, since
+   CubeCL's own derives expand to unqualified paths. Same requirement a `#[cube]` item has.
+
+### Evidence, tests, counts
+
+- **Three new suite-wired kernels**, all `tested` + `proved` on **both** lanes (wgpu/Metal and
+  cubecl-cpu): `uniform_value_map` (the restored `cubek-random` `Uniform` wrapper the survey's own
+  clean-room port had to drop — `abs = 1e-4`, `Proved{2}`), `stage_window_sum` (nested declared struct
+  + `#[cube(comptime)]` field + dotted clauses at depth 2 — `abs = 1e-4`, `Proved{3}`),
+  `accum_blend_map` (the device-local aggregate shape — `max_ulp = 0`, `Proved{2}`).
+- **Evidence added non-destructively**: the manifest diff is **194 insertions, 0 deletions** — every
+  pre-existing entry byte-identical, which is the milestone's own no-op criterion for struct-free
+  kernels, pinned as a permanent test.
+- `vericl-macros` unit tests **121 → 132** (11 kernel/helper-side) plus **18** new `cube_struct` gate
+  tests; two new integration files, `tests/cube_struct_identity.rs` (8 tests: the flipped probe, the
+  reorder A/B with its negative control, the struct-vs-flattened `ir_hash` tripwire with its
+  discrimination control, the body-literal route, the struct-free no-op, the comptime-field round
+  trip, the field-range assume) and `tests/cube_struct_out_of_block_backstop.rs` (4 tests).
+- **Independently re-ran the corrected classifier** (`recount.py` over the same six-crate scope): 97
+  gate-free (`fn_nontest` 20, impl/trait 72), 174 single-gate, and the corrected sole-blocker list of
+  20 site for site — matching the design's catalog exactly. Applied to
+  `docs/ecosystem-survey-2026-07.md` as a new addendum; `docs/design-struct-comptime.md` §4.4 carries
+  a correction marker rather than a rewrite.
+
+**Gates:** full workspace test green (456 tests, 0 failures); clippy clean on both feature sets
+(`--all-targets`, and `--features vericl-examples/cpu`), zero warnings; demo-defects exit 0 with every
+defect caught; `VERICL_UPDATE` run last.
+
+### Queued from this milestone (NOT fixed here — out of scope, design §4.4)
+
+- **`Array::new(...)` in a kernel body compiles under `#[vericl::kernel]` and panics only at twin
+  run time** with `Unexpanded Cube functions should not be called.` A **pre-existing ungated
+  device-only call** in the `docs/design-struct-comptime.md` §5.2 family — *not* a struct defect. The
+  runtime-struct design surfaced it while probing the corpus's `RowWise` shape (a device aggregate
+  with a register `Array::new` field, probe D2) and then **isolated it with no struct anywhere in the
+  kernel** (`scratchpad/cubetype/vcl/src/bin/arraynew.rs`, probe D2′) precisely so it could not be
+  mistaken for one. Recorded in `docs/design-cubetype-args.md` §4.4 and §10.5, and explicitly *not*
+  claimed by that design. It is the first thing an implementer will hit when they reach for array
+  fields (§10.5), so it should be closed before that milestone: the fix is a kernel-body gate in the
+  same family as the Float/Numeric reject list, rejecting device-only constructors at compile time
+  instead of at twin run time.

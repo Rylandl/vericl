@@ -134,30 +134,18 @@ use std::collections::{HashMap, HashSet};
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use sha2::{Digest, Sha256};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{Expr, Ident, Item, Type};
 
 use crate::FLOAT_METHOD_REJECT;
-
-/// Scalar primitives a config field may have, and the path roots a config body
-/// may qualify a call/read with. Deliberately closed: a config's fields are
-/// integer/bool/enum-valued by CubeCL's own construction (a `#[cube(launch)]`
-/// comptime type must be `Hash + Eq`, which `f32` is not — design §1.1), and
-/// anything outside this set is either a type whose definition the hash cannot
-/// see or a type whose values cannot be pinned.
-const PRIMITIVE_TYPES: &[&str] = &[
-    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "bool",
-    "char", "f32", "f64",
-];
-
-/// Path roots a config body may call through or read from besides the block's
-/// own declarations: the standard library, whose bodies are not user code, so
-/// not an identity concern. (`Self` is **not** here — it resolves to the
-/// enclosing `impl`'s type and its tail is checked against what the block
-/// declares for that type; see [`BodyGate::qualified_owner`].)
-const EXTERNAL_ROOTS: &[&str] = &["core", "std", "alloc"];
+// The macro-agnostic half of the round-10 gate hardening, shared with
+// `vericl::cube_struct!` rather than re-typed there (see `decl_block`'s module
+// doc for exactly which gates are shared and which deliberately are not).
+use crate::decl_block::{
+    EXTERNAL_ROOTS, PRIMITIVE_TYPES, STD_DERIVES, block_hash, derive_paths, is_std_derive,
+    render_path, std_derive_list,
+};
 
 /// G10 (purity): `core`/`std`/`alloc` **modules** a config body may not reach
 /// into, by second path segment. G4/G9 admit the standard library because its
@@ -272,21 +260,6 @@ const STD_METHOD_ALLOWLIST: &[&str] = &[
     "clone", "eq", "ne", "lt", "le", "gt", "ge", "cmp", "partial_cmp", "hash", "fmt", "default",
 ];
 
-/// The `std` derives a `vericl::config!` block admits, and the associated items
-/// each one contributes (so `TileCfg::default()` / `self.clone()` resolve
-/// against the block just like a hand-written item would).
-const STD_DERIVES: &[(&str, &[&str])] = &[
-    ("Clone", &["clone", "clone_from"]),
-    ("Copy", &[]),
-    ("Debug", &["fmt"]),
-    ("PartialEq", &["eq", "ne"]),
-    ("Eq", &[]),
-    ("Hash", &["hash"]),
-    ("Default", &["default"]),
-    ("PartialOrd", &["partial_cmp", "lt", "le", "gt", "ge"]),
-    ("Ord", &["cmp", "min", "max", "clamp"]),
-];
-
 /// Everything the block declares, by name — the allowlist G4/G6/G9 resolve
 /// against.
 #[derive(Default)]
@@ -347,7 +320,13 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
     check_return_types(&file, &declared, &mut errors);
     check_no_cube_attr(&file, &mut errors);
     check_derives(&file, &mut errors);
-    check_use_items(&file, &mut errors);
+    // G12 — shared with `vericl::cube_struct!`'s CS8 (round-10 probe P5b).
+    crate::decl_block::check_use_items(
+        &file,
+        "vericl::config!",
+        "G4/G9 resolve a call/read",
+        &mut errors,
+    );
     gate_bodies(&file, &declared, &mut errors);
 
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
@@ -361,9 +340,7 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
     // every method body. This is the input `SOURCE_HASH` structurally cannot
     // have (design §5.1) and the reason this macro is an item macro rather than
     // an attribute (design §6.2).
-    let mut hasher = Sha256::new();
-    hasher.update(ts.to_string().as_bytes());
-    let hash = format!("sha256:{:x}", hasher.finalize());
+    let hash = block_hash(&ts);
 
     let impls = declared.config_types.iter().map(|n| {
         quote! {
@@ -552,21 +529,6 @@ fn derived_assoc_items(attrs: &[syn::Attribute]) -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// Every path named inside a `#[derive(...)]` attribute on `attrs`.
-fn derive_paths(attrs: &[syn::Attribute]) -> Vec<syn::Path> {
-    let mut out = Vec::new();
-    for attr in attrs {
-        if !attr.path().is_ident("derive") {
-            continue;
-        }
-        let _ = attr.parse_nested_meta(|meta| {
-            out.push(meta.path.clone());
-            Ok(())
-        });
-    }
-    out
-}
-
 /// G11 (custom derives): a `#[derive]` outside the `std` set is the unhashed-impl
 /// sibling of G7's macro rejection. A derive macro is a `proc_macro_derive`: the
 /// *invocation* (`#[derive(Foo)]`) is in the tokens `CONFIG_HASH` covers, but
@@ -582,7 +544,7 @@ fn check_derives(file: &syn::File, errors: &mut Vec<syn::Error>) {
     let mut check = |attrs: &[syn::Attribute]| {
         for path in derive_paths(attrs) {
             let name = render_path(&path);
-            if STD_DERIVES.iter().any(|(n, _)| *n == name) {
+            if is_std_derive(&name) {
                 continue;
             }
             errors.push(syn::Error::new(
@@ -599,7 +561,7 @@ fn check_derives(file: &syn::File, errors: &mut Vec<syn::Error>) {
                      (gate G7). Allowed derives: {}. If the type needs a derive from another \
                      crate (`CubeType`, `serde::Serialize`, …), keep that type outside vericl and \
                      pin the values it would compute with instantiate(...)",
-                    STD_DERIVES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+                    std_derive_list()
                 ),
             ));
         }
@@ -613,60 +575,6 @@ fn check_derives(file: &syn::File, errors: &mut Vec<syn::Error>) {
             Item::Const(c) => check(&c.attrs),
             Item::Impl(i) => check(&i.attrs),
             _ => {}
-        }
-    }
-}
-
-/// G12 (root rebinding): a `use` inside the block may not introduce a name that
-/// G4/G9 resolve as an allowlisted root, and may not be a glob (which can
-/// introduce one invisibly).
-///
-/// Measured (round-10 review, probe P5b): `use crate::evil as core;` inside a
-/// config block re-pointed G4/G9's `core` root at user code, and
-/// `core::cmp::max(self.m, 1)` then evaluated to `self.m * 100` — a call into
-/// unhashed, ungated code that every gate waved through because it *spelled*
-/// `core`.
-fn check_use_items(file: &syn::File, errors: &mut Vec<syn::Error>) {
-    fn walk(tree: &syn::UseTree, errors: &mut Vec<syn::Error>) {
-        match tree {
-            syn::UseTree::Path(p) => walk(&p.tree, errors),
-            syn::UseTree::Group(g) => {
-                for t in &g.items {
-                    walk(t, errors);
-                }
-            }
-            syn::UseTree::Name(n) => reject_bound_root(&n.ident, errors),
-            syn::UseTree::Rename(r) => reject_bound_root(&r.rename, errors),
-            syn::UseTree::Glob(g) => errors.push(syn::Error::new(
-                g.star_token.span,
-                "a glob `use …::*;` inside a vericl::config! block is outside the vericl v1 \
-                 struct-comptime subset — G4/G9 resolve a call/read by the NAME of its path root \
-                 (`core`, `std`, `alloc`, a primitive), and a glob can bind any of those names to \
-                 user code without the block's tokens saying so. Import the items you need by \
-                 name",
-            )),
-        }
-    }
-    fn reject_bound_root(name: &Ident, errors: &mut Vec<syn::Error>) {
-        let s = name.to_string();
-        if EXTERNAL_ROOTS.contains(&s.as_str())
-            || PRIMITIVE_TYPES.contains(&s.as_str())
-            || s == "Self"
-        {
-            errors.push(syn::Error::new(
-                name.span(),
-                format!(
-                    "a `use … as {s};` inside a vericl::config! block rebinds a path root that \
-                     G4/G9 resolve BY NAME — after it, `{s}::…` in a config body would reach code \
-                     the block neither hashes nor gates while still spelling like the standard \
-                     library. Import it under a different name"
-                ),
-            ));
-        }
-    }
-    for item in &file.items {
-        if let Item::Use(u) = item {
-            walk(&u.tree, errors);
         }
     }
 }
@@ -1545,14 +1453,6 @@ impl<'ast> Visit<'ast> for BodyGate<'_> {
              subset — a macro's tokens are opaque to the gates above",
         ));
     }
-}
-
-fn render_path(path: &syn::Path) -> String {
-    path.segments
-        .iter()
-        .map(|s| s.ident.to_string())
-        .collect::<Vec<_>>()
-        .join("::")
 }
 
 #[cfg(test)]

@@ -17,11 +17,12 @@
 // Public surface. What a user's own code touches is small and stable:
 //
 //   * the macros — `#[vericl::kernel]`, `#[vericl::helper]`,
-//     `#[vericl::reference]`, `vericl::config!`, and `vericl::suite!` (the
-//     authoring interface);
+//     `#[vericl::reference]`, `vericl::config!`, `vericl::cube_struct!`, and
+//     `vericl::suite!` (the authoring interface);
 //   * the comparison vocabulary — [`Compare`];
 //   * the struct-comptime declaration trait — [`ConfigIdentity`] (implemented
-//     only by `vericl::config!`, never by hand);
+//     only by `vericl::config!`, never by hand), and its runtime counterpart
+//     [`StructIdentity`] (implemented only by `vericl::cube_struct!`);
 //   * the evidence-reading types — [`Manifest`], [`Entry`], [`Claim`],
 //     [`ClaimKind`], [`ClaimResult`], [`ContractRecord`], [`Identity`], and
 //     [`verify`] — for anyone parsing or checking an `evidence/*.json` file
@@ -60,12 +61,12 @@ pub use compare::{
     CompareReport, Mismatch, compare_exact_u32, compare_f32, compare_f32_absrel, compare_f64,
     compare_f64_absrel, ulp_distance_f32, ulp_distance_f64,
 };
-pub use contract::{Compare, ConfigIdentity, Contract, ContractRecord, Identity};
+pub use contract::{Compare, ConfigIdentity, Contract, ContractRecord, Identity, StructIdentity};
 pub use evidence::{
     CaseOutcome, Claim, ClaimKind, ClaimResult, Entry, Manifest, describe_case_outcome, verify,
 };
 pub use rng::SplitMix64;
-pub use vericl_macros::{config, helper, kernel, reference, suite};
+pub use vericl_macros::{config, cube_struct, helper, kernel, reference, suite};
 
 // --- Generated-code plumbing (pub for cross-crate use, hidden from docs) ---
 #[doc(hidden)]

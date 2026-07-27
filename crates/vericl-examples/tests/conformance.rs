@@ -164,6 +164,39 @@ vericl::suite! {
         // message about `F::dot` (design R6's measured false positive). Bit-exact
         // + proved.
         config_mode_scale,
+        // --- Runtime CubeType struct arguments (docs/design-cubetype-args.md) ---
+        // A `args: &UniformArgs` whose type is declared with
+        // `vericl::cube_struct! { … }`. CubeCL lowers a runtime struct parameter
+        // as a positional flattening of its fields at the struct's own parameter
+        // slot, so the IR is byte-identical to the same kernel written with loose
+        // scalars (measured three ways) and the prover needs no notion of a
+        // struct at all — `BUFFER_PARAMS` is unchanged and the bounds proof is
+        // the ordinary one.
+        //
+        // What the milestone adds is soundness: the helper half of this shape
+        // was accepted with NO diagnostic and in NO hash, so a `#[cube] impl`
+        // edit moved the twin from [3,6,9,12] to [4,5,6,7] with every recorded
+        // hash bit-identical (design §4.1). Each of these folds
+        // `<T as vericl::StructIdentity>::STRUCT_HASH` into its recorded
+        // identity, so any edit to the declaration — field name, type, ORDER, or
+        // comptime-ness — makes this evidence correctly stale.
+        //
+        // `uniform_value_map`: the restored ecosystem shape (§8) — the survey's
+        // clean-room port of cubek-random's `Uniform` had to DROP the `args:`
+        // wrapper; here it does not. `tested` (abs = 1e-4, the FMA-contraction
+        // shape) + `proved` bounds.
+        uniform_value_map,
+        // `stage_window_sum`: a NESTED declared struct and a `#[cube(comptime)]`
+        // field, with the dotted contract clauses that reach them
+        // (`gen(cfg.window.gain in …)`, `instantiate(cfg.window.taps = 3)`) —
+        // the other two thirds of the v1 field boundary. `tested` + `proved`.
+        stage_window_sum,
+        // `accum_blend_map`: the DEVICE-LOCAL aggregate, which is what 19 of the
+        // corrected 20 ecosystem sites actually do — a struct literal built in
+        // the kernel body and passed by value to a `#[vericl::helper]`. Exercises
+        // both identity-collection routes at once (body literal + helper
+        // signature). Bit-exact (`max_ulp = 0`) + proved.
+        accum_blend_map,
     ],
     evidence: "evidence/vericl.json",
     extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime),

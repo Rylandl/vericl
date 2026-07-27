@@ -1069,6 +1069,18 @@ pub(crate) fn build_conformance_items(
                 owned_tys.push(quote!(::std::vec::Vec<#elem>));
                 check_args.push(quote!(&#name));
             }
+            // A runtime `vericl::cube_struct!` parameter is cube-uniform by
+            // construction — it is a launch argument, so every thread in every
+            // cube sees the same value — which is why it threads through the
+            // cooperative path exactly as a scalar does (design §9).
+            ParamKind::Struct(ty) => {
+                field_names.push(name.clone());
+                let field = build_gen_field(p, &ranges, &lens, fn_name_str, None)?;
+                let stmt = &field.stmt;
+                draw_stmts.push(quote! { #stmt });
+                owned_tys.push(quote!(#ty));
+                check_args.push(quote!(#name));
+            }
             // #[comptime] params are baked into the twin as `let` consts and
             // spliced into `launch` as their pinned value — never drawn, never a
             // `generate_case`/`check_assumes` argument (mirrors the ordinary
@@ -1121,6 +1133,11 @@ pub(crate) fn build_conformance_items(
             ParamKind::Scalar(_) => {
                 reference_args.push(quote!(#name));
                 launch_args.push(quote!(#name));
+            }
+            ParamKind::Struct(ty) => {
+                let spec = crate::cube_struct::spec_type_path(ty).expect("classified struct param");
+                reference_args.push(quote!(#name));
+                launch_args.push(quote!(#spec::__vericl_launch_arg::<R>(&#name)));
             }
             ParamKind::ArrayRef(elem) => {
                 let handle = format_ident!("__vericl_{}_handle", name);

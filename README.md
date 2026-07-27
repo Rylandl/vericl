@@ -274,6 +274,104 @@ classifier with the (measured non-existent) struct-comptime gate removed moves g
 `trait` definitions, which `#[vericl::kernel]`/`#[vericl::helper]` (both `ItemFn`-based)
 structurally cannot annotate.
 
+### Runtime `CubeType` struct parameters: `vericl::cube_struct! { … }`
+
+The other parameter position. CubeCL also lets a `#[cube]` item take a **runtime** (non-`#[comptime]`)
+struct — `args: &MyStruct` where `MyStruct` derives `CubeType`/`CubeLaunch` — and lowers it as a
+**positional flattening of its fields** at that parameter's own slot, in field declaration order.
+That is measured three independent ways (`docs/design-cubetype-args.md` §2): the GPU output is
+bit-exact against the same kernel with the fields spelled as loose parameters, the `KernelDefinition`
+agrees buffer-for-buffer and scalar-for-scalar, and `kernel_ir_hash` is byte-identical. **The prover
+needs zero changes**, and the equality is re-asserted in-repo as a cubecl-upgrade tripwire
+(`tests/cube_struct_identity.rs::struct_and_flattened_spellings_have_identical_ir`).
+
+VeriCL accepted half of this shape before the milestone — the **helper** half — with *no diagnostic
+at all* and its definition in *no hash*. With a `#[cube] impl Pair { fn fold }` edited from
+`self.a * self.b` to `self.a + self.b`, the reference twin went from `[3, 6, 9, 12]` to
+`[4, 5, 6, 7]` while the kernel's `SOURCE_HASH`, the helper's `SOURCE_HASH` **and**
+`identity().source_hash` all stayed bit-identical: evidence recorded against the first build verified
+FRESH against the second. There is a second, launch-side hazard in the same family —
+`<Name>Launch::new` fills fields **by position**, so swapping two same-typed fields in the
+*declaration* changed the computed function with the kernel body and the launch-call text
+byte-unchanged.
+
+The declaration form closes both:
+
+```rust
+vericl::cube_struct! {
+    pub struct UniformArgs {
+        pub lower_bound: f32,
+        pub upper_bound: f32,
+    }
+}
+
+#[vericl::kernel(
+    assumes(s.len() == y.len(), args.lower_bound.abs() <= 100.0),
+    compare(abs = 1e-4),
+    gen(args.lower_bound in -100.0..=100.0, args.upper_bound in -100.0..=100.0, y in 0.0..=0.0),
+    uses(to_unit_interval)
+)]
+#[cube(launch)]
+pub fn uniform_value_map(s: &Array<u32>, args: &UniformArgs, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let scale = args.upper_bound - args.lower_bound;
+        y[ABSOLUTE_POS] = to_unit_interval(s[ABSOLUTE_POS]) * scale + args.lower_bound;
+    }
+}
+```
+
+Note what is *not* written: the `#[derive(CubeType, CubeLaunch)]`. The macro owns the derive set,
+because an author-chosen one is a silent capability switch — dropping `CubeLaunch` turns the type from
+launchable to device-local with every kernel's tokens unchanged. It also emits `Clone`/`Copy`, since
+the generated twin binds the struct by value.
+
+**The twin is your own struct.** A `#[derive(CubeType)]` struct of scalars is still an ordinary Rust
+struct, so there is no generated mirror type: the twin takes `args: UniformArgs`, `args.lower_bound`
+is ordinary field access, and the body tokens reach the twin unmodified. One token stream, two
+consumers — the same property `#[vericl::helper]` and `vericl::config!` rest on.
+
+**The v1 boundary.** A field must be one of:
+
+| field kind | admitted | why |
+|---|---|---|
+| runtime scalar | `f32` `f64` `u32` `i32` `u64` `i64` | generated exactly as a loose scalar parameter of that type is; `usize`/`bool` are comptime-only because there is no scalar draw for them |
+| nested struct | any struct declared in the **same** block | one block is one `STRUCT_HASH`, so a sibling-block type would contribute meaning without contributing to identity |
+| `#[cube(comptime)]` | integer, `bool`, `char`, or a unit enum declared in the same block | it keeps its positional launch slot but takes the plain host type; no float, because CubeCL's generated `CompilationArg` derives `Hash`/`Eq` and `f32` is neither |
+
+`Array`/`Tensor`/`Slice`/`View`/`Sequence`/`SharedMemory` fields are **deferred**, with a rejection
+that names all four missing pieces (a twin mirror type holding `&[T]`, a per-field entry in the
+compared-buffer set, per-field compare-tier selection, and a `gen(len(p.a = N))` form). They are
+measured working at the CubeCL level — the deferral is scope, not risk — and there are **zero**
+instances in the surveyed ecosystem.
+
+Also rejected, each with its own message: an `impl` block or `#[cube]` method inside the block (that
+is the measured divergence, verbatim); a generic declared struct; `&mut P`; a struct or enum
+**return** type from a kernel or helper (a tuple of scalars stays supported — it is destructured at
+the call site); a payload-carrying runtime enum; `wrapping` together with a struct parameter; and a
+`Vector` kernel with a struct parameter.
+
+**The contract surface grows by one thing: dotted names.** `gen(p.field in lo..=hi)` and
+`instantiate(p.comptime_field = …)`, at any declared nesting depth (`gen(cfg.window.gain in …)`).
+Every runtime field needs a range and every comptime field needs a pin — and that is checked by
+**rustc**, not by the macro: the clauses are emitted as a struct literal of a generated spec type, so
+a missing range is `E0063: missing field` naming the field and a misspelled one is `E0560`. That is
+also why it works across a crate boundary, where a macro-time registry could not.
+
+**The residual, stated plainly.** The same one `vericl::config!` has, and worse in consequence: a
+`#[cube] impl` written *outside* the block escapes both the hash and the gates, and because `#[cube]`
+emits a host body *and* a device body, the failure mode is a numeric divergence rather than a panic.
+There is no fix at macro scope. It is accepted because the differential lane catches any divergence
+that reaches an output and `ir_hash` moves whenever the value reaches the device — both pinned by
+`crates/vericl-examples/tests/cube_struct_out_of_block_backstop.rs`, including one assertion whose
+whole job is to state the residual so it cannot be quietly forgotten.
+
+**Honest reach.** As with struct-comptime, the value here is soundness, not coverage: of the ecosystem
+sites this gate was blocking, a v1 unlocks **zero** — every one carries a co-gate this feature does
+not touch (`Sequence`, device aggregates with `Slice`/`SharedMemory`/`View` fields, trait-generic or
+associated-type parameters, cmma). What the corpus pays is a **census correction** (the gate's
+sole-blocker count is 20, not 28, and 8 of the 28 needed nothing at all) and one live soundness hole
+closed. See `docs/ecosystem-survey-2026-07.md`'s addendum.
+
 ### f64 support: the cubecl-cpu-only tier
 
 `instantiate(F = f64)` monomorphizes a generic kernel at `f64` exactly like `F = f32`: the twin

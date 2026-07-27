@@ -35,6 +35,8 @@ use syn::{
 };
 
 mod config;
+mod cube_struct;
+mod decl_block;
 mod coop;
 mod suite;
 
@@ -280,8 +282,47 @@ const FLOAT_METHOD_REJECT: &[&str] = &[
 /// length pin (`len(name = N)`) that fixes an array parameter's generated
 /// length to a constant instead of the differential case size `n`.
 enum GenEntry {
-    Range { name: Ident, lo: Expr, hi: Expr },
-    Len { name: Ident, value: Expr },
+    Range {
+        name: Ident,
+        /// The dotted field path under `name` — empty for a plain scalar/array
+        /// parameter, `["lower_bound"]` for `gen(args.lower_bound in …)`, and
+        /// deeper for a nested declared struct (`gen(p.inner.k in …)`). Resolved
+        /// through the declared field graph by the `<T>__VericlSpec` literal the
+        /// kernel emits (docs/design-cubetype-args.md §5.5).
+        field_path: Vec<Ident>,
+        lo: Expr,
+        hi: Expr,
+    },
+    Len {
+        name: Ident,
+        /// Dotted form, kept only so `len(p.a = N)` gets the buffer-valued-field
+        /// deferral diagnosis rather than a parse error.
+        field_path: Vec<Ident>,
+        value: Expr,
+    },
+}
+
+/// `p` / `p.field` / `p.inner.k` — the key a dotted contract-clause entry is
+/// stored and reported under.
+fn dotted_key(name: &Ident, field_path: &[Ident]) -> String {
+    let mut s = name.to_string();
+    for f in field_path {
+        s.push('.');
+        s.push_str(&f.to_string());
+    }
+    s
+}
+
+/// Parse a trailing `.a.b.c` after an already-parsed head identifier.
+fn parse_field_path(input: ParseStream) -> syn::Result<Vec<Ident>> {
+    let mut out = Vec::new();
+    while input.peek(Token![.]) {
+        input.parse::<Token![.]>()?;
+        out.push(input.parse::<Ident>().map_err(|e| {
+            syn::Error::new(e.span(), format!("expected a field name after `.`: {e}"))
+        })?);
+    }
+    Ok(out)
 }
 
 impl Parse for GenEntry {
@@ -293,17 +334,22 @@ impl Parse for GenEntry {
             let target: Ident = content.parse().map_err(|e| {
                 syn::Error::new(e.span(), format!("expected `len(name = N)`: {e}"))
             })?;
+            let field_path = parse_field_path(&content)?;
             content.parse::<Token![=]>()?;
             let value: Expr = content.parse()?;
             if !content.is_empty() {
                 return Err(content.error("len(name = N) expects exactly one `name = N` entry"));
             }
-            return Ok(GenEntry::Len { name: target, value });
+            return Ok(GenEntry::Len { name: target, field_path, value });
         }
+        let field_path = parse_field_path(input)?;
         input.parse::<Token![in]>().map_err(|e| {
             syn::Error::new(
                 e.span(),
-                format!("expected `{name} in lo..=hi` or `len({name} = N)`: {e}"),
+                format!(
+                    "expected `{} in lo..=hi` or `len({name} = N)`: {e}",
+                    dotted_key(&name, &field_path)
+                ),
             )
         })?;
         let range: Expr = input.parse()?;
@@ -313,7 +359,7 @@ impl Parse for GenEntry {
                 end: Some(hi),
                 limits: RangeLimits::Closed(_),
                 ..
-            }) => Ok(GenEntry::Range { name, lo: *lo, hi: *hi }),
+            }) => Ok(GenEntry::Range { name, field_path, lo: *lo, hi: *hi }),
             other => Err(syn::Error::new(
                 other.span(),
                 "gen(...) ranges must be inclusive with both ends given: `name in lo..=hi`",
@@ -330,17 +376,26 @@ impl Parse for GenEntry {
 /// kernel signature is known, in `expand`, not here.
 struct InstantiateEntry {
     name: Ident,
+    /// The dotted field path under `name` — empty for a generic type parameter
+    /// or a `#[comptime]` parameter, `["inclusive"]` for
+    /// `instantiate(args.inclusive = false)`, which pins a `#[cube(comptime)]`
+    /// FIELD of a runtime struct parameter (docs/design-cubetype-args.md §5.5).
+    field_path: Vec<Ident>,
     value: Expr,
 }
 
 impl Parse for InstantiateEntry {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let name: Ident = input.parse()?;
+        let field_path = parse_field_path(input)?;
         input.parse::<Token![=]>().map_err(|e| {
-            syn::Error::new(e.span(), format!("expected `{name} = <value>`: {e}"))
+            syn::Error::new(
+                e.span(),
+                format!("expected `{} = <value>`: {e}", dotted_key(&name, &field_path)),
+            )
         })?;
         let value: Expr = input.parse()?;
-        Ok(InstantiateEntry { name, value })
+        Ok(InstantiateEntry { name, field_path, value })
     }
 }
 
@@ -2054,6 +2109,25 @@ enum ParamKind {
     /// generic-substituted, in the unlikely event it mentions the type
     /// param).
     Comptime(Type),
+    /// A **runtime** (non-`#[comptime]`) struct parameter — `p: P` or `p: &P`
+    /// where `P` is declared with `vericl::cube_struct! { … }`
+    /// (`docs/design-cubetype-args.md`).
+    ///
+    /// CubeCL lowers it as a positional flattening of its fields at this
+    /// parameter's own slot, in field declaration order (§2, measured three
+    /// ways), so it contributes **no buffer** in the v1 subset — every field is
+    /// a launch scalar, a nested declared struct of them, or a
+    /// `#[cube(comptime)]` constant. `BUFFER_PARAMS` and the prover are
+    /// therefore untouched: this variant pushes nothing, the way `Scalar` and
+    /// `Comptime` already do (§7, discharged by handing the flattened lane's
+    /// obligations to the struct lane's IR and getting the same
+    /// `Proved { obligations: 2 }`).
+    ///
+    /// The twin binds the author's own struct **by value** — a
+    /// `#[derive(CubeType)]` struct of scalars is still an ordinary Rust struct,
+    /// so no generated mirror type is needed and the body tokens reach the twin
+    /// unmodified (§5.4). `T` is the written type, already generic-substituted.
+    Struct(Type),
 }
 
 struct Param {
@@ -2074,6 +2148,43 @@ fn fn_arg_ident(pt: &PatType) -> syn::Result<Ident> {
         ));
     };
     Ok(pi.ident.clone())
+}
+
+/// The names of a signature's **runtime struct** parameters, decided from the
+/// raw (unsubstituted) signature.
+///
+/// A pre-pass, for the same reason `comptime_param_names` is one:
+/// `resolve_instantiate` runs *before* `classify_param`, because classification
+/// needs the generic substitution `instantiate(...)` produces. The rule is the
+/// classifier's, minus what the substitution would change — a bare generic
+/// parameter name (`p: F`) is excluded, since it becomes whatever
+/// `instantiate(F = …)` pins.
+fn pre_pass_struct_param_names(
+    inputs: &syn::punctuated::Punctuated<FnArg, Token![,]>,
+    generic_param_names: &[Ident],
+) -> Vec<Ident> {
+    let mut out = Vec::new();
+    for arg in inputs {
+        if is_comptime_param(arg) {
+            continue;
+        }
+        let FnArg::Typed(pt) = arg else { continue };
+        let Ok(name) = fn_arg_ident(pt) else { continue };
+        let ty = match pt.ty.as_ref() {
+            Type::Reference(r) => r.elem.as_ref(),
+            other => other,
+        };
+        let Some(ty) = plain_struct_param_type(ty) else { continue };
+        let Type::Path(tp) = &ty else { continue };
+        let is_generic = tp
+            .path
+            .get_ident()
+            .is_some_and(|i| generic_param_names.iter().any(|g| g == i));
+        if !is_generic {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// `true` if `arg` carries a (the only recognized) `#[comptime]` parameter
@@ -2131,6 +2242,149 @@ fn config_comptime_types(params: &[Param]) -> Vec<Type> {
         }
     }
     out
+}
+
+/// Design R2 — gate a kernel's or helper's **return type**.
+///
+/// Measured (`docs/design-cubetype-args.md` §3.1 correction 1b, probe V5):
+/// VeriCL gated helper return types not at all, so `-> Pair` compiled today with
+/// no diagnostic — the same class of silent acceptance as the parameter hole,
+/// on the other side of the ledger. It matters more once runtime structs exist,
+/// because a returned aggregate is a value the twin and the device body each
+/// construct independently and no compare mode compares per field.
+///
+/// **Narrowed from the design's R2, which said "a struct OR TUPLE".** A tuple of
+/// scalars is *shipped, suite-wired and differential-green* today —
+/// `fir_pair<F: Float>(a: F, b: F) -> (F, F)` and the `wrapping`
+/// `counter_split(z: u32) -> (u32, u32)` behind `counter_split_map` — because a
+/// tuple is destructured at the call site into scalars, which the existing
+/// compare modes do compare. Rejecting it would have been a regression dressed
+/// as a gate, so the rejection is for **struct/enum** returns only. The design's
+/// §10.3 R2 wording is corrected accordingly.
+///
+/// `ty` must already be `instantiate(...)`-substituted, so a `-> F` is checked
+/// as the concrete type it was pinned to.
+fn is_admissible_twin_return_type(ty: &Type) -> bool {
+    match ty {
+        // `()` and tuples of admissible components.
+        Type::Tuple(t) => t.elems.iter().all(is_admissible_twin_return_type),
+        Type::Paren(p) => is_admissible_twin_return_type(&p.elem),
+        Type::Group(g) => is_admissible_twin_return_type(&g.elem),
+        // A generic-argument-carrying path (`Line<F, 4>`, `Sequence<T>`,
+        // `Value<Vector<u32, N>>`) is not a scalar and is owned by the container
+        // milestones; a bare non-scalar path is a struct or enum.
+        Type::Path(tp) => is_scalar_param_type(tp),
+        _ => false,
+    }
+}
+
+/// The R2 rejection, shared by the kernel and helper paths.
+fn check_twin_return_type(
+    output: &ReturnType,
+    subst: &GenericSubst,
+    item_kind: &str,
+    fn_name_str: &str,
+) -> syn::Result<()> {
+    let ReturnType::Type(_, ty) = output else { return Ok(()) };
+    let substituted: Type = syn::parse2(subst_type_tokens(ty.to_token_stream(), subst))
+        .unwrap_or_else(|_| (**ty).clone());
+    if is_admissible_twin_return_type(&substituted) {
+        return Ok(());
+    }
+    Err(syn::Error::new(
+        ty.span(),
+        format!(
+            "a `#[vericl::{item_kind}]` may not return `{}` in the vericl v0 subset — a returned \
+             struct, enum or container is a value the reference twin and the device body each \
+             construct independently, and vericl has no per-field comparison for a returned \
+             aggregate, so a divergence inside it would be invisible unless it happened to reach a \
+             compared `&mut Array` output. Return the fields as separate scalars (a TUPLE of \
+             scalars IS supported — it is destructured at the call site), or take a \
+             `&mut Array<T>` out-parameter. (`{fn_name_str}` was accepted with no diagnostic at \
+             all before the CubeType-args milestone — docs/design-cubetype-args.md §3.1, probe V5.)",
+            substituted.to_token_stream()
+        ),
+    ))
+}
+
+/// The distinct **runtime CubeType struct** types a kernel or helper must fold
+/// a `StructIdentity` for: every one reachable from its signature or its body,
+/// in first-appearance order (signature left-to-right, then body in source
+/// order), deduplicated by type token text.
+///
+/// Three collection routes, and the design's ranked risk 1 is exactly the
+/// argument for having all three:
+///
+/// 1. **`ParamKind::Struct` parameters** — the signature route.
+/// 2. **`Expr::Struct` literals** — `Pair { a: x[i], b: 3 }` built in the body
+///    and handed to a helper. This is what 19 of the corrected 20 ecosystem
+///    sites do, and it is the route the reproduced probe used.
+/// 3. **written-out `Type` positions** — a `let p: Pair = …` annotation names
+///    the type with no literal at all, which would otherwise let an author
+///    mention a struct, edit its definition, and show the identity unmoved.
+///
+/// Deliberately over-inclusive rather than under: a body naming ANY non-scalar
+/// plain path type in a `let` annotation or constructing ANY struct literal is
+/// required to have declared it. A false positive is a compile error naming
+/// `vericl::cube_struct!`; a false negative is the hole this milestone exists to
+/// close. (The remaining route — a unit-struct *path* expression — is closed on
+/// the declaration side instead: CS9 rejects unit and tuple structs, and a unit
+/// struct has no fields, so the only way to change what it means is an
+/// out-of-block `#[cube] impl`, which is the pre-registered residual pinned by
+/// `tests/cube_struct_out_of_block_backstop.rs`.)
+fn runtime_struct_types(
+    params: &[Param],
+    body: &syn::Block,
+    generic_param_names: &[Ident],
+) -> Vec<Type> {
+    struct Collect<'a> {
+        seen: HashSet<String>,
+        out: Vec<Type>,
+        /// The item's own generic type parameters. The body walk sees the
+        /// **unsubstituted** source, so a `fir_pair::<F>(a, b)` turbofish and a
+        /// `let s: (F, F)` annotation both put `F` in `Type` position — and `F`
+        /// is not a declared cube struct, it is whatever `instantiate(F = …)`
+        /// pinned (which arrives already substituted through the *signature*
+        /// route above).
+        generics: &'a [Ident],
+    }
+    impl Collect<'_> {
+        fn push(&mut self, ty: &Type) {
+            let Some(t) = plain_struct_param_type(ty) else { return };
+            if let Type::Path(tp) = &t {
+                if let Some(id) = tp.path.get_ident() {
+                    // `Self` is never a declared cube struct here, and a generic
+                    // parameter name is not a type at all in the generated code.
+                    if id == "Self" || self.generics.iter().any(|g| g == id) {
+                        return;
+                    }
+                }
+            }
+            if self.seen.insert(t.to_token_stream().to_string()) {
+                self.out.push(t);
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Collect<'_> {
+        fn visit_expr_struct(&mut self, i: &'ast syn::ExprStruct) {
+            let ty = Type::Path(syn::TypePath { qself: None, path: i.path.clone() });
+            self.push(&ty);
+            syn::visit::visit_expr_struct(self, i);
+        }
+        fn visit_type(&mut self, i: &'ast Type) {
+            self.push(i);
+            syn::visit::visit_type(self, i);
+        }
+    }
+
+    let mut c = Collect { seen: HashSet::new(), out: Vec::new(), generics: generic_param_names };
+    for p in params {
+        if let ParamKind::Struct(ty) = &p.kind {
+            c.push(ty);
+        }
+    }
+    c.visit_block(body);
+    c.out
 }
 
 /// Design R2 — the **pinnable expression** allowlist for a struct-typed
@@ -2267,23 +2521,77 @@ fn classify_param(arg: &FnArg) -> syn::Result<Param> {
                 };
                 return Ok(Param { name, kind });
             }
-            let elem = elem_of_array(&r.elem).ok_or_else(|| {
-                syn::Error::new(
-                    r.span(),
-                    "reference parameters must be &Array<T>, &mut Array<T>, or a core \
-                     &Slice<T>/&SliceMut<T> (helper params) in the vericl v0 subset",
-                )
-            })?;
-            if r.mutability.is_some() {
-                Ok(Param { name, kind: ParamKind::ArrayMut(elem) })
-            } else {
-                Ok(Param { name, kind: ParamKind::ArrayRef(elem) })
+            if let Some(elem) = elem_of_array(&r.elem) {
+                return Ok(Param {
+                    name,
+                    kind: if r.mutability.is_some() {
+                        ParamKind::ArrayMut(elem)
+                    } else {
+                        ParamKind::ArrayRef(elem)
+                    },
+                });
             }
+            // A `&P` / `&mut P` for a non-buffer path type: a runtime struct
+            // parameter, which VeriCL rejected wholesale before the CubeType-args
+            // milestone (design §4.2, probe V1). `&P` is now the same parameter
+            // as `P` — CubeCL strips `&`/`&mut` on a helper parameter anyway
+            // (`parse/kernel.rs:767-786`) and the twin binds by value either way.
+            if let Some(ty) = plain_struct_param_type(&r.elem) {
+                if r.mutability.is_some() {
+                    // Design R8.
+                    return Err(syn::Error::new(
+                        r.span(),
+                        format!(
+                            "a runtime struct parameter must be taken by value or by shared \
+                             reference — `&mut {}` differs from `&{}` only for buffer-valued \
+                             fields (a `&mut` struct routes EVERY field through `expand_output`, \
+                             so its array fields become ReadWrite bindings — measured, \
+                             docs/design-cubetype-args.md §2.4 X7), and buffer-valued fields are \
+                             deferred in the v1 subset, so `&mut` here would declare an output \
+                             that cannot exist. Write `{}: {}` or `{}: &{}`",
+                            ty.to_token_stream(),
+                            ty.to_token_stream(),
+                            name,
+                            ty.to_token_stream(),
+                            name,
+                            ty.to_token_stream(),
+                        ),
+                    ));
+                }
+                return Ok(Param { name, kind: ParamKind::Struct(ty) });
+            }
+            Err(syn::Error::new(
+                r.span(),
+                "reference parameters must be &Array<T>, &mut Array<T>, or a core \
+                 &Slice<T>/&SliceMut<T> (helper params) in the vericl v0 subset",
+            ))
         }
-        Type::Path(_) => Ok(Param {
-            name,
-            kind: ParamKind::Scalar(pt.ty.as_ref().clone()),
-        }),
+        // The catch-all this arm used to be (`Type::Path(_) => Scalar`) is
+        // exactly what swallowed every by-value struct parameter: a helper's
+        // `p: Pair` was accepted with NO diagnostic at all and no identity
+        // coverage (design §4.2 V3, §10.4 correction 1), and a kernel's was
+        // misdiagnosed by `build_gen_field` as a `gen(...)` problem. Narrowing
+        // it to the written-out scalar set is what lets `ParamKind::Struct`
+        // exist and what makes both diagnoses correct.
+        Type::Path(tp) if is_scalar_param_type(tp) => {
+            Ok(Param { name, kind: ParamKind::Scalar(pt.ty.as_ref().clone()) })
+        }
+        Type::Path(_) => match plain_struct_param_type(pt.ty.as_ref()) {
+            Some(ty) => Ok(Param { name, kind: ParamKind::Struct(ty) }),
+            None => Err(syn::Error::new(
+                pt.ty.span(),
+                format!(
+                    "unsupported parameter type in the vericl v0 subset — `{}: {}` is neither a \
+                     scalar (f32/f64/u32/i32/u64/i64/usize/bool) nor a plain path naming a struct \
+                     declared with `vericl::cube_struct! {{ … }}`. A generic-argument-carrying type \
+                     in value position (`Sequence<T>`, `View<T>`, `ComptimeOption<T>`) is outside \
+                     the subset: a vericl cube struct may not be generic, and the container \
+                     milestones own those types",
+                    name,
+                    pt.ty.to_token_stream()
+                ),
+            )),
+        },
         other => Err(syn::Error::new(
             other.span(),
             "unsupported parameter type in the vericl v0 subset — a kernel/helper parameter must \
@@ -2291,6 +2599,47 @@ fn classify_param(arg: &FnArg) -> syn::Result<Param> {
              `&Slice<T>`/`&SliceMut<T>` (helper params only), or a `#[comptime]` scalar",
         )),
     }
+}
+
+/// `true` iff a value parameter's path type is a written-out scalar primitive —
+/// the set the `Type::Path(_) => Scalar` catch-all is narrowed to (design §10.4
+/// correction 1). Matched by trailing segment, like `is_wrapping_integer_type`,
+/// so `std::primitive::u32` counts; a generic-argument-carrying path never does.
+///
+/// This is the same list as [`COMPTIME_SCALAR_TYPES`] on purpose: the two
+/// parameter positions must agree on what "a scalar" is, or a type could be a
+/// config in one and a runtime struct in the other.
+fn is_scalar_param_type(tp: &syn::TypePath) -> bool {
+    if tp.qself.is_some() {
+        return false;
+    }
+    let Some(last) = tp.path.segments.last() else { return false };
+    matches!(last.arguments, syn::PathArguments::None)
+        && COMPTIME_SCALAR_TYPES.contains(&last.ident.to_string().as_str())
+}
+
+/// If `ty` is a plain path with no generic arguments and no qself — the shape a
+/// `vericl::cube_struct!`-declared type has (CS3 forbids generics) — return it.
+///
+/// Deliberately *not* "looks like a struct": the point is that every non-scalar
+/// plain path in runtime parameter position goes through the `StructIdentity`
+/// requirement, so an unrecognized shape is *gated* by rustc rather than waved
+/// through. An undeclared type therefore fails E0277 with the trait's
+/// `#[diagnostic::on_unimplemented]` message naming `vericl::cube_struct!`
+/// (design R1), at the parameter type's own span.
+fn plain_struct_param_type(ty: &Type) -> Option<Type> {
+    let Type::Path(tp) = ty else { return None };
+    if tp.qself.is_some() {
+        return None;
+    }
+    let last = tp.path.segments.last()?;
+    if !matches!(last.arguments, syn::PathArguments::None) {
+        return None;
+    }
+    if COMPTIME_SCALAR_TYPES.contains(&last.ident.to_string().as_str()) {
+        return None;
+    }
+    Some(ty.clone())
 }
 
 /// If `ty` is `Array<T>` (with any path prefix), return `T`.
@@ -2501,6 +2850,12 @@ struct InstantiatePlan {
     /// `"F = f32"`, `"taps = 3"`, ... — pretty-printed, in clause order, for
     /// `Contract::instantiate`.
     pretty: Vec<String>,
+    /// `instantiate(p.field = …)` pins for `#[cube(comptime)]` FIELDS of a
+    /// runtime struct parameter, keyed by the dotted name. Spliced into the
+    /// `<T>__VericlSpec` const the kernel emits — which is the single binding
+    /// both `generate_case` and `kernel_definition()` read, so the same tokens
+    /// provably reach both consumers (design risk 6).
+    field_pins: HashMap<String, TokenStream2>,
 }
 
 /// Gate and resolve the `instantiate(...)` clause against the kernel's
@@ -2518,6 +2873,7 @@ fn resolve_instantiate(
     fn_name_str: &str,
     generic_params: &[Ident],
     comptime_params: &[Ident],
+    struct_params: &[Ident],
 ) -> syn::Result<InstantiatePlan> {
     let needs_instantiate = !generic_params.is_empty() || !comptime_params.is_empty();
 
@@ -2548,10 +2904,17 @@ fn resolve_instantiate(
             width_args: Vec::new(),
             launch_generic_types: Vec::new(),
             pretty: Vec::new(),
+            field_pins: HashMap::new(),
         });
     };
 
-    if !needs_instantiate {
+    // A struct parameter alone never *requires* the clause (the declared struct
+    // may have no `#[cube(comptime)]` field, and this macro cannot see its
+    // fields — a missing pin surfaces as rustc's own `E0063: missing field` on
+    // the generated `<T>__VericlSpec` literal, naming the field). It does make
+    // the clause legitimate, so the "unused instantiation" rejection below must
+    // not fire for it.
+    if !needs_instantiate && struct_params.is_empty() {
         return Err(syn::Error::new(
             *clause_span,
             format!(
@@ -2574,12 +2937,13 @@ fn resolve_instantiate(
     // the `usize` cubecl's `expand`/`launch` take per `Size` generic.
     let mut width_vals: HashMap<String, LitInt> = HashMap::new();
     let mut comptime_values: HashMap<String, TokenStream2> = HashMap::new();
+    let mut field_pins: HashMap<String, TokenStream2> = HashMap::new();
     let mut seen: HashMap<String, proc_macro2::Span> = HashMap::new();
     let mut pretty_entries: Vec<String> = Vec::new();
     let mut errors: Vec<syn::Error> = Vec::new();
 
     for entry in entries {
-        let key = entry.name.to_string();
+        let key = dotted_key(&entry.name, &entry.field_path);
         if let Some(prev) = seen.get(&key) {
             let mut e = syn::Error::new(
                 entry.name.span(),
@@ -2591,6 +2955,61 @@ fn resolve_instantiate(
         }
         seen.insert(key.clone(), entry.name.span());
         pretty_entries.push(format!("{} = {}", key, pretty(&entry.value)));
+
+        // --- the dotted form: `instantiate(p.field = …)` pins a
+        // `#[cube(comptime)]` FIELD of a runtime struct parameter.
+        if !entry.field_path.is_empty() {
+            if !struct_params.contains(&entry.name) {
+                errors.push(syn::Error::new(
+                    entry.name.span(),
+                    format!(
+                        "instantiate(...) names `{key}`, but `{}` is not a runtime struct \
+                         parameter of {item_kind} `{fn_name_str}` — the dotted form pins a \
+                         `#[cube(comptime)]` FIELD of a `vericl::cube_struct!` parameter, and \
+                         nothing else has fields to pin",
+                        entry.name
+                    ),
+                ));
+                continue;
+            }
+            if !is_pinnable_config_expr(&entry.value) {
+                errors.push(syn::Error::new(
+                    entry.value.span(),
+                    format!(
+                        "instantiate(...) value for the `#[cube(comptime)]` struct field `{key}` \
+                         must be a literal, a path to a `const`/unit variant, or a call to a \
+                         `const fn` with pinnable arguments — `{}` is an arbitrary host \
+                         expression, which vericl cannot pin: a comptime field is baked into the \
+                         kernel at expansion AND materialised in the reference twin's struct \
+                         value, so a value that varies between evaluations makes the recorded \
+                         evidence describe a kernel that was never run",
+                        pretty(&entry.value)
+                    ),
+                ));
+                continue;
+            }
+            field_pins.insert(key, entry.value.to_token_stream());
+            continue;
+        }
+
+        // Design risk 5: pinning a whole RUNTIME struct is meaningless — its
+        // runtime fields are generated per case, not fixed — and must be a
+        // category error rather than silently treated as a generic type pin.
+        if struct_params.contains(&entry.name) {
+            errors.push(syn::Error::new(
+                entry.name.span(),
+                format!(
+                    "instantiate(...) pins `{key}`, which is a RUNTIME struct parameter of \
+                     {item_kind} `{fn_name_str}` — a runtime struct is generated per differential \
+                     case from its declared `gen({key}.field in lo..=hi)` ranges, not pinned to \
+                     one value, so pinning the whole struct would claim a constant the kernel \
+                     never receives. Pin its `#[cube(comptime)]` FIELDS individually \
+                     (`instantiate({key}.some_flag = false)`) and give its runtime fields \
+                     `gen(...)` ranges"
+                ),
+            ));
+            continue;
+        }
 
         if generic_params.contains(&entry.name) {
             match &entry.value {
@@ -2715,6 +3134,7 @@ fn resolve_instantiate(
         width_args,
         launch_generic_types,
         pretty: pretty_entries,
+        field_pins,
     })
 }
 
@@ -2758,6 +3178,31 @@ pub fn suite(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn config(input: TokenStream) -> TokenStream {
     match config::expand(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// `vericl::cube_struct! { <the runtime struct type(s)> }` — the declaration
+/// form for a **runtime** (non-`#[comptime]`) `CubeType` struct parameter's
+/// type.
+///
+/// Re-emits each declared struct with the `CubeType`/`CubeLaunch`/`Clone`/`Copy`
+/// derives the macro owns, hashes the whole block into
+/// `impl ::vericl::StructIdentity for T { const STRUCT_HASH }` (and
+/// `ConfigIdentity` with the same hash, so one type may serve both parameter
+/// positions), and emits the positional `<T>Launch::new` constructor and the
+/// generation spec from the field order it hashed. A kernel or helper taking
+/// `p: T` / `p: &T`, or constructing a `T { … }` literal in its body, folds
+/// `T`'s `STRUCT_HASH` into its recorded identity — which is what closes the
+/// hole measured live at `e5589f3`, where a `#[cube] impl` edit moved the
+/// reference twin from `[3, 6, 9, 12]` to `[4, 5, 6, 7]` with every recorded
+/// hash bit-identical. See `cube_struct::expand`'s module doc for the gate table
+/// and the precise residual, and `docs/design-cubetype-args.md` for the
+/// measurements behind it.
+#[proc_macro]
+pub fn cube_struct(input: TokenStream) -> TokenStream {
+    match cube_struct::expand(input.into()) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -2867,6 +3312,8 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         })
         .collect::<syn::Result<_>>()?;
 
+    let struct_param_names =
+        pre_pass_struct_param_names(&func.sig.inputs, &generic_param_names);
     let plan = resolve_instantiate(
         &spec.instantiate,
         func.sig.span(),
@@ -2874,6 +3321,7 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         &fn_name_str,
         &generic_param_names,
         &comptime_param_names,
+        &struct_param_names,
     )?;
 
     // --- uses(...): register this kernel's helper-composition dependency
@@ -2963,6 +3411,10 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         &fn_name_str,
     )?;
 
+    // Design R2 (docs/design-cubetype-args.md §10.4 correction 3): return types
+    // were ungated, so `-> Pair` compiled with no diagnostic (probe V5).
+    check_twin_return_type(&func.sig.output, &plan.generic_subst, "kernel", &fn_name_str)?;
+
     // --- design R2, the recognizing half: a struct-typed #[comptime]
     // parameter's `instantiate(...)` value must be a pinnable expression form.
     // See `is_pinnable_config_expr` for what that means and why the emitted
@@ -3009,6 +3461,17 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 ParamKind::ArrayRef(elem) | ParamKind::ArrayMut(elem) => {
                     (is_wrapping_integer_type(elem), elem.span())
                 }
+                // A runtime struct parameter under `wrapping` is rejected, and
+                // the reason is the gate's own reason: `WrappingFold` is
+                // UNTYPED, and this macro cannot see a declared struct's field
+                // types (they live in a `vericl::cube_struct!` block it never
+                // parsed), so it cannot certify that every field the body
+                // touches is an integer. Without the gate the failure is still
+                // loud but obscure — `f32` has no `wrapping_add`, so generated
+                // twin code fails to compile at a span the author never wrote.
+                // This narrows `docs/design-cubetype-args.md` §9's "support"
+                // row, which assumed the field types were visible here.
+                ParamKind::Struct(ty) => (false, ty.span()),
             };
             if !ok {
                 return Err(syn::Error::new(
@@ -3016,7 +3479,9 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                     "`wrapping` is outside the vericl v0 subset for this kernel: every parameter \
                      must be an integer scalar or integer Array (u32/i32/u64/i64) when \
                      `wrapping` is declared — the fold is untyped and must not silently touch \
-                     float math",
+                     float math. A runtime `vericl::cube_struct!` parameter is rejected for the \
+                     same reason one step removed: its field types live in a declaration block \
+                     this macro never parsed, so vericl cannot certify they are all integers",
                 ));
             }
         }
@@ -3286,6 +3751,28 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         identity_dep_exprs
             .push(quote!(<#ty as ::vericl::ConfigIdentity>::CONFIG_HASH.to_string()));
     }
+    // --- runtime CubeType struct types: one identity dependency per distinct
+    // type reachable from the SIGNATURE or the BODY, appended after the config
+    // hashes in first-appearance order (docs/design-cubetype-args.md §6).
+    //
+    // The body clause is not decoration — it is what closes the measured hole.
+    // The reproduced probe passes the struct by parameter to a helper *and*
+    // constructs it with a literal in the kernel, and either route alone would
+    // have left the other open: a kernel that only builds `Pair { … }` and
+    // hands it to an already-covered helper would otherwise fold nothing of its
+    // own, and a `let p: Pair = …` annotation names the type with no literal at
+    // all (design risk 1, the direct descendant of round 10's P1/P5b/P7).
+    //
+    // Naming `<T as ::vericl::StructIdentity>::STRUCT_HASH` is also what
+    // *requires* the declaration: an undeclared type has no impl, so the kernel
+    // fails E0277 with the trait's `#[diagnostic::on_unimplemented]` message
+    // naming `vericl::cube_struct!` (design R1) at the offending span. THAT is
+    // the fix for the silent acceptance measured at `e5589f3` (probe V3).
+    let struct_types = runtime_struct_types(&params, &func.block, &generic_param_names);
+    for ty in &struct_types {
+        identity_dep_exprs
+            .push(quote!(<#ty as ::vericl::StructIdentity>::STRUCT_HASH.to_string()));
+    }
 
     // --- design R2, the enforcing half: bind every struct-typed comptime
     // parameter's pinned value to a `const` of its own type, so rustc must
@@ -3313,6 +3800,17 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         })
         .collect();
 
+    // --- runtime struct parameters: the generation/launch spec `const`s (see
+    // `build_struct_spec_consts`). Resolved from the same `gen(...)` clause
+    // `build_conformance_items` resolves below — deterministically, so the two
+    // agree by construction.
+    let struct_spec_consts = if params.iter().any(|p| matches!(p.kind, ParamKind::Struct(_))) {
+        let (spec_ranges, _) = resolve_gen_entries(&params, &spec.gen_entries, &fn_name_str)?;
+        build_struct_spec_consts(&params, &spec_ranges, &plan.field_pins, &fn_name_str)?
+    } else {
+        Vec::new()
+    };
+
     // --- generated signatures ---
     let mod_name = Ident::new(&format!("{fn_name}_vericl"), fn_name.span());
     let vis = &func.vis;
@@ -3339,6 +3837,14 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                     let e = twin_elem(elem);
                     Some(quote!(#name: &mut [#e]))
                 }
+                // The struct IS the twin (design §5.4): a `#[derive(CubeType)]`
+                // struct of scalars is still an ordinary Rust struct, so the
+                // twin binds the author's own type by value and the body's
+                // `args.field` tokens reach it unmodified. No generated mirror
+                // type — that becomes necessary only when array fields land, and
+                // generating one early would freeze a shape before its
+                // requirements are known.
+                ParamKind::Struct(ty) => Some(quote!(#name: #ty)),
                 ParamKind::Comptime(_) => None,
             }
         })
@@ -3351,9 +3857,10 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         .filter_map(|p| {
             let name = &p.name;
             match &p.kind {
-                ParamKind::Scalar(_) | ParamKind::ArrayRef(_) | ParamKind::ArrayMut(_) => {
-                    Some(quote!(#name))
-                }
+                ParamKind::Scalar(_)
+                | ParamKind::ArrayRef(_)
+                | ParamKind::ArrayMut(_)
+                | ParamKind::Struct(_) => Some(quote!(#name)),
                 ParamKind::Comptime(_) => None,
             }
         })
@@ -3370,6 +3877,12 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                     let e = twin_elem(elem);
                     Some(quote!(#name: &[#e]))
                 }
+                // `check_assumes` receives the same `P` the twin does, so
+                // `assumes(args.lower_bound.abs() <= 100.0)` is ordinary Rust
+                // (design §5.5). By value, like a scalar: the declared struct is
+                // `Copy`, so the resample loop can predicate on a draw and then
+                // return it.
+                ParamKind::Struct(ty) => Some(quote!(#name: #ty)),
                 ParamKind::Comptime(_) => None,
             }
         })
@@ -3511,6 +4024,31 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                     );
                 });
                 buffer_params.push(quote!((#name_str, true)));
+                kd_call_args.push(quote!(#name));
+            }
+            // A runtime struct registers through its OWN `LaunchArg::expand`,
+            // which calls each field type's `expand` once, in declaration order,
+            // on the same `KernelBuilder` (`generate_struct.rs:221-290`) — the
+            // source-level statement of the flattening. In the v1 subset every
+            // field is a scalar, so this contributes NO buffer and
+            // `buffer_params` is untouched: the prover's `index == buffer id`
+            // invariant and `BUFFER_PARAMS`' custody are byte-unchanged
+            // (design §7, discharged by measurement).
+            //
+            // The `CompilationArg` is HAND-BUILT field-wise from the spec const
+            // rather than obtained by registering a `KernelLauncher`: with
+            // `cubecl/std` on, `with_info`/`with_scope` route through
+            // `thread_local!` statics that only `into_bindings` drains, so a
+            // launcher fed via `register` but never launched leaks its scalars
+            // into the next real launch (measured — design risk 8).
+            ParamKind::Struct(ty) => {
+                let spec = struct_spec_const_ident(name);
+                kd_stmts.push(quote! {
+                    let #name = <#ty as ::cubecl::prelude::LaunchArg>::expand(
+                        &#spec.__vericl_compilation_arg(),
+                        &mut __vericl_builder,
+                    );
+                });
                 kd_call_args.push(quote!(#name));
             }
             ParamKind::Comptime(_ty) => {
@@ -3695,6 +4233,17 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             // instead of a numeric divergence in the differential lane. Absent
             // entirely for a kernel with no config parameter.
             #(#config_pin_checks)*
+
+            // One `const <T>__VericlSpec` per runtime `vericl::cube_struct!`
+            // parameter, built from this kernel's `gen(p.f in …)` ranges and
+            // `instantiate(p.c = …)` pins. Three gates in one item: rustc's
+            // struct-literal exhaustiveness is the "every field needs a range"
+            // check (E0063 names the field), `const` is the purity check on
+            // every pinned value, and having exactly ONE binding is why the same
+            // tokens provably reach `generate_case` and `kernel_definition()`
+            // (docs/design-cubetype-args.md risk 6). Absent entirely for a
+            // kernel with no struct parameter.
+            #(#struct_spec_consts)*
 
             /// Names of the `#[vericl::helper]`-annotated functions this
             /// kernel calls via `uses(...)`. `[]` for a non-composing
@@ -4093,12 +4642,18 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
     // a #[comptime] param with a targeted error (see its `item_kind ==
     // "helper"` branch) rather than silently accepting a pin this design
     // never uses.
+    // A helper's runtime struct parameters are likewise NOT pinnable: a helper
+    // is not launched, so it has no `gen(...)`/launch surface of its own — the
+    // caller supplies the struct value. Passing an empty list means an
+    // `instantiate(p.field = …)` on a helper is rejected with the targeted "not
+    // a runtime struct parameter" error rather than silently accepted.
     let plan = resolve_instantiate(
         &spec.instantiate,
         func.sig.span(),
         "helper",
         &fn_name_str,
         &generic_param_names,
+        &[],
         &[],
     )?;
 
@@ -4135,6 +4690,10 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
         &fn_name_str,
     )?;
 
+    // Design R2 (docs/design-cubetype-args.md §10.4 correction 3): return types
+    // were ungated, so `-> Pair` compiled with no diagnostic (probe V5).
+    check_twin_return_type(&func.sig.output, &plan.generic_subst, "helper", &fn_name_str)?;
+
     // `wrapping` on a helper: the same integer-only gate a kernel gets (the
     // `WrappingFold` is untyped, so folding `+`/`-`/`*` to `wrapping_*` must
     // not silently touch float math). Every value parameter must be an integer
@@ -4153,6 +4712,17 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
                 ParamKind::ArrayRef(elem) | ParamKind::ArrayMut(elem) => {
                     (is_wrapping_integer_type(elem), elem.span())
                 }
+                // A runtime struct parameter under `wrapping` is rejected, and
+                // the reason is the gate's own reason: `WrappingFold` is
+                // UNTYPED, and this macro cannot see a declared struct's field
+                // types (they live in a `vericl::cube_struct!` block it never
+                // parsed), so it cannot certify that every field the body
+                // touches is an integer. Without the gate the failure is still
+                // loud but obscure — `f32` has no `wrapping_add`, so generated
+                // twin code fails to compile at a span the author never wrote.
+                // This narrows `docs/design-cubetype-args.md` §9's "support"
+                // row, which assumed the field types were visible here.
+                ParamKind::Struct(ty) => (false, ty.span()),
             };
             if !ok {
                 return Err(syn::Error::new(
@@ -4160,7 +4730,9 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
                     "`wrapping` is outside the vericl v0 subset for this helper: every parameter \
                      must be an integer scalar or integer Array (u32/i32/u64/i64) when \
                      `wrapping` is declared — the fold is untyped and must not silently touch \
-                     float math",
+                     float math. A runtime `vericl::cube_struct!` parameter is rejected for the \
+                     same reason one step removed: its field types live in a declaration block \
+                     this macro never parsed, so vericl cannot certify they are all integers",
                 ));
             }
         }
@@ -4341,6 +4913,14 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
                 ParamKind::Scalar(ty) | ParamKind::Comptime(ty) => quote!(#name: #ty),
                 ParamKind::ArrayRef(elem) => quote!(#name: &[#elem]),
                 ParamKind::ArrayMut(elem) => quote!(#name: &mut [#elem]),
+                // The V6 shape, which is what 19 of the corrected 20 ecosystem
+                // sites actually do: a device-local aggregate built in a kernel
+                // body and passed to a helper. It already ran correctly (0/64
+                // bit-differences) — and completely ungated and unhashed. The
+                // twin types it by its written type, exactly as the design's
+                // §5.4 table says; what this milestone adds is the
+                // `StructIdentity` fold in `identity_hash_at` below.
+                ParamKind::Struct(ty) => quote!(#name: #ty),
             }
         })
         .collect();
@@ -4357,6 +4937,14 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
     // helper's `identity_hash_at` below — the helper-side half of the kernel's
     // config-identity folding (design §7).
     let helper_config_types = config_comptime_types(&params);
+    // Runtime CubeType struct types reachable from this helper's signature or
+    // body. THIS is the half that closes the measured hole: the accepted,
+    // undiagnosed shape at `e5589f3` was `#[vericl::helper] fn use_pair(p: Pair)`
+    // (docs/design-cubetype-args.md §4.2 V3), and naming
+    // `<Pair as StructIdentity>::STRUCT_HASH` here both folds the struct's
+    // definition into the helper's identity — hence into every composing
+    // kernel's — and *requires* the declaration.
+    let helper_struct_types = runtime_struct_types(&params, &func.block, &generic_param_names);
 
     let pin_note = if plan.pretty.is_empty() {
         String::new()
@@ -4431,6 +5019,7 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
                     &[
                         #(#used_helper_mods::identity_hash_at(depth + 1),)*
                         #(<#helper_config_types as ::vericl::ConfigIdentity>::CONFIG_HASH.to_string(),)*
+                        #(<#helper_struct_types as ::vericl::StructIdentity>::STRUCT_HASH.to_string(),)*
                     ],
                 )
             }
@@ -4957,6 +5546,10 @@ enum FieldRole {
     Scalar,
     ArrayRef,
     ArrayMut,
+    /// A runtime `vericl::cube_struct!` parameter: a by-value argument to the
+    /// twin and to `check_assumes` (the declared struct is `Copy` — the macro
+    /// emits the derive), and a `<T>Launch::new(…)` at the launch site.
+    Struct,
 }
 
 struct GenField {
@@ -5003,14 +5596,15 @@ fn resolve_gen_entries(
     let mut lens: GenLens = std::collections::HashMap::new();
     for entry in gen_entries {
         match entry {
-            GenEntry::Range { name, lo, hi } => {
-                let key = name.to_string();
+            GenEntry::Range { name, field_path, lo, hi } => {
+                let key = dotted_key(name, field_path);
+                let root = name.to_string();
                 match params.iter().find(|p| p.name == *name) {
                     None => {
                         return Err(syn::Error::new(
                             name.span(),
                             format!(
-                                "gen(...) declares a range for `{key}`, but `{key}` is not a \
+                                "gen(...) declares a range for `{key}`, but `{root}` is not a \
                                  parameter of `{fn_name_str}`"
                             ),
                         ));
@@ -5019,9 +5613,35 @@ fn resolve_gen_entries(
                         return Err(syn::Error::new(
                             name.span(),
                             format!(
-                                "gen(...) declares a range for `{key}`, but `{key}` is a \
+                                "gen(...) declares a range for `{key}`, but `{root}` is a \
                                  #[comptime] parameter pinned by instantiate(...), not a runtime \
                                  value to generate"
+                            ),
+                        ));
+                    }
+                    // A runtime struct parameter is generated field by field —
+                    // its fields are what carry types and ranges, and the struct
+                    // itself has no scalar draw.
+                    Some(p) if matches!(p.kind, ParamKind::Struct(_)) && field_path.is_empty() => {
+                        return Err(syn::Error::new(
+                            name.span(),
+                            format!(
+                                "gen(...) declares a range for `{root}`, which is a runtime struct \
+                                 parameter of `{fn_name_str}` — a struct has no scalar range. Name \
+                                 its FIELDS: `gen({root}.some_field in lo..=hi)`, one per runtime \
+                                 field (a `#[cube(comptime)]` field is pinned with \
+                                 `instantiate({root}.some_flag = …)` instead)"
+                            ),
+                        ));
+                    }
+                    Some(p) if !matches!(p.kind, ParamKind::Struct(_)) && !field_path.is_empty() => {
+                        return Err(syn::Error::new(
+                            name.span(),
+                            format!(
+                                "gen(...) declares a range for `{key}`, but `{root}` is not a \
+                                 runtime struct parameter of `{fn_name_str}` — the dotted form \
+                                 names a FIELD of a `vericl::cube_struct!` parameter, and nothing \
+                                 else has fields"
                             ),
                         ));
                     }
@@ -5034,8 +5654,25 @@ fn resolve_gen_entries(
                     ));
                 }
             }
-            GenEntry::Len { name, value } => {
+            GenEntry::Len { name, field_path, value } => {
                 let key = name.to_string();
+                if !field_path.is_empty() {
+                    // Reachable only for a struct parameter's field, and only a
+                    // buffer-valued one would need a length — the design §10.5
+                    // deferral, diagnosed here rather than as a parse error.
+                    return Err(syn::Error::new(
+                        name.span(),
+                        format!(
+                            "gen(...) declares `len({})`, a length for a FIELD of a runtime struct \
+                             parameter — only a buffer-valued field (`Array<T>`/`Tensor<T>`) has a \
+                             length, and buffer-valued fields are deferred: \
+                             `vericl::cube_struct!` rejects them at the declaration with the four \
+                             missing pieces named. Pass the buffer as its own \
+                             `&Array<T>`/`&mut Array<T>` kernel parameter, where `len(...)` applies",
+                            dotted_key(name, field_path)
+                        ),
+                    ));
+                }
                 match params.iter().find(|p| p.name == *name) {
                     None => {
                         return Err(syn::Error::new(
@@ -5057,12 +5694,15 @@ fn resolve_gen_entries(
                         ));
                     }
                     Some(p) if !matches!(p.kind, ParamKind::ArrayRef(_) | ParamKind::ArrayMut(_)) => {
+                        let what = if matches!(p.kind, ParamKind::Struct(_)) {
+                            "a runtime struct (its fields are scalars in the v1 subset, and a \
+                             buffer-valued field is deferred at the declaration)"
+                        } else {
+                            "a scalar"
+                        };
                         return Err(syn::Error::new(
                             name.span(),
-                            format!(
-                                "gen(...) len(...) only applies to Array parameters; `{key}` is \
-                                 a scalar"
-                            ),
+                            format!("gen(...) len(...) only applies to Array parameters; `{key}` is {what}"),
                         ));
                     }
                     _ => {}
@@ -5105,6 +5745,137 @@ fn integer_draw_expr(ty: &TokenStream2, kind: NumKind, range: Option<&(Expr, Exp
             }
         }
     }
+}
+
+/// The `const` item name holding a runtime struct parameter's generation/launch
+/// spec — the single point every consumer reads.
+fn struct_spec_const_ident(param: &Ident) -> Ident {
+    format_ident!("__VERICL_SPEC_{}", param)
+}
+
+/// Build the `const <T>__VericlSpec` items for a kernel's runtime struct
+/// parameters — one per parameter, from its `gen(p.f in lo..=hi)` ranges and
+/// `instantiate(p.c = …)` pins.
+///
+/// Three things at once, and they are the same thing:
+///
+/// 1. **Field coverage is rustc's job.** The macro never learns `T`'s fields; it
+///    only learns the names the author wrote. Emitting them as a struct literal
+///    of `<T>__VericlSpec` makes rustc's own exhaustiveness check the gate — a
+///    field with no range is `E0063: missing field` naming it, a misspelled one
+///    is `E0560: no field named`, both at the kernel's own span, and both work
+///    across a crate boundary where a macro-time registry could not.
+/// 2. **Purity is rustc's job too.** A `const` item is Rust's own purity
+///    guarantee: an `instantiate(p.c = flip())` that `is_pinnable_config_expr`
+///    cannot tell from a `const fn` call is rejected with E0015 at the value's
+///    span. This is the same "recognizing half + enforcing half" split the
+///    struct-comptime milestone's `config_pin_checks` uses.
+/// 3. **One binding, so the same tokens provably reach both consumers**
+///    (design risk 6): `generate_case` draws from this const and
+///    `kernel_definition()` builds its `CompilationArg` from it. There is no
+///    second literal that could drift.
+fn build_struct_spec_consts(
+    params: &[Param],
+    ranges: &GenRanges,
+    field_pins: &HashMap<String, TokenStream2>,
+    fn_name_str: &str,
+) -> syn::Result<Vec<TokenStream2>> {
+    let mut out = Vec::new();
+    for p in params {
+        let ParamKind::Struct(ty) = &p.kind else { continue };
+        let root = p.name.to_string();
+        let Some(spec_path) = cube_struct::spec_type_path(ty) else {
+            return Err(syn::Error::new(
+                ty.span(),
+                format!(
+                    "internal error: runtime struct parameter `{root}` of `{fn_name_str}` has a \
+                     type vericl cannot name a `vericl::cube_struct!` spec for"
+                ),
+            ));
+        };
+        // Every dotted entry under this parameter, as (field path, value).
+        let mut entries: Vec<SpecEntry> = Vec::new();
+        for (key, (lo, hi)) in ranges {
+            if let Some(path) = strip_root(key, &root) {
+                entries.push((path, quote!((#lo, #hi))));
+            }
+        }
+        for (key, value) in field_pins {
+            if let Some(path) = strip_root(key, &root) {
+                entries.push((path, value.clone()));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let literal = struct_spec_literal(&spec_path, &entries, 0);
+        let const_ident = struct_spec_const_ident(&p.name);
+        let doc = format!(
+            "Generation/launch spec for the runtime struct parameter `{root}: {}`, built from this \
+             kernel's `gen({root}.… in …)` ranges and `instantiate({root}.… = …)` pins. A `const` \
+             so rustc const-evaluates every pinned value (the enforcing half of the pinnable-value \
+             gate) and so `generate_case` and `kernel_definition()` provably read the SAME tokens.",
+            ty.to_token_stream()
+        );
+        out.push(quote! {
+            #[doc = #doc]
+            #[allow(non_upper_case_globals, dead_code)]
+            const #const_ident: #spec_path = #literal;
+        });
+    }
+    Ok(out)
+}
+
+/// One resolved entry of a runtime struct parameter's generation/launch spec: a
+/// dotted field path under the parameter, and the tokens that field takes — an
+/// inclusive `(lo, hi)` range for a runtime field, the pinned value for a
+/// `#[cube(comptime)]` one.
+type SpecEntry = (Vec<String>, TokenStream2);
+
+/// `("args.inner.k", "args")` -> `Some(["inner", "k"])`; `None` when `key` does
+/// not name a field under `root`.
+fn strip_root(key: &str, root: &str) -> Option<Vec<String>> {
+    let mut segs = key.split('.');
+    if segs.next()? != root {
+        return None;
+    }
+    let rest: Vec<String> = segs.map(|s| s.to_string()).collect();
+    if rest.is_empty() { None } else { Some(rest) }
+}
+
+/// The nested `<T>__VericlSpec { … }` literal for one struct parameter.
+///
+/// A nested declared struct's spec type is named through the
+/// `<Root>__VericlSpec__<f1>__<f2>` alias `vericl::cube_struct!` emits per
+/// reachable path — the only way the kernel macro, which knows nothing but the
+/// dotted clause names, can spell it.
+fn struct_spec_literal(
+    spec_path: &Path,
+    entries: &[SpecEntry],
+    depth: usize,
+) -> TokenStream2 {
+    let mut leaves: Vec<TokenStream2> = Vec::new();
+    let mut groups: Vec<(String, Vec<SpecEntry>)> = Vec::new();
+    for (path, value) in entries {
+        let Some(head) = path.get(depth) else { continue };
+        if path.len() == depth + 1 {
+            let f = format_ident!("{}", head);
+            leaves.push(quote!(#f: #value));
+        } else {
+            match groups.iter_mut().find(|(h, _)| h == head) {
+                Some((_, v)) => v.push((path.clone(), value.clone())),
+                None => groups.push((head.clone(), vec![(path.clone(), value.clone())])),
+            }
+        }
+    }
+    for (head, sub) in &groups {
+        let f = format_ident!("{}", head);
+        let mut nested = spec_path.clone();
+        if let Some(last) = nested.segments.last_mut() {
+            last.ident = format_ident!("{}__{}", last.ident, head);
+        }
+        let inner = struct_spec_literal(&nested, sub, depth + 1);
+        leaves.push(quote!(#f: #inner));
+    }
+    quote!(#spec_path { #(#leaves,)* })
 }
 
 /// Build one parameter's [`GenField`]: its owned type, its `generate_case`
@@ -5224,6 +5995,23 @@ fn build_gen_field(
             let role = if matches!(p.kind, ParamKind::ArrayMut(_)) { FieldRole::ArrayMut } else { FieldRole::ArrayRef };
             Ok(GenField { name, owned_ty: quote!(::std::vec::Vec<#elem>), stmt, role, elem_ty: Some(elem.clone()), elem_kind: Some(kind) })
         }
+        // A runtime struct draws field by field from the spec `const`, using —
+        // per field — exactly the expression a loose scalar parameter of that
+        // type draws with (`__vericl_draw` is generated by `vericl::cube_struct!`
+        // from the declared field order, calling the same `next_f32_range` /
+        // integer formula this function uses). One draw, one struct value, fed
+        // to both the twin and the launch.
+        ParamKind::Struct(ty) => {
+            let spec = struct_spec_const_ident(&name);
+            Ok(GenField {
+                name: name.clone(),
+                owned_ty: quote!(#ty),
+                stmt: quote!(let #name: #ty = #spec.__vericl_draw(&mut __vericl_rng);),
+                role: FieldRole::Struct,
+                elem_ty: None,
+                elem_kind: None,
+            })
+        }
         ParamKind::Comptime(_) => {
             unreachable!("callers filter out #[comptime] params before calling build_gen_field")
         }
@@ -5280,7 +6068,7 @@ fn build_conformance_items(
         .map(|f| {
             let name = &f.name;
             match f.role {
-                FieldRole::Scalar => quote!(#name),
+                FieldRole::Scalar | FieldRole::Struct => quote!(#name),
                 FieldRole::ArrayRef | FieldRole::ArrayMut => quote!(&#name),
             }
         })
@@ -5322,7 +6110,7 @@ fn build_conformance_items(
     for f in &fields {
         let name = &f.name;
         match f.role {
-            FieldRole::Scalar => {
+            FieldRole::Scalar | FieldRole::Struct => {
                 reference_args.push(quote!(#name));
             }
             FieldRole::ArrayRef => {
@@ -5406,6 +6194,16 @@ fn build_conformance_items(
                             ::cubecl::prelude::ArrayArg::from_raw_parts(#handle.clone(), #name.len())
                         }
                     }
+                }
+                // The positional `<T>Launch::new(…)`, emitted by
+                // `vericl::cube_struct!` from the field order it hashed — so the
+                // §4.3 hazard (a definition-only field swap changing the
+                // computed function with the launch-call text unchanged) becomes
+                // internal, and `STRUCT_HASH` moving is what makes the stored
+                // evidence correctly stale.
+                ParamKind::Struct(ty) => {
+                    let spec = cube_struct::spec_type_path(ty).expect("classified struct param");
+                    quote!(#spec::__vericl_launch_arg::<R>(&#name))
                 }
                 ParamKind::Comptime(_) => comptime_values[&name.to_string()].clone(),
             }
@@ -5532,6 +6330,27 @@ fn build_vector_conformance_items(
         let name_str = name.to_string();
         match &p.kind {
             ParamKind::Comptime(_) => { /* spliced at the launch site, not generated */ }
+            // The vectorized differential path is the all-`Vector` elementwise
+            // class (design-line-vector.md §8.2/§8.3): inputs are drawn as flat
+            // scalars and reshaped into lanes, and the compare is
+            // flat-scalar-vs-flat-scalar. A runtime struct parameter has no lane
+            // structure, so combining the two is rejected by name rather than
+            // mis-generated — the same treatment a mixed scalar/vector array
+            // kernel gets.
+            ParamKind::Struct(ty) => {
+                return Err(syn::Error::new(
+                    ty.span(),
+                    format!(
+                        "kernel `{fn_name_str}` has both a `Vector` array parameter and a runtime \
+                         struct parameter `{name_str}: {}`; the v1 vectorized differential path is \
+                         the all-`Vector` elementwise class and has no lane model for a struct \
+                         argument — outside the vericl v0 subset. Spell the struct's fields as \
+                         loose scalar parameters for a vectorized kernel (they lower identically \
+                         — measured, docs/design-cubetype-args.md §2)",
+                        ty.to_token_stream()
+                    ),
+                ));
+            }
             ParamKind::Scalar(_) => {
                 // Scalar value params (e.g. the `s` of `out[p] = a[p] * splat(s)`)
                 // draw exactly as in the scalar path — reuse its field builder so
@@ -5678,6 +6497,9 @@ fn build_vector_conformance_items(
                             ::cubecl::prelude::ArrayArg::from_raw_parts(#handle.clone(), #flat.len())
                         }
                     }
+                }
+                ParamKind::Struct(_) => {
+                    unreachable!("a struct param in a vector kernel is rejected above")
                 }
                 ParamKind::Comptime(_) => comptime_values[&name.to_string()].clone(),
             }
@@ -7265,6 +8087,309 @@ mod tests {
             &func,
         )
         .expect("a literal construction must be accepted");
+    }
+
+    // -----------------------------------------------------------------
+    // Runtime CubeType struct arguments (docs/design-cubetype-args.md).
+    //
+    // The milestone's central rejections are RUSTC-mediated (an undeclared
+    // type has no `StructIdentity` impl), so what a macro-level test can pin
+    // is that the requirement is NAMED — which is precisely the mechanism:
+    // the generated `identity()`/`identity_hash_at` names
+    // `<T as ::vericl::StructIdentity>::STRUCT_HASH`, so an undeclared `T`
+    // fails E0277 with the trait's `#[diagnostic::on_unimplemented]` message.
+    // Same precedent as `config_kernel_folds_config_hash_and_emits_the_pin_check`
+    // below. The end-to-end behaviour is pinned in vericl-examples'
+    // `tests/cube_struct_identity.rs`.
+    // -----------------------------------------------------------------
+
+    /// THE FLIPPED PROBE. At `e5589f3` this exact signature —
+    /// `#[vericl::helper] fn use_pair(p: Pair) -> u32` — was accepted with **no
+    /// diagnostic at all** and contributed to **no hash** (design §4.2 V3, §4.1
+    /// V4). It now names `StructIdentity`, which both requires the declaration
+    /// and folds the struct's definition into the helper's identity.
+    #[test]
+    fn a_helper_struct_param_requires_and_folds_struct_identity() {
+        let f: ItemFn =
+            syn::parse_str("pub fn use_pair(p: Pair) -> u32 { p.a * p.b }").expect("valid fn");
+        let out = expand_helper(quote!(), &f).expect("accepted").to_string();
+        assert!(
+            out.contains("< Pair as :: vericl :: StructIdentity > :: STRUCT_HASH"),
+            "the helper must fold its runtime struct parameter's STRUCT_HASH — this is the live \
+             hole's closure: {out}"
+        );
+        // The twin binds the author's own struct BY VALUE (design §5.4): no
+        // generated mirror type, and the body tokens reach it unmodified.
+        assert!(out.contains("use_pair_vericl_ref (p : Pair)"), "{out}");
+        // `&Pair` is the same parameter — cubecl strips `&`/`&mut` on a helper
+        // parameter anyway, and before this milestone it was rejected outright
+        // (probe V1).
+        let byref: ItemFn =
+            syn::parse_str("pub fn use_pair(p: &Pair) -> u32 { p.a * p.b }").expect("valid fn");
+        let out2 = expand_helper(quote!(), &byref).expect("accepted").to_string();
+        assert!(out2.contains("< Pair as :: vericl :: StructIdentity > :: STRUCT_HASH"), "{out2}");
+    }
+
+    /// The kernel half: the identity fold, the spec `const`, the positional
+    /// launch argument, and the hand-built `CompilationArg` for IR extraction.
+    #[test]
+    fn a_kernel_struct_param_emits_the_whole_launch_and_identity_surface() {
+        let f: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, args: &UniformArgs, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * args.gain; } }",
+        )
+        .expect("valid fn");
+        let out = expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0, args.gain in 0.0..=1.0)),
+            &f,
+        )
+        .expect("accepted")
+        .to_string();
+        assert!(
+            out.contains("< UniformArgs as :: vericl :: StructIdentity > :: STRUCT_HASH"),
+            "identity must fold the struct hash: {out}"
+        );
+        assert!(
+            out.contains("const __VERICL_SPEC_args : UniformArgs__VericlSpec"),
+            "the generation/launch spec must be a `const` — rustc's exhaustiveness check is the \
+             field-coverage gate and `const` is the purity gate: {out}"
+        );
+        assert!(out.contains("gain : (0.0 , 1.0)"), "the dotted gen range must land on the field: {out}");
+        assert!(
+            out.contains("UniformArgs__VericlSpec :: __vericl_launch_arg :: < R > (& args)"),
+            "the launch argument must be the macro-emitted positional constructor: {out}"
+        );
+        assert!(
+            out.contains("__VERICL_SPEC_args . __vericl_compilation_arg ()"),
+            "IR extraction must hand-build the CompilationArg from the SAME const (design risk \
+             6/8): {out}"
+        );
+        // A v1 struct contributes NO buffer: the prover's custody is unchanged.
+        assert!(
+            out.contains(r#"BUFFER_PARAMS : & [(& str , bool)] = & [("x" , false) , ("y" , true)]"#),
+            "a scalar-field struct must add no BUFFER_PARAMS entry: {out}"
+        );
+    }
+
+    /// Design risk 1: a struct type can enter a body WITHOUT being a parameter.
+    /// Both remaining routes are collected — a struct literal and a written-out
+    /// `let` type annotation — so an author cannot mention a type, edit its
+    /// definition, and show the identity unmoved.
+    #[test]
+    fn body_struct_literals_and_type_annotations_are_collected() {
+        let lit: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { let a = Acc { s: x[ABSOLUTE_POS], w: 0.5 }; \
+             y[ABSOLUTE_POS] = a.s * a.w; } }",
+        )
+        .expect("valid fn");
+        let out = expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0)),
+            &lit,
+        )
+        .expect("accepted")
+        .to_string();
+        assert!(
+            out.contains("< Acc as :: vericl :: StructIdentity > :: STRUCT_HASH"),
+            "a struct LITERAL in the body must be folded: {out}"
+        );
+
+        let ann: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { let a: Acc = make(); y[ABSOLUTE_POS] = a.s; } }",
+        )
+        .expect("valid fn");
+        let out2 = expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0), uses(make)),
+            &ann,
+        )
+        .expect("accepted")
+        .to_string();
+        assert!(
+            out2.contains("< Acc as :: vericl :: StructIdentity > :: STRUCT_HASH"),
+            "a written-out `let` TYPE ANNOTATION must be folded (design risk 1): {out2}"
+        );
+    }
+
+    /// NEGATIVE CONTROL for the `Type::Path(_) => Scalar` narrowing (design
+    /// §10.4 correction 1): every written-out scalar still classifies as a
+    /// scalar, so no existing kernel changes shape. A generic type parameter is
+    /// excluded too — it is substituted, not a struct.
+    #[test]
+    fn scalar_params_still_classify_as_scalar_after_the_narrowing() {
+        for ty in ["f32", "f64", "u32", "i32", "u64", "i64", "usize", "bool", "u8", "char"] {
+            let f: FnArg = syn::parse_str(&format!("v: {ty}")).expect("valid arg");
+            let p = classify_param(&f).expect("scalar accepted");
+            assert!(
+                matches!(p.kind, ParamKind::Scalar(_)),
+                "`{ty}` must still be a scalar parameter after the catch-all narrowing"
+            );
+        }
+        let s: FnArg = syn::parse_str("p: Pair").expect("valid arg");
+        assert!(matches!(classify_param(&s).expect("accepted").kind, ParamKind::Struct(_)));
+        // A generic parameter name is not a struct: the pre-pass excludes it,
+        // because `instantiate(F = f32)` decides what it is.
+        let inputs: syn::punctuated::Punctuated<FnArg, Token![,]> =
+            syn::parse_quote!(a: F, p: Pair, n: usize);
+        let names = pre_pass_struct_param_names(&inputs, &[format_ident!("F")]);
+        assert_eq!(names.len(), 1, "only `p: Pair` is a runtime struct parameter");
+        assert_eq!(names[0], "p");
+    }
+
+    /// Design R8. `&mut P` differs from `&P` only for buffer-valued fields
+    /// (measured: a `&mut` struct routes every field through `expand_output`),
+    /// and those are deferred — so it would declare an output that cannot exist.
+    #[test]
+    fn a_mut_ref_struct_param_is_rejected() {
+        let f: FnArg = syn::parse_str("p: &mut Pair").expect("valid arg");
+        let e = match classify_param(&f) {
+            Ok(_) => panic!("&mut P must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("by value or by shared reference"), "{e}");
+        assert!(e.contains("expand_output"), "the measured reason must be stated: {e}");
+        // Negative control: `&mut Array<T>` is of course still fine.
+        let ok: FnArg = syn::parse_str("y: &mut Array<f32>").expect("valid arg");
+        assert!(matches!(classify_param(&ok).expect("accepted").kind, ParamKind::ArrayMut(_)));
+    }
+
+    /// Design R2, and its CORRECTION. Return types were ungated (probe V5), so
+    /// `-> Pair` compiled with no diagnostic. It is now rejected — but the
+    /// design's "struct OR TUPLE" wording would have been a regression: a tuple
+    /// of scalars is shipped and suite-wired (`fir_pair -> (F, F)`,
+    /// `counter_split -> (u32, u32)`), so only struct/enum returns are rejected.
+    #[test]
+    fn struct_returns_are_rejected_and_scalar_tuples_are_not() {
+        let bad: ItemFn = syn::parse_str("pub fn h(a: u32) -> Pair { Pair { a, b: 1 } }")
+            .expect("valid fn");
+        let e = expand_helper(quote!(), &bad).expect_err("-> Pair must be rejected").to_string();
+        assert!(e.contains("may not return"), "{e}");
+        assert!(e.contains("no per-field comparison"), "{e}");
+        // The shipped shapes must keep compiling.
+        for src in [
+            "pub fn h(a: u32, b: u32) -> (u32, u32) { (a + b, a - b) }",
+            "pub fn h(a: u32) -> u32 { a }",
+            "pub fn h(a: u32) { let _ = a; }",
+        ] {
+            let f: ItemFn = syn::parse_str(src).expect("valid fn");
+            expand_helper(quote!(), &f).unwrap_or_else(|e| panic!("`{src}` must stay accepted: {e}"));
+        }
+        // …and a generic return is checked at its PINNED type, so `-> F` with
+        // `instantiate(F = f32)` is a scalar return.
+        let g: ItemFn =
+            syn::parse_str("pub fn h<F: Float>(a: F) -> F { a }").expect("valid fn");
+        expand_helper(quote!(instantiate(F = f32)), &g).expect("a pinned generic return is scalar");
+    }
+
+    /// Design risk 5: `instantiate(p = Pair { … })` on a RUNTIME struct is
+    /// meaningless — its runtime fields are generated per case — and must be a
+    /// category error rather than silently treated as a generic type pin.
+    #[test]
+    fn pinning_a_whole_runtime_struct_is_a_category_error() {
+        let f: ItemFn = syn::parse_str(
+            "pub fn k(p: Pair, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = p.a; } }",
+        )
+        .expect("valid fn");
+        let e = expand(
+            quote!(compare(max_ulp = 0), gen(y in 0.0..=0.0), instantiate(p = Pair { a: 1.0 })),
+            &f,
+        )
+        .expect_err("pinning a runtime struct must be rejected")
+        .to_string();
+        assert!(e.contains("which is a RUNTIME struct parameter"), "{e}");
+        assert!(e.contains("generated per differential case"), "{e}");
+    }
+
+    /// The dotted `gen(...)`/`instantiate(...)` grammar's category errors, both
+    /// directions.
+    #[test]
+    fn dotted_contract_clauses_are_checked_against_the_parameter_kind() {
+        let k: ItemFn = syn::parse_str(
+            "pub fn k(p: Pair, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = p.a; } }",
+        )
+        .expect("valid fn");
+        // A struct named with no field.
+        let e = expand(quote!(compare(max_ulp = 0), gen(p in 0.0..=1.0, y in 0.0..=0.0)), &k)
+            .expect_err("a bare struct range must be rejected")
+            .to_string();
+        assert!(e.contains("has no scalar range"), "{e}");
+        assert!(e.contains("Name its FIELDS"), "{e}");
+        // A dotted range on a non-struct parameter.
+        let f: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let e2 = expand(
+            quote!(compare(max_ulp = 0), gen(x.field in 0.0..=1.0, y in 0.0..=0.0)),
+            &f,
+        )
+        .expect_err("a dotted range on an array must be rejected")
+        .to_string();
+        assert!(e2.contains("is not a runtime struct parameter"), "{e2}");
+        // A dotted `len(...)` — the buffer-valued-field deferral.
+        let e3 = expand(
+            quote!(compare(max_ulp = 0), gen(x in 0.0..=1.0, y in 0.0..=0.0, len(x.a = 4))),
+            &f,
+        )
+        .expect_err("a dotted len must be rejected")
+        .to_string();
+        assert!(e3.contains("only a buffer-valued field"), "{e3}");
+    }
+
+    /// `wrapping` × runtime struct: rejected, because `WrappingFold` is untyped
+    /// and this macro cannot see a declared struct's field types. Narrows the
+    /// design's §9 "support" row, which assumed they were visible here.
+    #[test]
+    fn wrapping_with_a_struct_param_is_rejected() {
+        let f: ItemFn = syn::parse_str(
+            "pub fn k(p: Pair, y: &mut Array<u32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = p.a * 3; } }",
+        )
+        .expect("valid fn");
+        let e = expand(
+            quote!(compare(exact), gen(y in 0..=0, p.a in 0..=10), wrapping),
+            &f,
+        )
+        .expect_err("wrapping + struct must be rejected")
+        .to_string();
+        assert!(e.contains("`wrapping` is outside the vericl v0 subset"), "{e}");
+        assert!(e.contains("declaration block this macro never parsed"), "{e}");
+    }
+
+    /// A `Vector` kernel with a struct parameter: rejected by name rather than
+    /// mis-generated, the same treatment a mixed scalar/vector array kernel gets.
+    #[test]
+    fn a_vector_kernel_with_a_struct_param_is_rejected() {
+        let f: ItemFn = syn::parse_str(
+            "pub fn k<N: Size>(x: &Array<Vector<f32, N>>, p: Pair, y: &mut Array<Vector<f32, N>>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let e = expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0, p.a in 0.0..=1.0),
+                   instantiate(N = 4)),
+            &f,
+        )
+        .expect_err("vector + struct must be rejected")
+        .to_string();
+        assert!(e.contains("all-`Vector` elementwise class"), "{e}");
+    }
+
+    /// A generic-argument-carrying type in value position is neither a scalar
+    /// nor a declarable cube struct (CS3 forbids generics), so it is rejected
+    /// with the subset message rather than sent to `StructIdentity`.
+    #[test]
+    fn a_generic_container_value_param_is_rejected_by_name() {
+        let f: FnArg = syn::parse_str("s: Sequence<u32>").expect("valid arg");
+        let e = match classify_param(&f) {
+            Ok(_) => panic!("a generic container value param must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("unsupported parameter type"), "{e}");
+        assert!(e.contains("the container milestones own those types"), "{e}");
     }
 
     /// §7: a kernel with a struct-typed comptime param folds

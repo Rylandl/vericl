@@ -333,6 +333,42 @@ twin representation for a struct-of-buffers, a `gen(...)` story for structured l
 `LaunchArg` construction path, and comparison semantics per field. None of that is touched here. That
 milestone is now the ranked next one (§11).
 
+> **CORRECTION (round 11, `docs/design-cubetype-args.md`) — this paragraph is wrong in four places,
+> and the reader should trust that document over this one.** Each item was measured while designing
+> and building the runtime-struct milestone; the four prerequisites named above turned out to be one
+> real one, two non-existent ones, and one deferral — and it *missed a fifth*, which was the whole
+> milestone.
+>
+> 1. **"a twin representation for a struct-of-buffers"** — that shape does not exist in the corpus.
+>    Of 165 surveyed `CubeType`/`CubeLaunch` struct definitions, 25 derive `CubeLaunch` (the only
+>    ones eligible as a launch argument) and **zero** of those 25 has an `Array` or `Tensor` field.
+>    The 20 definitions that *do* carry `Array`/`Slice`/`SharedMemory` fields are all `CubeType`-only
+>    device aggregates, built inside a kernel and never launched. The ecosystem's runtime launch
+>    struct is a **parameter block of scalars** (design-cubetype-args §3.3). The struct-of-buffers is
+>    expressible and works, and is deferred on scope (§10.5 there) — not needed for v1.
+> 2. **"comparison semantics per field"** — not needed until array fields land, for the same reason:
+>    a scalar-field struct contributes no compared buffer at all (§10.5 there).
+> 3. **"a `LaunchArg` construction path"** — it is a *positional* `<Name>Launch::new(…)` in field
+>    declaration order (`generate_struct.rs:92-114`), which the declaration macro emits from the
+>    field order it must hash anyway. The identity requirement and the implementability requirement
+>    are the same requirement (§5.2, §5.5 there).
+> 4. **The `gen(...)` story** is the one prerequisite this paragraph got right, and it is one thing:
+>    a two-segment dotted name, `gen(p.field in lo..=hi)`.
+>
+> **The missed fifth, and the actual milestone: the struct's *definition* must be folded into
+> identity, or the feature ships with the exact hole `vericl::config!` was built to close.** Worse:
+> half of it was already shipped. The measured-correct diagnosis quoted three paragraphs above holds
+> only for a **kernel** parameter; on a `#[vericl::helper]` the same `p: Pair` was accepted with **no
+> diagnostic at all**, and editing a `#[cube] impl Pair { fn fold }` moved the reference twin from
+> `[3, 6, 9, 12]` to `[4, 5, 6, 7]` with the kernel's `SOURCE_HASH`, the helper's `SOURCE_HASH` and
+> `identity().source_hash` all bit-identical (design-cubetype-args §4.1/§4.2, probes V3/V4). Closed by
+> `vericl::cube_struct!` in round 11.
+>
+> A fifth correction to the sentence above it: the quoted kernel-side message is **not** "clean and
+> correct" — it blames `gen(...)` for a parameter-class problem, because `classify_param`'s
+> `Type::Path(_) => Scalar` catch-all swallowed every by-value struct. That catch-all is narrowed and
+> the message replaced in round 11 (design-cubetype-args §10.4).
+
 ### 4.5 Co-occurrence — what the compatibility matrix must cover
 
 Of the 243 sites with a struct comptime param vs the 221 without:

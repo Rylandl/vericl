@@ -27,6 +27,7 @@ charter-and-changelog; this document is the manual.
 4. [The contract clauses, built up](#4-the-contract-clauses-built-up)
 5. [Generic and `#[comptime]` kernels: `instantiate(...)`](#5-generic-and-comptime-kernels-instantiate)
    - [5.1 Struct-typed `#[comptime]` config parameters: `vericl::config!`](#51-struct-typed-comptime-config-parameters-vericlconfig)
+   - [5.2 Runtime struct parameters: `vericl::cube_struct!`](#52-runtime-struct-parameters-vericlcube_struct)
 6. [Kernel composition: `#[vericl::helper]` + `uses(...)`](#6-kernel-composition-vericlhelper--uses)
 7. [Cooperative kernels: shared-memory reductions](#7-cooperative-kernels-shared-memory-reductions)
 8. [The `suite!` block](#8-the-suite-block)
@@ -521,6 +522,100 @@ a config, but the requirement it emits — `<Taps as ConfigIdentity>::CONFIG_HAS
 *rustc*, which can. Scalars carry an identity naming the type, so retargeting the alias at another
 primitive re-stales the evidence. An alias for a **struct** still needs that struct declared with
 `vericl::config!`, and the error says so.
+
+### 5.2 Runtime struct parameters: `vericl::cube_struct!`
+
+Section 5.1 is about a struct that never reaches the device. This one is about a struct that does.
+
+CubeCL lets a `#[cube]` item take a **runtime** struct — `args: &MyStruct` (or by value) where
+`MyStruct` derives `CubeType`/`CubeLaunch`. It is lowered as a *positional flattening of its fields*
+at that parameter's own slot: the same kernel with the fields spelled as loose parameters produces
+bit-exact GPU output, an identical `KernelDefinition`, and a byte-identical `kernel_ir_hash`. So it
+is a spelling, not a new capability — but the spelling is the ecosystem's, and before this milestone
+VeriCL accepted half of it silently and hashed none of it.
+
+Declare the type with `vericl::cube_struct!`:
+
+```rust
+use cubecl::prelude::*;   // the block emits CubeCL's derives, so the prelude must be in scope
+
+vericl::cube_struct! {
+    pub struct UniformArgs {
+        pub lower_bound: f32,
+        pub upper_bound: f32,
+    }
+}
+
+#[vericl::kernel(
+    assumes(s.len() == y.len(), args.lower_bound.abs() <= 100.0),
+    compare(abs = 1e-4),
+    gen(args.lower_bound in -100.0..=100.0, args.upper_bound in -100.0..=100.0, y in 0.0..=0.0),
+    uses(to_unit_interval)
+)]
+#[cube(launch)]
+pub fn uniform_value_map(s: &Array<u32>, args: &UniformArgs, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let scale = args.upper_bound - args.lower_bound;
+        y[ABSOLUTE_POS] = to_unit_interval(s[ABSOLUTE_POS]) * scale + args.lower_bound;
+    }
+}
+```
+
+You write no derives. `vericl::cube_struct!` emits `CubeType`, `CubeLaunch`, `Clone` and `Copy`
+itself, and **rejects them if you write them** — an author-chosen derive set is a silent capability
+switch (dropping `CubeLaunch` turns the type from launchable to device-local with your kernel's
+tokens unchanged), and `Clone`/`Copy` are what let the generated twin bind the struct by value.
+
+**Why the declaration is mandatory.** Two measured reasons, both about identity:
+
+1. A struct type's *definition* is in neither input of `SOURCE_HASH`. Before this milestone, a
+   `#[vericl::helper] fn use_pair(p: Pair)` compiled with **no diagnostic at all**, and editing a
+   `#[cube] impl Pair { fn fold }` from `self.a * self.b` to `self.a + self.b` moved the twin from
+   `[3, 6, 9, 12]` to `[4, 5, 6, 7]` while every recorded hash stayed bit-identical.
+2. CubeCL fills a launch struct **by position**, so reordering two same-typed fields in the
+   *declaration* changed what the kernel computed with the body and the launch call unchanged.
+   VeriCL now emits that constructor from the order it hashed, so the reorder stays *correct* — and
+   `STRUCT_HASH` moving is what makes your stored evidence correctly stale.
+
+**The twin is your own struct.** No mirror type is generated: the twin takes `args: UniformArgs`,
+reads `args.lower_bound` with the same tokens the device gets, and hands the whole value to a
+`#[vericl::helper]` that takes `UniformArgs` too.
+
+**What a field may be.**
+
+- a runtime scalar: `f32`, `f64`, `u32`, `i32`, `u64`, `i64`. Each needs a
+  `gen(p.field in lo..=hi)` range, generated exactly as a loose scalar parameter of that type is.
+  (`usize`/`bool` are comptime-only: VeriCL has no scalar draw for them.)
+- another struct declared **in the same block** — nested to any depth, with dotted clauses to match
+  (`gen(cfg.window.gain in 0.5..=2.0)`).
+- `#[cube(comptime)] pub taps: u32` — an integer, `bool`, `char`, or a unit enum declared in the
+  same block. It keeps its positional launch slot but takes the plain host type, never reaches the
+  device, and is pinned once with `instantiate(cfg.window.taps = 3)`. No float: CubeCL's generated
+  `CompilationArg` derives `Hash`/`Eq`, and `f32` is neither.
+
+Buffer-valued fields (`Array`, `Tensor`, `Slice`, `View`, `Sequence`, `SharedMemory`) are
+**deferred**, and the rejection names all four missing pieces rather than waving at "not supported".
+Pass the buffer as its own `&Array<T>` / `&mut Array<T>` parameter.
+
+**Field coverage is checked by rustc, not by VeriCL.** The macro annotating your kernel never learns
+the struct's fields — it only sees the names you wrote in `gen(...)`/`instantiate(...)`. It emits them
+as a literal of a generated spec type, so a field with no range is
+**E0063: missing field `upper_bound`** and a misspelled one is **E0560**, both naming the field. The
+same `const` binding is what const-evaluates every pinned comptime value (E0015 if it is impure) and
+what guarantees `generate_case` and the IR extraction read the *same* tokens.
+
+**Also rejected**, each with its own message: an `impl` block or `#[cube]` method inside the block; a
+generic declared struct; `&mut P`; a struct or enum **return** type from a kernel or helper (a tuple
+of scalars is fine — it is destructured at the call site); a payload-carrying runtime enum;
+`wrapping` together with a struct parameter; and a `Vector` kernel with a struct parameter.
+
+**The residual.** A `#[cube] impl` written *outside* the block escapes both the hash and the gates —
+Rust allows an inherent impl anywhere in the crate and a proc macro sees only the tokens it is
+handed. Worse than the config case, because `#[cube]` emits a host body *and* a device body, so the
+failure is a numeric divergence rather than a panic. The differential lane is what catches it, and
+`ir_hash` moves whenever the value reaches the device. Keep operations on a declared struct in
+`#[vericl::helper]` free functions, where the twin is generated from the same tokens the device gets
+and the body is gated.
 
 ---
 
