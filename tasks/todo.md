@@ -3207,3 +3207,182 @@ green (165); clippy clean on both feature sets (`--workspace --all-targets`, and
 `-p vericl-examples --all-targets --features cpu`), zero warnings; demo-defects exit 0 with every
 defect caught; `VERICL_UPDATE` run last (only to exercise and then undo the doctored counts — the
 manifest it wrote is byte-identical to `HEAD`).
+
+---
+
+## Gap-closure plan — RECORDED 2026-07-27 (M-0 SHIPPED)
+
+The roadmap through round 11 was driven by two measured corpora: a private production DSP codebase
+(22 kernels) and a 464-item CubeCL ecosystem survey. Ranking by those corpora was correct for the
+question they answered — *"what unblocks the code we can actually see?"* — and it produced real wins
+(the shim batch took private faithful coverage 6/22 → ~18/22; struct comptime + runtime struct args
+closed the two largest ecosystem buckets and, more importantly, two identity-soundness holes).
+
+It is the wrong ranking for the question an outside user asks.
+
+### Motivation — the corpora do not contain the user's kernel
+
+An open-source user arriving at VeriCL does not ask "which of my items has the fewest blocking
+gates". They ask "can I bring **a histogram**? **an image filter**? **a warp reduction**?" — kernel
+classes, not construct sets. And the two reference corpora happen not to contain them:
+
+| Class the user recognizes | Ecosystem incidence | **Sole**-blocker | Private codebase |
+|---|---:|---:|---|
+| Scatter-add / histogram (`Atomic`) | **1** | **0** | zero uses |
+| 2-D topology | 39 | **1** | wall #6 (measured, unquantified) |
+| `plane_*` subgroup reductions | 88 | **2** | zero uses |
+
+By the sole-blocker metric — the honest reach number the re-census introduced precisely because
+incidence answers the wrong question — **all three of the next milestones are near the bottom of the
+list.** `Atomic` sole-blocks zero items in 464. That is not a reason to skip them; it is a reason to
+be explicit that this plan is **ranked by recognizability, not by measured reach**, and that the
+justification is a different one:
+
+1. A DSP codebase and a linear-algebra/ML kernel library are not a sample of "GPU kernels". They are
+   two points. Neither writes histograms; that says nothing about whether GPU programmers do.
+2. The cost of a *wrong* "no" is asymmetric. A user whose kernel class is silently absent spends an
+   afternoon annotating before the compiler tells them, and concludes the tool is narrow in a way it
+   never advertised. That cost is paid before any survey metric is felt.
+3. The three classes are the ones a reader of the README would *assume* work. Assumed-working and
+   actually-rejected is the exact gap this plan closes.
+
+The record should not pretend the surveys endorse this ordering. They do not, and the numbers above
+are reproduced here so no future reader has to rediscover the tension.
+
+### M-0 — the coverage page — **DONE 2026-07-27**
+
+The immediate deliverable, and the only one that prevents the footgun *before* the milestones land:
+**`docs/coverage.md`**, "Can I bring this kernel?" — 13 rows of recognizable kernel classes
+(elementwise 1-D, vectorized elementwise, gather/permutation, windowed/stencil via slices,
+tree/grid-stride reduction, RNG/hash/mixing, scatter-add/histogram, 2-D/3-D dispatch, `plane_*`,
+`Tensor`/`View`/`cmma` tiling, framework-generic trait kernels, struct-arg kernels, f64) × four
+columns (differential-tested / bounds-proved / race-proved / status), every cell checked against an
+example, a test, or a committed evidence entry and cited by name. Linked from the README (a new
+"What kernels can VeriCL verify today?" section above `## Status`) and from `docs/guide.md` twice
+(the intro, and the §11 rejection reference).
+
+Docs only; zero code changes; `cargo test --workspace` green at **469 passed / 0 failed** before and
+after; committed evidence untouched.
+
+Five things the page had to state more weakly than the internal summary assumed, all because the code
+says so:
+
+1. **`cmma` is not rejected by a targeted error.** There is no `cmma` string anywhere in
+   `crates/vericl-macros/src/`. It hits the `UsesRewriteFold` multi-segment residual and fails
+   downstream (twin compile error / `unexpanded!()` panic), not at a VeriCL span. `guide.md` §11's
+   prose implies otherwise. Recorded as a diagnostic gap, not a soundness one.
+2. **Race freedom is *not checked* for every non-cooperative row** — not "n/a". `sum_racy` writes
+   `y[0] +=` from every thread, proves its bounds cleanly (2 obligations), and is caught only by the
+   differential lane diverging. The page gives this its own heading rather than a dash in a column.
+3. **Vector widths are not an enumerated set.** The rule is "pin one width per contract"; width 4 is
+   the only width with GPU ground truth or any test. "Pinned widths" overstates it in one direction
+   and understates it in the other.
+4. **Only `vec_add` of the three vector kernels carries evidence.** `vec_scale`/`vec_madd` are
+   differential-only, no bounds proof.
+5. **Gather proves in-bounds but cannot express injectivity**, so a permutation used as a *write*
+   index is a proved-and-wrong shape. Measured on real private code (16/32 elements diverged, worst
+   ~2.1e9 ULP). The page states this as a first-class caveat on the gather row.
+
+One correction made in passing: `guide.md` §12 listed "custom `CubeType` struct arguments" as out of
+scope for v0, which round 11 made false. Amended in place with a pointer to `coverage.md` as the
+maintained per-class status, so there is one place that goes stale instead of four.
+
+### M-A — 2-D / 3-D dispatch — DESIGN IN FLIGHT
+
+`docs/design-2d-dispatch.md`. The `_X`/`_Y`/`_Z` position builtins are banned unconditionally today,
+including under `cooperative(...)` — the cooperative subset is 1-D by construction
+(`coop::COOP_ALLOWED`). Unblocks image-space kernels, and is the prerequisite for the one deferred
+shared-memory item that needs it (2-D dispatch padding, `design-shared-memory.md` §7.4).
+
+### M-B — atomics (scatter-add / histogram) — QUEUED
+
+`Atomic*` is banned by prefix today. **Open question that must be answered in the design, not after
+it:** a float atomic add has no defined accumulation order, so a differential against a sequential
+twin with one fixed order is comparing against one of many legal device results. Integer and other
+bit-exact-associative accumulations do not have this problem. The unacceptable outcome is a design
+that picks the twin's order, observes agreement within a tolerance, and records a `tested` claim that
+reads like the other rows — the claim would be quantifying over an order the device never promised.
+Candidate resolutions to evaluate rather than assume: restrict v1 to integer/bit-exact atomics; or
+introduce an order-independent claim kind; or make the tolerance an explicit function of the
+accumulation length and record it as an assumption. Also note the prefix asymmetry the coverage audit
+surfaced: `BANNED_PREFIXES` uses capital-`A`, so `Atomic::fetch_add` is caught by the ban list while a
+lowercase free `atomic_add(...)` is caught by the undeclared-call rejection — two different messages
+for one class, worth unifying when the class becomes supported.
+
+### M-C — `plane_*` subgroup reductions — QUEUED
+
+Banned by the `plane_` prefix today. **Open question, same discipline:** the plane/subgroup width is
+**device-decided**, not kernel-declared. A sequential twin cannot model a plane reduction without
+committing to a width, and a twin built at a width the device does not honor is a different function
+from the kernel — silently. Whatever the design settles on, the pinned width has to be part of the
+recorded contract and a launch on a device with a different width has to *fail*, in the same way
+`mismatched_cube_dim_panics` already makes a cooperative kernel fail rather than pass at the wrong
+`cube_dim`. That existing precedent is the model to follow.
+
+Note for the record: `plane_*` was the recorded #1 post-`Slice` frontier and was correctly
+de-prioritised by the re-census (88 incidences, 2 sole-blockers). It returns here on the
+recognizability argument, not because that measurement was wrong.
+
+### M-D — twin-side `break` semantics + struct buffer fields — QUEUED
+
+Two smaller items grouped because neither justifies its own review cluster.
+
+- **Loop `break`/`continue` on the twin side.** Neither is on any ban list today; both are re-emitted
+  into the twin verbatim, which is correct *inside a loop* (unlike `return`, which is banned exactly
+  because it would escape the twin's per-thread loop). The gap is on the prover side: `while` is
+  modeled only in the canonical leading-break-guard desugaring, and a trailing-break
+  `loop { body; if c { break } }` is `OutOfSubset`. Widen the modeled shapes, and add the explicit
+  macro-level gate that today's silence leaves implicit.
+- **Buffer-valued `cube_struct!` fields** (`Array`/`Tensor` in a declared struct). Deferred with a
+  targeted message in `design-cubetype-args.md` §10.5, with the foundation already measured (X6–X8:
+  one buffer binding per array field, flattened in place at the struct's parameter slot; I3: identical
+  IR). Needs a twin mirror type holding `&[T]`, a per-field entry in the compared-buffer set, and a
+  `gen(len(p.a = N))` form. **Blocked on the queued `Array::new(...)` gate** (round-11 record above):
+  a device-only constructor in a kernel body compiles and panics only at twin run time, and it is the
+  first thing an implementer hits when reaching for array fields. Close that gate first.
+
+### Explicitly out — with rationale, not silence
+
+- **`Tensor` / `View` / `cmma` tiled matmul / conv / attention.** Two independent reasons, both
+  recorded on the coverage page. (a) The `View` machinery is `Arc<dyn>` dynamic-dispatch
+  coordinate→offset layout; modeling it soundly enough for a bounds claim to mean anything is a
+  larger effort than the entire current prover (`design-view-slice.md` §8). (b) VeriCL's differential
+  leg compares against a twin derived from the same source — for a tiled matmul the honest twin is
+  the naive triple loop, a genuinely different accumulation order, so the tolerance story is its own
+  research project rather than a per-kernel `compare(...)`. Shipping the class would mean shipping a
+  claim materially weaker than every other row while looking identical to them. The measured numbers
+  agree for once: `Tensor` sole-blocks 0 items, cmma 6.
+- **A permutation / injectivity assume form.** The proved-and-wrong scatter shape above. No assume
+  form expresses injectivity of a loaded table, and inventing one is a semantics question (what does
+  the generator draw? what does the prover encode?) rather than a plumbing one. Recorded, measured on
+  real code, not scheduled.
+
+### Review discipline
+
+**Rounds 12 and 13, one cluster each: M-A + M-B (topology and memory-effect semantics), then
+M-C + M-D.** Same standard as rounds 10 and 11 — adversarial, preserving every probe as a permanent
+regression, and treating a shipped-but-uncompiled capability claim as a defect of the same severity
+as a soundness hole.
+
+**The rounds-10/11 lesson is binding on the M-B and M-C designs specifically**, and it is the reason
+both carry an explicit open question above rather than an assumed answer:
+
+> Every defect of consequence in rounds 10 and 11 was VeriCL asserting a model of semantics **it does
+> not own** without measuring the real thing. Round 10 CRITICAL 2: the flush-to-zero FMA model was
+> *false* — the device flushes when the exact pre-rounding product-sum is subnormal, not when the
+> rounded result is, and only 21996 measured triples said so. Round 11 CRITICAL 1: every by-name gate
+> read attributes as written while **rustc** expands `cfg_attr` afterwards, so the set VeriCL
+> classified and the set that decides meaning were two different sets — a false `Proved`. Round 11
+> MODERATE 2: "one type, both positions" was shipped as a capability and had never compiled for any
+> declared type.
+>
+> M-B's accumulation order is owned by the **device and driver**. M-C's plane width is owned by the
+> **device**. Neither may be modeled from documentation or inference. Measure it on the real backends
+> first — the way `host_shim_gpu_ground_truth.rs` and `line_shim_gpu_ground_truth.rs` already do —
+> and let the measurement decide the subset boundary. A model asserted ahead of its ground truth is
+> the specific failure mode this project exists to prevent, and it has now produced a critical finding
+> in two consecutive rounds.
+
+Standing requirement carried forward: `docs/coverage.md` is updated **in the same change** as any
+milestone that moves a row. A coverage page that lags the code is worse than no coverage page, because
+it is believed.

@@ -17,6 +17,12 @@ docs first; VeriCL sits *on top of* an ordinary CubeCL kernel and never replaces
 If you want the design rationale rather than the how-to, the [README](../README.md) is a
 charter-and-changelog; this document is the manual.
 
+**Before you start, check whether your kernel is in scope:
+[docs/coverage.md](coverage.md) — "Can I bring this kernel?"** — a per-kernel-class matrix
+(elementwise, gather, stencil, reduction, RNG, atomics, 2-D, `plane_*`, tiling, f64, …) giving the
+honest status of each, cited to real examples, plus the gap-closure plan for the classes that are not
+supported yet. It will save you an afternoon if your kernel is one VeriCL rejects.
+
 ---
 
 ## Contents
@@ -949,6 +955,11 @@ rejected rather than approximated: unbounded `while`/`loop`, stepped/descending 
 `return`, `plane_*` reductions, `Atomic*`, the `View`/`Layout` strided-tensor machinery,
 `terminate!()` outside the cooperative uniform guard, and 2-D topology are all future work.
 
+For the same boundary organized by **kernel class** rather than by construct — "is my gather / my
+stencil / my histogram / my 2-D image kernel in scope, and what exactly is proved about it?" — see
+[docs/coverage.md](coverage.md), which also records which classes are planned and which are
+deliberately out.
+
 ### Rustc-mediated rejections (delegated to the compiler, by design)
 
 Four safety catches are enforced by rustc on the *generated twin* or on generated `const` items, not
@@ -1015,8 +1026,10 @@ depends on you knowing the boundary.
 - **It does not recover intent from an existing kernel automatically, or prove performance or
   algorithmic appropriateness.**
 - **The supported kernel subset is narrow (section 11).** Whole classes of real kernels — `plane_*`
-  reductions, custom `CubeType` struct arguments, 2-D topology, `Tensor`/`View` strided machinery,
-  atomics — are out of scope for v0 and rejected explicitly, not approximated.
+  reductions, 2-D topology, `Tensor`/`View` strided machinery, atomics — are out of scope for v0 and
+  rejected explicitly, not approximated. (Custom `CubeType` struct arguments *were* on this list and
+  are now supported via `vericl::cube_struct!`, section 5.2; [docs/coverage.md](coverage.md) is the
+  maintained per-class status.)
 - **`f64` has no front-end-independent lane on a wgpu-only machine.** WGSL has no f64; the honest lane
   is cubecl-cpu, which shares CubeCL's front end. For an f64 kernel the macro-derived twin is the sole
   independent reference.

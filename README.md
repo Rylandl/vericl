@@ -14,6 +14,20 @@ evidence manifest that goes stale when anything it depends on changes.
 > workflow, reading an evidence file, what each rejection means, and an honest "what VeriCL does not
 > do". This README is the design record and changelog; the guide is the manual.
 
+## What kernels can VeriCL verify today?
+
+Bring it if it is a **1-D elementwise, gather, stencil, RNG/hash, or shared-memory tree-reduction**
+kernel over `Array<T>` — those are supported, exercised, and carry committed evidence. Vectorized
+`Vector<P, N>` elementwise, `cube_struct!`/`config!` struct arguments, and f64 work with caveats worth
+reading first. **Do not bring it yet** if it needs 2-D/3-D dispatch, atomics, or `plane_*` subgroup
+reductions — those are rejected at compile time today and are the next three milestones.
+`Tensor`/`View`/`cmma` tiling is deliberately out of scope, with reasons.
+
+**[docs/coverage.md](docs/coverage.md) is the per-kernel-class matrix** — differential-tested,
+bounds-proved, race-proved, and status for each class, every cell cited to a real example or test,
+with the caveats on the row rather than in a footnote. It also carries the gap-closure plan. Read it
+before you spend an afternoon annotating a kernel VeriCL will reject.
+
 ## Status
 
 Exploratory. This document records the problem, the design decisions that are locked in, and the
