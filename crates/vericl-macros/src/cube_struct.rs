@@ -45,11 +45,55 @@
 //! - **Hashes the whole block** into
 //!   `impl ::vericl::StructIdentity for T { const STRUCT_HASH }`, which the
 //!   kernel/helper folds into its recorded identity via
-//!   `::vericl::combine_source_hash`. It emits `ConfigIdentity` with the same
-//!   hash too, so one declared type may serve **both** parameter positions
-//!   (design §6, "one type, both positions"); the converse does not hold, and a
-//!   `vericl::config!` type used as a runtime parameter lands on
+//!   `::vericl::combine_source_hash`. Where the type can also serve `#[comptime]`
+//!   position it emits `ConfigIdentity` with the same hash (design §6, "one type,
+//!   both positions" — **conditional**, see below); the converse never holds, and
+//!   a `vericl::config!` type used as a runtime parameter lands on
 //!   `StructIdentity`'s `#[diagnostic::on_unimplemented]` note.
+//!
+//! # "One type, both positions", precisely (round-11 correction)
+//!
+//! The design's §6 claim was shipped unconditionally and is **false in general**.
+//! `ConfigIdentity` was emitted for every declared struct, but the trait is only
+//! half of what `#[comptime]` position needs: CubeCL `Debug`-formats a comptime
+//! parameter and derives `Hash`/`Eq` over it. Measured — a two-`u32` declared
+//! struct as `#[comptime] c: IntCfg` failed with `no method named 'hash'`, `no
+//! method named 'eq'` and "doesn't implement `Debug`", **even though the
+//! `ConfigIdentity` impl was there**; and for a float-field struct no set of
+//! derives can fix it, because `f32` is neither `Hash` nor `Eq`.
+//!
+//! So the honest rule, and what this macro now implements:
+//!
+//! - a declared type is comptime-usable **iff** every field in its transitive
+//!   shape is an integer/`bool`/`char`, a declared unit enum, or another
+//!   comptime-usable declared struct — one `f32`/`f64` anywhere disqualifies it;
+//! - for those types the macro emits `Debug`/`PartialEq`/`Eq`/`Hash` **itself**
+//!   (skipping any the author already wrote) together with `ConfigIdentity`, so
+//!   the capability needs no recipe from the author at all;
+//! - for the rest it emits neither, so naming one in `#[comptime]` position is a
+//!   single `ConfigIdentity` `on_unimplemented` note that says *why*, instead of
+//!   three raw trait errors pointing at `#[cube(launch)]`.
+//!
+//! The same four derives are why a declared **enum** is no longer re-emitted
+//! untouched: without them the documented "unit enum `#[cube(comptime)]` field"
+//! shape did not compile at all (`E0204` on the owning struct's `Copy`, then
+//! `hash`/`clone` not found on the enum). It still gets no `CubeType`.
+//!
+//! The same fix is what makes a **declared struct** usable as a
+//! `#[cube(comptime)]` field, pinned whole by `instantiate(p.win = Win { … })`
+//! (`strided_window_sum` in `vericl-examples`). It is pinned *whole*: there is
+//! no `gen(p.win.taps in …)` surface, and the nested spec alias for such a path
+//! points at a marker type whose NAME is the diagnosis, so the mismatch is
+//! rustc's `E0560` naming the reason rather than a raw `E0308` between two
+//! generated type names (round 11, LOW 5).
+//!
+//! One honesty note on the enum, since CS2 advertises it: a comptime enum FIELD
+//! enters the `CompilationArg` (two pins are two compiled kernels), but the v1
+//! subset gives a kernel *body* no way to branch on it — a `match` inside
+//! `#[cube]` lowers as a DEVICE match and needs `CubeEnum`, and a `comptime!`
+//! block may reference only `#[comptime]` PARAMETERS, not a field of a runtime
+//! struct. So its role today is the declaration/launch/identity path, not a
+//! body-level switch. Stated rather than advertised.
 //! - **Emits the launch/generation plumbing from the field order it hashed**:
 //!   a hidden `<T>__VericlSpec` type carrying one `gen(...)` range per runtime
 //!   field and one `instantiate(...)` pinned value per `#[cube(comptime)]`
@@ -72,15 +116,16 @@
 //! | # | Gate | Why |
 //! |---|---|---|
 //! | CS1 | the block must declare at least one `struct` | otherwise nothing gets a `StructIdentity` and the macro is a no-op that looks like a declaration (config G1) |
-//! | CS2 | every field type must be a launch scalar (`f32`/`f64`/`u32`/`i32`/`u64`/`i64`) or a struct declared in **this** block; a `#[cube(comptime)]` field admits integer/`bool`/`char` and a unit-only enum declared in this block | a type declared in a *different* block would contribute meaning without contributing to the hash (config G6). `Array`/`Slice`/`View`/`Sequence`/`SharedMemory`/`Tensor` fields are the design §10.5 deferral |
+//! | CS2 | every field type must be a **single-segment** path naming a launch scalar (`f32`/`f64`/`u32`/`i32`/`u64`/`i64`) or a struct declared in **this** block; a `#[cube(comptime)]` field admits integer/`bool`/`char` and a unit-only enum declared in this block | a type declared in a *different* block would contribute meaning without contributing to the hash (config G6). The single-segment requirement is round 11: this gate resolves by the FINAL segment, so `sm::u32` passed as a `u32` while being an `f32`, and CS8 could not see it (the rebound name was `sm`). `Array`/`Slice`/`View`/`Sequence`/`SharedMemory`/`Tensor` fields are the design §10.5 deferral |
 //! | CS3 | no generics on a declared type | `impl<T> StructIdentity for P<T>` gives every instantiation one hash (config G5) |
 //! | CS4 | no `impl` block, and no `#[cube]` anywhere except the `#[cube(comptime)]` field attribute | a `#[cube]` method's body runs as host Rust in the twin and as expanded device code in the kernel, and nothing reconciles them — measured as the very edit that moves the twin without moving any hash (design §4.1) |
 //! | CS5 | only `std` derives; `CubeType`/`CubeLaunch`/`Clone`/`Copy` are emitted by the macro and rejected if written | a custom derive's *definition* decides the type's impls and the hash covers only the invocation (config G11) |
 //! | CS6 | no macro invocation inside the block | a macro's tokens are opaque to `syn`'s visitors, so CS2–CS5 would be evaded wholesale (config G8) |
 //! | CS7 | only `struct`/`enum`/`use` items | v1 has no method surface, so any other item is either dead or an unhashed escape (config G7) |
-//! | CS8 | a `use` may not rebind `core`/`std`/`alloc`/`Self`/a primitive name, and may not be a glob | CS2 resolves field types **by name** (config G12, from round 10; shared implementation in [`crate::decl_block`]) |
+//! | CS8 | a `use` may not rebind `core`/`std`/`alloc`/`Self`/a primitive/a `std` **derive** name, and may not be a glob | CS2 resolves field types and CS5 resolves derives **by name** (config G12, from round 10; the derive-name half is round 11; shared implementation in [`crate::decl_block`]). It closes only the *single-segment* rebinding — the qualified `sm::u32` spelling is closed by CS2's single-segment requirement instead |
 //! | CS9 | a declared struct must have at least one **named** field | `gen(p.field in …)` and the launch constructor are field-name-driven; a unit or tuple struct has no such surface, and a unit struct additionally has no definition an edit could move |
-//! | CS10 | the declared nesting graph must be acyclic | a recursive declared struct has no finite value (rustc's E0072) and no finite spec type; caught here so the diagnosis names the cycle |
+//! | CS10 | the declared nesting graph must be acyclic, and bounded in depth/size | a recursive declared struct has no finite value (rustc's E0072) and no finite spec type; caught here so the diagnosis names the cycle. The nested-alias enumeration is a *graph-path* walk, so a legal DAG can still be exponential — capped rather than hung (round 11) |
+//! | CS11 | no `#[cfg_attr(…)]` anywhere, and a FIELD may carry only the bare `#[cube(comptime)]` marker and doc comments | every gate here classifies attributes AS WRITTEN and rustc expands `cfg_attr` afterwards: `#[cfg_attr(all(), cube(comptime))]` is classified RUNTIME by vericl and COMPTIME by CubeCL, so the extracted IR is built with the field's `Default` while the launched kernel gets the drawn value — a false `Proved`. Round 11; shared `cfg_attr` implementation in [`crate::decl_block`], and the whitelist mirrors `classify_param`'s |
 //!
 //! # The residual, precisely
 //!
@@ -95,6 +140,39 @@
 //! exists* in `crates/vericl-examples/tests/cube_struct_out_of_block_backstop.rs`:
 //! the differential lane catches any divergence that reaches an output, and
 //! `ir_hash` moves whenever the value reaches the device.
+//!
+//! ## The forged-identity bypass (round 11)
+//!
+//! Recorded here rather than only in the trait's own doc, because its scope is
+//! different in kind from the residual above. `::vericl::StructIdentity` is a
+//! **public, unsealed** trait, so nothing stops an author writing
+//!
+//! ```ignore
+//! impl vericl::StructIdentity for MyOwnType {
+//!     const STRUCT_HASH: &'static str = "sha256:0000…";
+//! }
+//! ```
+//!
+//! for a type this macro never saw. That is not a narrow gap in one gate — it is
+//! a **complete bypass of the mechanism**: the type is never declared, so CS1–CS11
+//! never run on it, its `#[cube] impl` methods are unrestricted, its field order
+//! is not the one any constructor was emitted from, and its recorded identity is
+//! a constant the author chose, which by construction never goes stale. It is
+//! exactly the hole [`::vericl::StructIdentity`] exists to close, re-opened by
+//! hand, and it is the same shape as `ConfigIdentity`'s ("a hand-written impl can
+//! claim any hash it likes, including a constant one").
+//!
+//! It is **not** closable here and is not treated as an attack surface. Sealing
+//! the trait would forbid the impl, but a `#[proc_macro]` cannot seal anything —
+//! and more to the point, VeriCL's guarantee has never been "an author cannot lie
+//! to their own evidence file"; it is "an author who does not lie gets an
+//! identity that moves when the meaning does". Every gate in this module is aimed
+//! at *accidental* drift, which is the failure that actually happens. The
+//! bypass is stated so that it is never mistaken for something the gates cover,
+//! and it is pinned as a compiling acknowledgment test
+//! (`forged_struct_identity_is_a_complete_bypass`) that will stop compiling if
+//! the trait is ever sealed — at which point this section is wrong and must be
+//! rewritten.
 
 use std::collections::HashSet;
 
@@ -203,6 +281,11 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
         "CS2 resolves a field type",
         &mut errors,
     );
+    // CS11 — the round-11 classification-split gate, in two halves: `cfg_attr`
+    // anywhere (shared with `vericl::config!`'s G14) and the field-attribute
+    // whitelist.
+    crate::decl_block::check_no_cfg_attr(&file, "vericl::cube_struct!", &mut errors);
+    check_field_attrs(&file, &mut errors);
 
     if let Some(combined) = errors.clone().into_iter().reduce(|mut a, b| {
         a.combine(b);
@@ -222,6 +305,10 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
     // macro turns from a silent miscomputation into a stale-evidence report.
     let hash = block_hash(&ts);
 
+    // Which declared structs can serve COMPTIME position — measured, not
+    // assumed (round-11 review, MODERATE 2). See [`comptime_usable_structs`].
+    let comptime_usable = comptime_usable_structs(&declared);
+
     let mut out = TokenStream2::new();
 
     for item in &file.items {
@@ -233,6 +320,13 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
                 // harness both hands it to `check_assumes` and launches with it,
                 // so a non-`Copy` declared struct would fail to compile in
                 // generated code for a reason the author never wrote.
+                //
+                // `Debug`/`PartialEq`/`Eq`/`Hash` are added exactly when every
+                // field admits them: those are the four CubeCL needs to accept
+                // the type in `#[comptime]` position, and emitting them for a
+                // type that cannot have them would replace one honest error
+                // with four confusing ones.
+                let extra = comptime_derives(&s.attrs, comptime_usable.contains(&s.ident.to_string()));
                 out.extend(quote! {
                     #[derive(
                         ::core::clone::Clone,
@@ -240,14 +334,28 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
                         ::cubecl::prelude::CubeType,
                         ::cubecl::prelude::CubeLaunch,
                     )]
+                    #extra
                     #s
                 });
             }
-            // A declared enum is re-emitted UNTOUCHED: its place in the v1
-            // subset is as a `#[cube(comptime)]` field type, which keeps the
-            // plain host type and never reaches the device — so it needs no
-            // CubeType derive, and giving it one would claim a device
-            // representation vericl has no twin model for.
+            // A declared enum's place in the v1 subset is as a
+            // `#[cube(comptime)]` field type or a `#[comptime]` parameter,
+            // which keeps the plain host type and never reaches the device — so
+            // it gets no `CubeType`/`CubeLaunch` derive (that would claim a
+            // device representation vericl has no twin model for), but it DOES
+            // get the host derives both of those positions require. Measured
+            // (round-11 review): without them, the documented "unit enum
+            // comptime FIELD" shape did not compile at all — the owning
+            // struct's `Copy` failed on `E0204` and CubeCL's generated
+            // `CompilationArg` could not `hash`/`clone` it.
+            Item::Enum(e) => {
+                let extra = comptime_derives(&e.attrs, true);
+                out.extend(quote! {
+                    #[derive(::core::clone::Clone, ::core::marker::Copy)]
+                    #extra
+                    #e
+                });
+            }
             other => out.extend(other.to_token_stream()),
         }
     }
@@ -258,15 +366,27 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
             impl ::vericl::StructIdentity for #name {
                 const STRUCT_HASH: &'static str = #hash;
             }
-            impl ::vericl::ConfigIdentity for #name {
-                const CONFIG_HASH: &'static str = #hash;
-            }
         });
+        // `ConfigIdentity` — i.e. "this type may ALSO be a `#[comptime]`
+        // parameter" — only where that is true. A float-field struct cannot be
+        // one at any price (`f32` is neither `Hash` nor `Eq`), and claiming
+        // otherwise is what round 11 caught: the impl was emitted
+        // unconditionally while the type failed to compile in that position.
+        // Withholding it lands the author on `ConfigIdentity`'s
+        // `#[diagnostic::on_unimplemented]` note, which names this case.
+        if comptime_usable.contains(&name.to_string()) {
+            out.extend(quote! {
+                impl ::vericl::ConfigIdentity for #name {
+                    const CONFIG_HASH: &'static str = #hash;
+                }
+            });
+        }
         out.extend(spec_items(s, &declared)?);
     }
     // A declared enum carries `ConfigIdentity` only (see `StructIdentity`'s
     // "Enums" section): it may be a `#[comptime]` parameter or a comptime field,
-    // never a runtime parameter.
+    // never a runtime parameter. A unit-only enum is always hashable, so this is
+    // unconditional.
     for e in &file.items {
         let Item::Enum(e) = e else { continue };
         let name = &e.ident;
@@ -280,7 +400,29 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
     // One `type Root__VericlSpec__a__b = Inner__VericlSpec;` per nested path, so
     // `#[vericl::kernel]` can name a nested field's spec type from the dotted
     // `gen(p.a.b in …)` clause alone — the only thing it knows.
-    for (alias, target, vis) in nested_paths {
+    for a in nested_paths {
+        let NestedAlias { alias, target, vis, comptime_whole } = a;
+        if comptime_whole {
+            // The field at this path is `#[cube(comptime)]`, so it is pinned
+            // WHOLE (`instantiate(p.f = T { … })`) and has no per-sub-field
+            // spec. Pointing the alias at `T__VericlSpec` — which is what this
+            // loop used to do — made `gen(p.f.k in …)` a raw `E0308` between two
+            // generated type names. A marker struct puts the reason in the type
+            // NAME, so rustc's own `E0560: no field named` says it: "struct
+            // `…__is_a_comptime_field_pinned_whole_by_instantiate` has no field
+            // named `k`".
+            let marker = format_ident!("{}__is_a_comptime_field_pinned_whole_by_instantiate", alias);
+            out.extend(quote! {
+                #[doc(hidden)]
+                #[allow(non_camel_case_types)]
+                #[derive(::core::clone::Clone, ::core::marker::Copy)]
+                #vis struct #marker;
+                #[doc(hidden)]
+                #[allow(non_camel_case_types)]
+                #vis type #alias = #marker;
+            });
+            continue;
+        }
         out.extend(quote! {
             #[doc(hidden)]
             #[allow(non_camel_case_types)]
@@ -289,6 +431,90 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
     }
 
     Ok(out)
+}
+
+/// The four `std` derives a type needs, on top of the `Clone`/`Copy` this macro
+/// already emits, before CubeCL will accept it in `#[comptime]` position.
+///
+/// Measured (round-11 review): a `cube_struct!` type with two `u32` fields used
+/// as `#[comptime] c: IntCfg` failed to compile with `no method named 'hash'`,
+/// `no method named 'eq'` and "doesn't implement `Debug`"; adding exactly these
+/// four made it compile and run. That is the whole recipe — and it is also why
+/// a float-field struct can never be one, since `f32` is neither `Hash` nor
+/// `Eq`.
+const COMPTIME_POSITION_DERIVES: &[&str] = &["Debug", "PartialEq", "Eq", "Hash"];
+
+/// The subset of [`COMPTIME_POSITION_DERIVES`] to emit for an item, as a
+/// `#[derive(...)]` attribute (empty when `usable` is false, or when the author
+/// wrote them all).
+///
+/// Author-written entries are skipped rather than rejected: unlike
+/// `CubeType`/`CubeLaunch`, these are `std` derives whose expansion is fixed, so
+/// "the macro owns them" buys nothing and a duplicate would be a confusing
+/// `E0119` for code the author was right to write.
+fn comptime_derives(attrs: &[syn::Attribute], usable: bool) -> TokenStream2 {
+    if !usable {
+        return TokenStream2::new();
+    }
+    let written: HashSet<String> =
+        crate::decl_block::derive_paths(attrs).iter().map(render_path).collect();
+    let paths: Vec<syn::Path> = COMPTIME_POSITION_DERIVES
+        .iter()
+        .filter(|d| !written.contains(**d))
+        .map(|d| match *d {
+            "Debug" => syn::parse_quote!(::core::fmt::Debug),
+            "PartialEq" => syn::parse_quote!(::core::cmp::PartialEq),
+            "Eq" => syn::parse_quote!(::core::cmp::Eq),
+            _ => syn::parse_quote!(::core::hash::Hash),
+        })
+        .collect();
+    if paths.is_empty() {
+        return TokenStream2::new();
+    }
+    quote!(#[derive(#(#paths),*)])
+}
+
+/// The declared structs that can serve **both** parameter positions — every
+/// field of which admits `Hash`/`Eq` (design §6, corrected in round 11).
+///
+/// A struct qualifies iff every field's type is an integer/`bool`/`char`, a
+/// declared unit enum, or another qualifying declared struct. A single `f32` or
+/// `f64` field anywhere in its transitive shape disqualifies it, runtime or
+/// comptime: CubeCL's generated `<Name>CompilationArg` derives `Hash`/`Eq` and
+/// a `#[comptime]` parameter is `Debug`-formatted, and no float type is any of
+/// those.
+///
+/// Computed as a fixpoint rather than one pass because a struct's answer depends
+/// on its nested structs' answers, and `enumerate_nested_paths` (which is what
+/// proves the graph acyclic) has not run yet. The iteration is monotone —
+/// entries are only ever removed — so it terminates on any graph, cyclic or not.
+fn comptime_usable_structs(declared: &Declared) -> HashSet<String> {
+    let mut usable: HashSet<String> =
+        declared.structs.iter().map(|s| s.ident.to_string()).collect();
+    loop {
+        let mut changed = false;
+        for s in &declared.structs {
+            let name = s.ident.to_string();
+            if !usable.contains(&name) {
+                continue;
+            }
+            let ok = s.fields.iter().all(|f| {
+                let Type::Path(tp) = &f.ty else { return false };
+                let Some(last) = tp.path.segments.last() else { return false };
+                let t = last.ident.to_string();
+                COMPTIME_FIELD_TYPES.contains(&t.as_str())
+                    || declared.enum_names.contains(&t)
+                    || usable.contains(&t)
+            });
+            if !ok {
+                usable.remove(&name);
+                changed = true;
+            }
+        }
+        if !changed {
+            return usable;
+        }
+    }
 }
 
 /// CS3/CS7/CS9 + the declared-name tables.
@@ -397,23 +623,87 @@ fn collect_declared(file: &syn::File, errors: &mut Vec<syn::Error>) -> Declared 
     d
 }
 
-/// `true` for a `#[cube(comptime)]` field attribute — the one `#[cube]` spelling
-/// CS4 admits, because it is CubeCL's own field-level marker rather than a body
-/// the twin would have to reproduce.
+/// `true` for a **bare** `#[cube(comptime)]` field attribute — the one `#[cube]`
+/// spelling CS4 admits, because it is CubeCL's own field-level marker rather
+/// than a body the twin would have to reproduce.
+///
+/// "Bare" is load-bearing and is checked structurally rather than by scanning
+/// for the word: the path must be exactly `cube` (one segment, so a `x::cube`
+/// that could resolve anywhere is not it) and its argument list must be exactly
+/// the single path `comptime`. Anything else — `#[cube(comptime, launch)]`, a
+/// key/value form, an unparseable argument list — is not this attribute and is
+/// rejected by [`check_field_attrs`] rather than silently treated as it.
+fn is_bare_cube_comptime(a: &syn::Attribute) -> bool {
+    if !a.path().is_ident("cube") {
+        return false;
+    }
+    let syn::Meta::List(list) = &a.meta else { return false };
+    let Ok(nested) = list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return false;
+    };
+    nested.len() == 1 && matches!(&nested[0], syn::Meta::Path(p) if p.is_ident("comptime"))
+}
+
+/// `true` if any of `attrs` is the bare `#[cube(comptime)]` field marker.
 fn is_cube_comptime_field(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        if !a.path().is_ident("cube") {
-            return false;
-        }
-        let mut found = false;
-        let _ = a.parse_nested_meta(|meta| {
-            if meta.path.is_ident("comptime") {
-                found = true;
+    attrs.iter().any(is_bare_cube_comptime)
+}
+
+/// CS11's field half: a declared struct's FIELD may carry only the attributes
+/// this macro classifies against — the bare `#[cube(comptime)]` marker and doc
+/// comments. Every other attribute is rejected **by name**.
+///
+/// This mirrors the discipline `classify_param` already holds a kernel's own
+/// parameters to (`#[comptime]` or nothing — any other parameter attribute is a
+/// rejection, not a shrug), and for the same reason. Every downstream decision
+/// about a field is made by reading this list by name: whether the field is
+/// drawn per case or pinned by `instantiate(...)`, which positional slot it
+/// takes in `<Name>Launch::new`, and — the sharp one — whether its *value* or
+/// its `Default` enters the `CompilationArg` the extracted IR is built from. An
+/// attribute the macro does not recognize is therefore either inert (and
+/// misleading, since the block's hash records it as if it mattered) or a
+/// classification rustc and VeriCL disagree about.
+///
+/// An allowlist rather than a denylist is the whole point: the round-11 escape
+/// was a *spelling* (`#[cfg_attr(all(), cube(comptime))]`) that no denylist
+/// naming `cube` could have caught, and the next one would be another spelling.
+fn check_field_attrs(file: &syn::File, errors: &mut Vec<syn::Error>) {
+    for item in &file.items {
+        let Item::Struct(s) = item else { continue };
+        for f in s.fields.iter() {
+            let fname = f
+                .ident
+                .as_ref()
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "<unnamed>".to_string());
+            for a in &f.attrs {
+                if a.path().is_ident("doc") || is_bare_cube_comptime(a) {
+                    continue;
+                }
+                errors.push(syn::Error::new(
+                    a.span(),
+                    format!(
+                        "`#[{}]` on `{}.{fname}` is outside the vericl v1 subset — a \
+                         vericl::cube_struct! field may carry only the bare `#[cube(comptime)]` \
+                         marker and doc comments, and every other attribute is rejected BY NAME. \
+                         The field's attribute list is what decides whether the field is drawn per \
+                         case or pinned by instantiate(...), which positional slot it takes in \
+                         `{}Launch::new`, and whether its VALUE or its `Default` enters the \
+                         `CompilationArg` the extracted IR (and therefore every proved obligation) \
+                         is built from — so an attribute vericl does not recognize is either inert \
+                         and misleading, or a classification vericl and rustc would disagree \
+                         about. This is the same whitelist a `#[comptime]` KERNEL parameter is \
+                         held to",
+                        render_path(a.path()),
+                        s.ident,
+                        s.ident,
+                    ),
+                ));
             }
-            Ok(())
-        });
-        found
-    })
+        }
+    }
 }
 
 fn reject_generics(generics: &syn::Generics, name: &Ident, errors: &mut Vec<syn::Error>) {
@@ -448,6 +738,9 @@ fn check_field_types(declared: &Declared, errors: &mut Vec<syn::Error>) {
             let owner = &s.ident;
             let fname = &f.ident;
             let ty_txt = f.ty.to_token_stream().to_string();
+            // The buffer-valued deferral keeps its own diagnosis even when
+            // written qualified (`cubecl::prelude::Array<f32>`) — that author
+            // wants to know about the deferral, not about path resolution.
             let msg = if is_buffer_valued_type(&f.ty) {
                 format!(
                     "a vericl cube struct field must be a scalar (f32/f64/u32/i32/u64/i64), a \
@@ -461,6 +754,20 @@ fn check_field_types(declared: &Declared, errors: &mut Vec<syn::Error>) {
                      `&[T]`, a per-field entry in the compared-buffer set, per-field compare-tier \
                      selection, and a `gen(len(p.{fname} = N))` form. Pass the buffer as its own \
                      `&Array<T>` / `&mut Array<T>` kernel parameter instead"
+                )
+            } else if is_qualified_path_type(&f.ty) {
+                format!(
+                    "`{owner}.{fname}: {ty_txt}` names a QUALIFIED path, which is outside the \
+                     vericl v1 subset — CS2 resolves a field type by the name of its FINAL \
+                     SEGMENT, and a qualified path's final segment says nothing about what the \
+                     path resolves to. Measured (round-11 review): with \
+                     `use crate::shady as sm;` in scope and `mod shady {{ pub type u32 = f32; }}`, \
+                     `{fname}: sm::u32` passes the scalar check as a `u32` while being an `f32` — \
+                     and the same tail trick makes `other::Inner` pass as a struct \"declared in \
+                     this block\" when it is a different type entirely. CS8 cannot catch this: it \
+                     rejects a `use … as u32;` that rebinds the NAME the gate reads, and here the \
+                     rebound name is the module (`sm`), not the tail. Write the unqualified name \
+                     (`f32`/`f64`/`u32`/`i32`/`u64`/`i64`, or a struct declared in THIS block)"
                 )
             } else if f.comptime {
                 format!(
@@ -503,9 +810,27 @@ fn is_buffer_valued_type(ty: &Type) -> bool {
     )
 }
 
+/// `true` for a path type written with more than one segment (or a leading
+/// `::`) — the shape CS2 must refuse because it resolves by the FINAL segment.
+///
+/// Round-11 review, MODERATE 4. `field_type_ok` and [`crate::NumKind::of`] both
+/// key on `path.segments.last()`, so `sm::u32` is "a `u32`" to every gate and
+/// every generated draw while resolving to whatever `sm` actually exports —
+/// and CS8, which rejects a `use … as u32;`, sees only a `use … as sm;` here.
+/// A single-segment requirement closes the whole family at the point of
+/// resolution rather than chasing spellings at the point of import.
+fn is_qualified_path_type(ty: &Type) -> bool {
+    match ty {
+        Type::Path(tp) => {
+            tp.qself.is_some() || tp.path.leading_colon.is_some() || tp.path.segments.len() > 1
+        }
+        _ => false,
+    }
+}
+
 fn field_type_ok(ty: &Type, comptime: bool, declared: &Declared) -> bool {
     let Type::Path(tp) = ty else { return false };
-    if tp.qself.is_some() {
+    if is_qualified_path_type(ty) {
         return false;
     }
     let Some(last) = tp.path.segments.last() else { return false };
@@ -672,13 +997,37 @@ pub(crate) fn spec_type_path(ty: &Type) -> Option<syn::Path> {
     Some(p)
 }
 
+/// The largest number of nested spec aliases one `vericl::cube_struct!` block
+/// may expand to — CS10's *size* half (round-11 review, LOW 7).
+///
+/// [`enumerate_nested_paths`] walks graph PATHS, not types, because that is what
+/// a dotted `gen(p.a.b in …)` clause names. CS10 already refuses a cyclic graph
+/// (infinite), but an acyclic one is still exponential in its depth: eight
+/// nested fields repeated eight deep is 16.7M aliases, each an emitted item.
+/// 4096 is far beyond any declaration a person writes (the shipped examples
+/// reach 2) and turns a hung compile into a diagnosis.
+const MAX_NESTED_ALIASES: usize = 4096;
+
+/// One emitted nested spec alias.
+struct NestedAlias {
+    /// `Root__VericlSpec__a__b` — the name `#[vericl::kernel]` forms from a
+    /// dotted clause.
+    alias: Ident,
+    /// The nested struct's own spec type.
+    target: Ident,
+    vis: syn::Visibility,
+    /// `true` when the field at this path is `#[cube(comptime)]`, i.e. pinned
+    /// WHOLE by `instantiate(p.f = T { … })` rather than described field by
+    /// field. Such a path has no per-sub-field spec, so the alias points at a
+    /// marker type whose NAME is the diagnosis (see the emission site).
+    comptime_whole: bool,
+}
+
 /// CS10 + the nested spec aliases: every path `Root.a.b…` through the declared
-/// nesting graph, as `(alias ident, target spec ident, visibility)`.
+/// nesting graph.
 #[allow(clippy::type_complexity)]
-fn enumerate_nested_paths(
-    declared: &Declared,
-) -> syn::Result<Vec<(Ident, Ident, syn::Visibility)>> {
-    let mut out = Vec::new();
+fn enumerate_nested_paths(declared: &Declared) -> syn::Result<Vec<NestedAlias>> {
+    let mut out: Vec<NestedAlias> = Vec::new();
     for s in &declared.structs {
         let root = spec_ident(&s.ident);
         let mut stack: Vec<(Ident, String, Vec<String>)> =
@@ -712,7 +1061,48 @@ fn enumerate_nested_paths(
                     ));
                 }
                 let alias = format_ident!("{}__{}", alias_so_far, f.ident);
-                out.push((alias.clone(), spec_ident(&last.ident), cur.vis.clone()));
+                // CS10's size half: this is a GRAPH-path walk, so a perfectly
+                // legal DAG can be exponential in its depth (`k` fields of the
+                // same nested type at depth `d` is `k^d` aliases). Refuse with
+                // a diagnosis rather than swallowing the compiler.
+                if out.len() >= MAX_NESTED_ALIASES {
+                    return Err(syn::Error::new(
+                        f.ty.span(),
+                        format!(
+                            "this vericl::cube_struct! block's declared nesting graph expands to \
+                             more than {MAX_NESTED_ALIASES} distinct field PATHS — one hidden spec \
+                             alias is emitted per path (that is how `#[vericl::kernel]` resolves a \
+                             dotted `gen(p.a.b in …)` clause from the parameter's type alone), and \
+                             the count is the number of paths through the graph, not the number of \
+                             types: `k` nested fields repeated at depth `d` is `k^d`. Flatten the \
+                             declaration, or split it across blocks so each kernel names the shape \
+                             it actually uses"
+                        ),
+                    ));
+                }
+                if f.comptime {
+                    // A comptime struct field is pinned WHOLE — `instantiate(p.f
+                    // = T { … })` — so there is no per-sub-field spec beneath
+                    // it and no path to enumerate. Emitting the ordinary alias
+                    // here was a live type mismatch (round 11, LOW 5): the alias
+                    // named `T__VericlSpec` while the spec entry's type is `T`,
+                    // so `gen(p.f.k in …)` produced a raw `E0308` about two
+                    // generated type names. The marker alias below turns that
+                    // into `E0560` naming the reason.
+                    out.push(NestedAlias {
+                        alias,
+                        target: spec_ident(&last.ident),
+                        vis: cur.vis.clone(),
+                        comptime_whole: true,
+                    });
+                    continue;
+                }
+                out.push(NestedAlias {
+                    alias: alias.clone(),
+                    target: spec_ident(&last.ident),
+                    vis: cur.vis.clone(),
+                    comptime_whole: false,
+                });
                 let mut next_path = path.clone();
                 next_path.push(fty.clone());
                 stack.push((alias, last.ident.to_string(), next_path));
@@ -942,18 +1332,53 @@ mod tests {
         assert_ne!(hash_of(BASE), hash_of(&documented), "a doc comment must move STRUCT_HASH");
     }
 
-    /// STRUCT_HASH and CONFIG_HASH are the same hash of the same block — one
-    /// declared type may serve both parameter positions (design §6).
+    /// "One type, both positions" (design §6) — as **corrected in round 11**.
+    ///
+    /// `STRUCT_HASH` and `CONFIG_HASH` are the same hash of the same block, but
+    /// `ConfigIdentity` is emitted only where the type can genuinely occupy
+    /// `#[comptime]` position: CubeCL `Debug`-formats a comptime parameter and
+    /// derives `Hash`/`Eq` over it, and `f32` is none of those. The old code
+    /// emitted the impl unconditionally, so `BASE` (two `f32` fields) advertised
+    /// a capability that failed to compile — measured, three raw trait errors.
     #[test]
-    fn struct_hash_equals_config_hash_and_both_impls_are_emitted() {
-        let out = ok(BASE);
-        assert!(out.contains("impl :: vericl :: StructIdentity for Uniform"), "{out}");
-        assert!(out.contains("impl :: vericl :: ConfigIdentity for Uniform"), "{out}");
-        let s = hash_of(BASE);
+    fn config_identity_and_the_comptime_derives_track_field_hashability() {
+        // Float fields: StructIdentity yes, ConfigIdentity NO, and none of the
+        // four comptime-position derives.
+        let float = ok(BASE);
+        assert!(float.contains("impl :: vericl :: StructIdentity for Uniform"), "{float}");
+        assert!(
+            !float.contains("impl :: vericl :: ConfigIdentity for Uniform"),
+            "a float-field struct cannot be a #[comptime] parameter at any price: {float}"
+        );
+        assert!(!float.contains("core :: hash :: Hash"), "{float}");
+
+        // All-integer fields: both impls, and the four derives that make the
+        // second one true rather than aspirational.
+        let int_src = "pub struct IntCfg { pub m: u32, #[cube(comptime)] pub n: u32 }";
+        let int = ok(int_src);
+        assert!(int.contains("impl :: vericl :: StructIdentity for IntCfg"), "{int}");
+        assert!(int.contains("impl :: vericl :: ConfigIdentity for IntCfg"), "{int}");
+        for d in ["core :: fmt :: Debug", "core :: cmp :: PartialEq", "core :: cmp :: Eq", "core :: hash :: Hash"] {
+            assert!(int.contains(d), "{d} missing: {int}");
+        }
+        // …and the two hashes are the same hash of the same block.
         let marker = "CONFIG_HASH : & 'static str = \"";
-        let i = out.find(marker).expect("CONFIG_HASH");
-        let rest = &out[i + marker.len()..];
-        assert_eq!(s, rest[..rest.find('"').unwrap()].to_string());
+        let i = int.find(marker).expect("CONFIG_HASH");
+        let rest = &int[i + marker.len()..];
+        assert_eq!(hash_of(int_src), rest[..rest.find('"').unwrap()].to_string());
+
+        // Transitivity, both ways: a float NESTED inside an otherwise-integer
+        // struct disqualifies the outer one too.
+        let nested_ok = ok("pub struct In { pub k: u32 } pub struct Out { pub i: In, pub j: i64 }");
+        assert!(nested_ok.contains("impl :: vericl :: ConfigIdentity for Out"), "{nested_ok}");
+        let nested_no = ok("pub struct In { pub k: f32 } pub struct Out { pub i: In, pub j: i64 }");
+        assert!(!nested_no.contains("ConfigIdentity for Out"), "{nested_no}");
+        assert!(!nested_no.contains("ConfigIdentity for In"), "{nested_no}");
+
+        // An author-written std derive is not duplicated (that would be E0119).
+        let written = ok("#[derive(Debug, Hash)] pub struct P { pub a: u32 }");
+        assert_eq!(written.matches("Debug").count(), 1, "{written}");
+        assert_eq!(written.matches("Hash").count(), 1, "{written}");
     }
 
     /// The macro owns the derive set (design §5.2 point 3) and emits the
@@ -1084,6 +1509,139 @@ mod tests {
         assert!(g.contains("glob"), "{g}");
     }
 
+    /// CS11, half one — the round-11 CRITICAL: the **classification split**.
+    ///
+    /// `#[cfg_attr(all(), cube(comptime))]` was accepted, and the field it
+    /// carried was classified RUNTIME by vericl (a `(u32, u32)` spec entry,
+    /// drawn per case, `Default::default()` in the `CompilationArg` the
+    /// extracted IR is built from) and COMPTIME by CubeCL. The prover then
+    /// discharges obligations against an IR where the field is `0` while the
+    /// launched kernel runs with the drawn value — a false `Proved`. The
+    /// reviewer's exploit declaration is pinned verbatim as the first case.
+    #[test]
+    fn cfg_attr_anywhere_in_the_block_is_rejected() {
+        // The false-`Proved` exploit's own declaration block.
+        let split = err(
+            "pub struct Sneaky { pub a: f32, #[cfg_attr(all(), cube(comptime))] pub taps: u32 }",
+        );
+        assert!(split.contains("`#[cfg_attr(…)]`"), "{split}");
+        assert!(split.contains("false `Proved`"), "the measured consequence must be named: {split}");
+        assert!(split.contains("vericl::cube_struct!"), "the message must name THIS macro: {split}");
+
+        // The CS4 bypass spelling…
+        let cube = err("#[cfg_attr(all(), cube)] pub struct P { pub a: u32 }");
+        assert!(cube.contains("`#[cfg_attr(…)]`"), "{cube}");
+        // …and the CS5 one.
+        let der = err("#[cfg_attr(all(), derive(serde::Serialize))] pub struct P { pub a: u32 }");
+        assert!(der.contains("`#[cfg_attr(…)]`"), "{der}");
+        // A `cfg_attr` on an enum, a variant and a `use` is caught too — the
+        // gate is a whole-file walk, not an item-kind list.
+        for src in [
+            "#[cfg_attr(all(), derive(Evil))] pub enum M { A } pub struct P { pub a: u32 }",
+            "pub enum M { #[cfg_attr(all(), doc = \"x\")] A } pub struct P { pub a: u32, #[cube(comptime)] pub m: M }",
+            "#[cfg_attr(all(), allow(unused))] use core::u32 as _a; pub struct P { pub a: u32 }",
+        ] {
+            let e = err(src);
+            assert!(e.contains("`#[cfg_attr(…)]`"), "{src}: {e}");
+        }
+    }
+
+    /// CS11, half two — the FIELD-attribute whitelist, mirroring
+    /// `classify_param`'s discipline: the bare `#[cube(comptime)]` and doc
+    /// comments pass, everything else is rejected by name.
+    ///
+    /// The `#[cube(comptime, launch)]` case is the reason "bare" is checked
+    /// structurally: the old recognizer scanned the argument list for the word
+    /// `comptime` and would have classified that field comptime while handing
+    /// CubeCL an attribute it means something else by.
+    #[test]
+    fn field_attributes_are_whitelisted_not_denylisted() {
+        // Accepted: the marker, doc comments, and both together.
+        ok("pub struct P { /// docs\n pub a: u32, #[cube(comptime)] /// more\n pub b: u32 }");
+        for (attr, needle) in [
+            ("#[serde(skip)]", "serde"),
+            ("#[allow(dead_code)]", "allow"),
+            ("#[cfg(feature = \"x\")]", "cfg"),
+            ("#[repr(C)]", "repr"),
+        ] {
+            let e = err(&format!("pub struct P {{ pub a: u32, {attr} pub b: u32 }}"));
+            assert!(e.contains("outside the vericl v1 subset"), "{attr}: {e}");
+            assert!(e.contains(needle), "the rejection must name the attribute: {attr}: {e}");
+            assert!(e.contains("P.b"), "the rejection must name the field: {attr}: {e}");
+        }
+        // A NON-BARE `#[cube(...)]` is not the marker: it falls through to CS4,
+        // whose diagnosis is the more actionable one for a `#[cube]` spelling.
+        // That it is not silently classified as the comptime marker is the
+        // load-bearing half — `#[cube(comptime, launch)] pub b: f32` would
+        // otherwise be admitted as a comptime field of a type CubeCL cannot
+        // `Hash`.
+        for attr in ["#[cube(comptime, launch)]", "#[cube]", "#[cube(comptime = true)]"] {
+            let e = err(&format!("pub struct P {{ pub a: u32, {attr} pub b: f32 }}"));
+            assert!(
+                e.contains("the only admitted spelling is `#[cube(comptime)]` on a FIELD"),
+                "{attr}: {e}"
+            );
+        }
+        let non_bare: syn::ItemStruct =
+            syn::parse_quote!(pub struct P { #[cube(comptime, launch)] pub b: f32 });
+        assert!(
+            !is_cube_comptime_field(&non_bare.fields.iter().next().expect("one field").attrs),
+            "a non-bare `#[cube(...)]` must not be read as the comptime marker"
+        );
+    }
+
+    /// CS8's derive-name half (round 11, co-reviewer): the derive gate admits a
+    /// `#[derive(X)]` by comparing `X` to the `std` set BY NAME, exactly as the
+    /// root gate compares a path root by name — so rebinding a `std` derive name
+    /// is the same escape one namespace over.
+    #[test]
+    fn rebinding_a_std_derive_name_is_rejected() {
+        for d in ["Hash", "Debug", "Default", "PartialEq"] {
+            let e = err(&format!(
+                "use crate::evil as {d}; #[derive({d})] pub struct P {{ pub a: u32 }}"
+            ));
+            assert!(e.contains("rebinds a DERIVE name"), "{d}: {e}");
+            assert!(e.contains("vericl::cube_struct!"), "{d}: {e}");
+        }
+        // Negative control: a name that is neither a root, a primitive nor a
+        // std derive is still importable.
+        ok("use core::u32 as _u32alias; pub struct P { pub a: u32 }");
+    }
+
+    /// CS2's single-segment requirement (round 11, MODERATE 4) — the
+    /// qualified-path aliasing escape CS8 structurally could not see.
+    ///
+    /// CS2 and `NumKind::of` both resolve a field type by its FINAL segment, so
+    /// `sm::u32` was "a `u32`" to every gate and every generated draw while
+    /// resolving to whatever `sm` exports; CS8 saw only `use crate::shady as
+    /// sm;`, which binds no name any gate reads. Closed at the resolution point.
+    #[test]
+    fn qualified_field_type_paths_are_rejected() {
+        for ty in ["sm::u32", "shady::f32", "crate::x::u32", "::core::primitive::u32"] {
+            let e = err(&format!("pub struct P {{ pub a: {ty} }}"));
+            assert!(e.contains("names a QUALIFIED path"), "{ty}: {e}");
+            assert!(e.contains("FINAL SEGMENT"), "{ty}: {e}");
+        }
+        // The whole exploit as written, `use` and all.
+        let full = err("use crate::shady as sm; pub struct P { pub a: sm::u32 }");
+        assert!(full.contains("names a QUALIFIED path"), "{full}");
+        // The cross-block struct spelling, which used to reach rustc as a raw
+        // E0308 in generated code (the spec/draw types are built from THIS
+        // block's `Inner`, the field is someone else's).
+        let x = err("pub struct Inner { pub k: u32 } pub struct P { pub i: other::Inner }");
+        assert!(x.contains("names a QUALIFIED path"), "{x}");
+        assert!(x.contains("declared in this block"), "{x}");
+        // A comptime field is covered by the same rule.
+        let c = err("pub struct P { pub a: u32, #[cube(comptime)] pub b: sm::u32 }");
+        assert!(c.contains("names a QUALIFIED path"), "{c}");
+        // NEGATIVE CONTROL: the buffer-valued deferral keeps its own diagnosis
+        // even when the author writes it qualified.
+        let b = err("pub struct P { pub a: cubecl::prelude::Array<f32> }");
+        assert!(b.contains("buffer-valued field"), "{b}");
+        // …and unqualified scalars / block-declared structs still pass.
+        ok("pub struct Inner { pub k: u32 } pub struct P { pub i: Inner, pub s: f32 }");
+    }
+
     /// CS9.
     #[test]
     fn unit_and_tuple_structs_are_rejected() {
@@ -1131,6 +1689,64 @@ mod tests {
         assert!(out.contains("type Inner__VericlSpec__d = Deep__VericlSpec"), "{out}");
     }
 
+    /// LOW 5 (round 11) — a `#[cube(comptime)]` field of a DECLARED struct type
+    /// is pinned **whole** (`instantiate(p.win = Win { … })`), so there is no
+    /// per-sub-field spec beneath it.
+    ///
+    /// The alias walk used to emit the ordinary `… = Win__VericlSpec` alias for
+    /// that path anyway, while the spec entry's own type is `Win` — so a
+    /// `gen(p.win.taps in …)` clause compiled into an assignment between two
+    /// generated type names and surfaced as a raw `E0308`. The marker type puts
+    /// the reason in the name, so rustc's own `E0560` states it.
+    #[test]
+    fn a_comptime_struct_field_is_pinned_whole_not_per_subfield() {
+        let out = ok(
+            "pub struct Win { pub taps: u32, pub stride: u32 } \
+             pub struct Cfg { pub gain: f32, #[cube(comptime)] pub win: Win }",
+        );
+        // The spec entry is the VALUE type — that is what `instantiate` pins.
+        assert!(out.contains("pub win : Win ,"), "{out}");
+        // …so the path alias must not claim a nested SPEC.
+        assert!(
+            !out.contains("type Cfg__VericlSpec__win = Win__VericlSpec"),
+            "the comptime path must not alias the nested spec: {out}"
+        );
+        assert!(
+            out.contains(
+                "type Cfg__VericlSpec__win = Cfg__VericlSpec__win__is_a_comptime_field_pinned_whole_by_instantiate"
+            ),
+            "{out}"
+        );
+        // NEGATIVE CONTROL: the same field as a RUNTIME field still gets the
+        // ordinary nested alias, so the marker is about comptime-ness and not
+        // about nesting.
+        let runtime = ok(
+            "pub struct Win { pub taps: u32, pub stride: u32 } \
+             pub struct Cfg { pub gain: f32, pub win: Win }",
+        );
+        assert!(runtime.contains("type Cfg__VericlSpec__win = Win__VericlSpec"), "{runtime}");
+    }
+
+    /// CS10's size half (round 11, LOW 7): the alias walk enumerates graph
+    /// PATHS, so an acyclic — therefore CS10-legal — declaration can still be
+    /// exponential. Six levels of four nested fields is 5460 paths.
+    #[test]
+    fn the_nested_alias_walk_is_capped_with_a_diagnosis() {
+        let mut src = String::from("pub struct L6 { pub k: u32 }");
+        for lvl in (0..6).rev() {
+            src.push_str(&format!(
+                " pub struct L{lvl} {{ pub a: L{n}, pub b: L{n}, pub c: L{n}, pub d: L{n} }}",
+                n = lvl + 1
+            ));
+        }
+        let e = err(&src);
+        assert!(e.contains("distinct field PATHS"), "{e}");
+        assert!(e.contains("k^d"), "the growth law must be stated: {e}");
+        // NEGATIVE CONTROL: the shipped shapes are nowhere near the cap.
+        ok("pub struct D { pub k: u32 } pub struct I { pub d: D, pub s: f32 } \
+            pub struct O { pub i: I, pub t: f32 }");
+    }
+
     /// The spec type carries one entry per field, in declaration order.
     #[test]
     fn spec_fields_track_the_declaration() {
@@ -1140,3 +1756,4 @@ mod tests {
         assert!(out.contains("pub inclusive : bool"), "a comptime field's spec entry is the pinned value: {out}");
     }
 }
+

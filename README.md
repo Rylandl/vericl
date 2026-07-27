@@ -336,7 +336,20 @@ consumers — the same property `#[vericl::helper]` and `vericl::config!` rest o
 |---|---|---|
 | runtime scalar | `f32` `f64` `u32` `i32` `u64` `i64` | generated exactly as a loose scalar parameter of that type is; `usize`/`bool` are comptime-only because there is no scalar draw for them |
 | nested struct | any struct declared in the **same** block | one block is one `STRUCT_HASH`, so a sibling-block type would contribute meaning without contributing to identity |
-| `#[cube(comptime)]` | integer, `bool`, `char`, or a unit enum declared in the same block | it keeps its positional launch slot but takes the plain host type; no float, because CubeCL's generated `CompilationArg` derives `Hash`/`Eq` and `f32` is neither |
+| `#[cube(comptime)]` | integer, `bool`, `char`, a unit enum declared in the same block, or another declared struct whose fields are all of those (pinned **whole**) | it keeps its positional launch slot but takes the plain host type; no float anywhere in the shape, because CubeCL's generated `CompilationArg` derives `Hash`/`Eq` and `f32` is neither |
+
+Field types are written **unqualified** (`u32`, not `sm::u32`): VeriCL resolves a field type by its
+last path segment, so a qualified path is rejected rather than trusted. A field may carry only the
+bare `#[cube(comptime)]` marker and doc comments, and `#[cfg_attr(…)]` is rejected anywhere in the
+block — rustc expands it *after* the macro has classified the attribute, which is exactly how the
+macro and the compiler come to disagree about which fields are comptime.
+
+**One type, both positions — when the fields allow it.** If every field in the transitive shape is
+integer/`bool`/`char`/unit-enum, the macro also emits `Debug`/`PartialEq`/`Eq`/`Hash` (what CubeCL
+requires of a `#[comptime]` parameter) and `ConfigIdentity`, so the same declaration serves `p: &T`
+*and* `#[comptime] p: T` under one hash. A float field anywhere makes the comptime position
+unavailable at any price, and the `ConfigIdentity` diagnostic says so rather than surfacing as three
+raw trait errors.
 
 `Array`/`Tensor`/`Slice`/`View`/`Sequence`/`SharedMemory` fields are **deferred**, with a rejection
 that names all four missing pieces (a twin mirror type holding `&[T]`, a per-field entry in the

@@ -36,6 +36,12 @@
 //!    (pinned in `vericl-macros`' `impl_blocks_and_cube_attributes_are_rejected`;
 //!    restated here as the documented boundary).
 //!
+//! 4. `forged_struct_identity_is_a_complete_bypass` — the round-11 addition, and
+//!    a residual of a *different kind*: `StructIdentity` is a public, unsealed
+//!    trait, so a hand-written impl for a type the macro never saw bypasses the
+//!    mechanism entirely rather than partially. Written so that it stops
+//!    compiling if the trait is ever sealed.
+//!
 //! The backstop for (2) beyond this file: a struct-derived value that reaches
 //! the device is in the IR, so `Identity::ir_hash` moves even when `source_hash`
 //! does not.
@@ -169,13 +175,66 @@ fn out_of_block_impls_do_not_move_struct_hash() {
         "an in-block declaration edit MUST move STRUCT_HASH"
     );
 
-    // And the runtime-struct trait is not silently the config one: a declared
-    // cube struct carries BOTH, with the same hash, so one type may serve both
-    // parameter positions (design §6, "one type, both positions").
+    // And the runtime-struct trait is not silently the config one: `C`'s single
+    // field is a `u32`, so it is comptime-usable and carries BOTH traits with
+    // the same hash — one type, both positions (design §6, as **corrected** in
+    // round 11: the second impl is emitted only for a declared type whose whole
+    // field shape is integer/bool/char/unit-enum, because CubeCL `Debug`-formats
+    // a comptime parameter and derives `Hash`/`Eq` over it, and `f32` is none of
+    // those).
     assert_eq!(
         <residual_a::C as StructIdentity>::STRUCT_HASH,
         <residual_a::C as vericl::ConfigIdentity>::CONFIG_HASH,
-        "a cube_struct! type's STRUCT_HASH and CONFIG_HASH are one hash of one block"
+        "a comptime-usable cube_struct! type's STRUCT_HASH and CONFIG_HASH are one hash of one block"
+    );
+}
+
+// (4) The FORGED-IDENTITY bypass (round-11 review, LOW 6).
+//
+// `StructIdentity` is a public, unsealed trait. Nothing stops an author writing
+// the impl by hand for a type `vericl::cube_struct!` never saw — and that is not
+// a narrow gap in one gate, it is a complete bypass of the mechanism: no gate
+// runs on the type, its `#[cube] impl` methods are unrestricted, and its
+// recorded identity is a constant that by construction never goes stale.
+//
+// It is recorded rather than closed. A `#[proc_macro]` cannot seal a trait, and
+// VeriCL's guarantee has never been "an author cannot lie to their own evidence
+// file" — it is "an author who does not lie gets an identity that moves when the
+// meaning does". Every gate is aimed at accidental drift.
+
+/// A type `vericl::cube_struct!` never saw, wearing the trait anyway.
+#[derive(Clone, Copy)]
+struct Forged {
+    #[allow(dead_code)]
+    k: u32,
+}
+
+impl StructIdentity for Forged {
+    const STRUCT_HASH: &'static str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+}
+
+/// (4) The acknowledgment test, written to FAIL IF THE HOLE IS CLOSED.
+///
+/// If `StructIdentity` is ever sealed, this file stops compiling — at which
+/// point `vericl-macros`' `cube_struct` residual section and this comment are
+/// wrong and must be rewritten. That is the point of writing it down as code.
+#[test]
+fn forged_struct_identity_is_a_complete_bypass() {
+    // The forged hash is whatever the author typed, and it covers nothing: the
+    // type has no declaration block, no gates, and no emitted constructor.
+    assert_eq!(<Forged as StructIdentity>::STRUCT_HASH, "sha256:0000000000000000000000000000000000000000000000000000000000000000");
+    // Discrimination against the honest path: a real declared struct's hash is
+    // derived from tokens, so two different declarations differ — the forged one
+    // cannot differ from itself no matter what is edited.
+    assert_ne!(
+        <Forged as StructIdentity>::STRUCT_HASH,
+        <residual_a::C as StructIdentity>::STRUCT_HASH,
+        "a declared struct's hash must not collide with a hand-written constant"
+    );
+    assert_ne!(
+        <residual_a::C as StructIdentity>::STRUCT_HASH,
+        <residual_c::C as StructIdentity>::STRUCT_HASH,
+        "…and the honest path is the one where an edit moves the hash"
     );
 }
 

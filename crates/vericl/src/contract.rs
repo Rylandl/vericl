@@ -218,8 +218,10 @@ impl Contract {
 }
 
 /// Identity of a struct/enum used as a struct-typed `#[comptime]` kernel
-/// parameter (a *config type*), implemented **only** by the
-/// `vericl::config! { … }` item macro.
+/// parameter (a *config type*), implemented by the `vericl::config! { … }` item
+/// macro — and by `vericl::cube_struct! { … }` for the declared types that can
+/// actually stand in that position (see "Cube structs in comptime position"
+/// below).
 ///
 /// # Why this trait exists
 ///
@@ -267,11 +269,31 @@ impl Contract {
 /// is exactly what an identity fold is for. An alias to anything *else* still
 /// hits the `#[diagnostic::on_unimplemented]` message below, which names the
 /// alias case explicitly so the diagnosis is not misleading.
+///
+/// # Cube structs in comptime position (round-11 correction)
+///
+/// `vericl::cube_struct!` also emits this trait — but **only** for the types
+/// that can genuinely occupy `#[comptime]` position, which is not all of them.
+/// The trait is one of two requirements; the other is CubeCL's, and it is not
+/// negotiable: a comptime parameter is `Debug`-formatted and its
+/// `CompilationArg` derives `Hash`/`Eq`. Measured (round-11 review) — a
+/// two-`u32` `cube_struct!` type in comptime position failed with `no method
+/// named 'hash'`, `no method named 'eq'` and "doesn't implement `Debug`" while
+/// its `ConfigIdentity` impl was present and correct.
+///
+/// So `cube_struct!` now emits those four derives itself for a declared type
+/// whose transitive field shape is entirely integers/`bool`/`char`/unit enums,
+/// and emits `ConfigIdentity` for exactly the same set. A struct with an
+/// `f32`/`f64` field anywhere gets neither, because no derive set can give
+/// `f32` `Hash` or `Eq` — such a type is a runtime parameter type only, and
+/// naming it in comptime position lands on the note below rather than on three
+/// raw trait errors pointing at `#[cube(launch)]`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is used as a struct-typed #[comptime] parameter but is not declared with a `vericl::config!` block",
     label = "not a vericl config type",
     note = "wrap the type AND its impl blocks in `vericl::config! {{ … }}` so vericl can fold the config's definition into kernel identity and gate its method bodies for host-callability",
-    note = "if `{Self}` is a TYPE ALIAS, note that vericl's macro cannot see through it (a proc macro has no name resolution): an alias for a scalar primitive resolves here automatically, but an alias for a struct/enum needs that underlying type declared with `vericl::config!`"
+    note = "if `{Self}` is a TYPE ALIAS, note that vericl's macro cannot see through it (a proc macro has no name resolution): an alias for a scalar primitive resolves here automatically, but an alias for a struct/enum needs that underlying type declared with `vericl::config!`",
+    note = "if `{Self}` is declared with `vericl::cube_struct!`, note that only a declared type whose fields are ALL integer/bool/char/unit-enum (transitively) can occupy #[comptime] position: CubeCL Debug-formats a comptime parameter and derives Hash/Eq over it, and `f32`/`f64` is none of those — so a float-field cube struct is a RUNTIME parameter type only. Pass it as `p: T` / `p: &T` and pin the integer parts with `#[cube(comptime)]` fields, or declare a separate all-integer type for the comptime half"
 )]
 pub trait ConfigIdentity {
     /// SHA-256 (as `"sha256:<hex>"`) over the entire `vericl::config!` token
@@ -326,15 +348,17 @@ pub trait ConfigIdentity {
 /// `vericl::cube_struct!` emits `StructIdentity` for the **structs** it
 /// declares, never for an enum: a payload-carrying runtime enum lowers to a tag
 /// plus every variant's payload and has no twin model in the v1 subset, and a
-/// unit enum's place in the subset is as a `#[cube(comptime)]` *field* type
-/// (where it needs no `CubeType` derive at all). A declared enum therefore gets
-/// [`ConfigIdentity`] only, and naming it in runtime parameter position lands on
-/// the message below.
+/// unit enum's place in the subset is as a `#[cube(comptime)]` *field* type or a
+/// `#[comptime]` parameter (where it needs no `CubeType` derive at all — though
+/// it does need `Clone`/`Copy`/`Debug`/`PartialEq`/`Eq`/`Hash`, which the macro
+/// emits for it as of round 11; without them the shape did not compile).
+/// A declared enum therefore gets [`ConfigIdentity`] only, and naming it in
+/// runtime parameter position lands on the message below.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is used as a runtime CubeType parameter but is not declared with a `vericl::cube_struct!` block",
     label = "not a vericl cube struct",
     note = "wrap the struct declaration in `vericl::cube_struct! {{ … }}` so vericl can fold the struct's definition into kernel identity, emit the CubeType/CubeLaunch derives, and build the launch argument from the declared field order — a field reorder or type change would otherwise alter what the kernel computes while leaving its recorded identity bit-identical",
-    note = "if `{Self}` is declared with `vericl::config!`, note that a config type is NOT a runtime parameter type: `vericl::config!` gates its methods for HOST-callability because a comptime config runs on the host, while a runtime parameter is device data. Declare it with `vericl::cube_struct!` instead — a `cube_struct!` type may also be used as a #[comptime] parameter, but the reverse is not sound",
+    note = "if `{Self}` is declared with `vericl::config!`, note that a config type is NOT a runtime parameter type: `vericl::config!` gates its methods for HOST-callability because a comptime config runs on the host, while a runtime parameter is device data. Declare it with `vericl::cube_struct!` instead — a `cube_struct!` type may ALSO be used as a #[comptime] parameter when every one of its fields is integer/bool/char/unit-enum (CubeCL Debug-formats a comptime parameter and derives Hash/Eq over it, which no float field can satisfy), and the reverse is never sound",
     note = "if `{Self}` is an ENUM, a payload-carrying runtime enum parameter is outside the vericl v0 subset (CubeCL lowers it to a tag plus every variant's payload, and the twin would need a matching host discriminant model); a `#[cube(comptime)]` unit-enum FIELD inside a `vericl::cube_struct!` type is supported instead"
 )]
 pub trait StructIdentity {

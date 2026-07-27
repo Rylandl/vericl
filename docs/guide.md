@@ -566,6 +566,16 @@ itself, and **rejects them if you write them** — an author-chosen derive set i
 switch (dropping `CubeLaunch` turns the type from launchable to device-local with your kernel's
 tokens unchanged), and `Clone`/`Copy` are what let the generated twin bind the struct by value.
 
+**And, when it can, four more.** If every field in the type's transitive shape is an integer, `bool`,
+`char`, a unit enum declared in the same block, or another such struct, the macro *also* emits
+`Debug`, `PartialEq`, `Eq` and `Hash` — the four CubeCL requires before a type may appear in
+`#[comptime]` position — plus the `ConfigIdentity` impl. **That is the whole recipe**: such a type
+serves *both* positions, `p: &T` and `#[comptime] p: T`, from one declaration and one hash. A type
+with an `f32`/`f64` field anywhere gets neither, because no derive set can give `f32` `Hash` or `Eq`;
+naming it in `#[comptime]` position is a `ConfigIdentity` error whose note says so. (Unlike the four
+above, these are ordinary `std` derives — if you write one yourself, the macro simply does not
+duplicate it.)
+
 **Why the declaration is mandatory.** Two measured reasons, both about identity:
 
 1. A struct type's *definition* is in neither input of `SOURCE_HASH`. Before this milestone, a
@@ -588,10 +598,23 @@ reads `args.lower_bound` with the same tokens the device gets, and hands the who
   (`usize`/`bool` are comptime-only: VeriCL has no scalar draw for them.)
 - another struct declared **in the same block** — nested to any depth, with dotted clauses to match
   (`gen(cfg.window.gain in 0.5..=2.0)`).
-- `#[cube(comptime)] pub taps: u32` — an integer, `bool`, `char`, or a unit enum declared in the
-  same block. It keeps its positional launch slot but takes the plain host type, never reaches the
-  device, and is pinned once with `instantiate(cfg.window.taps = 3)`. No float: CubeCL's generated
-  `CompilationArg` derives `Hash`/`Eq`, and `f32` is neither.
+- `#[cube(comptime)] pub taps: u32` — an integer, `bool`, `char`, a unit enum declared in the same
+  block, or another declared struct whose own fields are all of those. It keeps its positional launch
+  slot but takes the plain host type, never reaches the device, and is pinned once with
+  `instantiate(cfg.window.taps = 3)`. A struct-typed one is pinned **whole**
+  (`instantiate(p.win = Win { taps: 3, stride: 2 })`) — there is no per-sub-field `gen`/`instantiate`
+  surface beneath it, and writing one is an `E0560` naming a type called
+  `…__is_a_comptime_field_pinned_whole_by_instantiate`. No float anywhere in the shape: CubeCL's
+  generated `CompilationArg` derives `Hash`/`Eq`, and `f32` is neither.
+
+Write the field type **unqualified** — `u32`, not `sm::u32`, and `Inner`, not `other::Inner`. VeriCL
+resolves a field type by the name of its last path segment, so a qualified path is rejected rather
+than trusted: the tail of `sm::u32` says nothing about what it resolves to.
+
+A field may carry only the bare `#[cube(comptime)]` marker and doc comments — every other attribute,
+including `#[cfg]` and `#[cfg_attr]`, is rejected by name. `cfg_attr` in particular is rejected
+*anywhere* in the block: rustc expands it after VeriCL has already classified the attribute, so it
+would let the macro and the compiler disagree about which fields are comptime.
 
 Buffer-valued fields (`Array`, `Tensor`, `Slice`, `View`, `Sequence`, `SharedMemory`) are
 **deferred**, and the rejection names all four missing pieces rather than waving at "not supported".

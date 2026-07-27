@@ -694,13 +694,38 @@ grows one section. A `STRUCT_HASH` is a leaf `const`, so `MAX_HELPER_COMPOSITION
 `<P as StructIdentity>::STRUCT_HASH`, so an undeclared type fails `E0277` with a
 `#[diagnostic::on_unimplemented]` message at the parameter's own span (R1).
 
-**One type, both positions.** `is_config_comptime_type` (`lib.rs:2106-2116`) requires
-`ConfigIdentity` of *any* non-scalar `#[comptime]` parameter type, so `cube_struct!` emits
-`ConfigIdentity` **as well as** `StructIdentity` with the same hash. A declared struct may therefore
-also be a `#[comptime]` parameter — the corpus shape `docs/design-struct-comptime.md` §9 records as
-"config type deriving `CubeType`". It is not a replacement for `vericl::config!`, because CS4 leaves
-a `cube_struct!` type with no methods and the ecosystem's comptime configs are method-heavy
-(132 config methods surveyed); the two macros are for the two halves of that split.
+**One type, both positions — CONDITIONALLY (corrected, round-11 review).**
+`is_config_comptime_type` (`lib.rs:2106-2116`) requires `ConfigIdentity` of *any* non-scalar
+`#[comptime]` parameter type, so `cube_struct!` emits `ConfigIdentity` as well as `StructIdentity`
+with the same hash. A declared struct may therefore also be a `#[comptime]` parameter — the corpus
+shape `docs/design-struct-comptime.md` §9 records as "config type deriving `CubeType`". It is not a
+replacement for `vericl::config!`, because CS4 leaves a `cube_struct!` type with no methods and the
+ecosystem's comptime configs are method-heavy (132 config methods surveyed); the two macros are for
+the two halves of that split.
+
+**What this section originally shipped was false, and is now correct.** `ConfigIdentity` was emitted
+unconditionally, but the trait is only *half* the requirement: CubeCL `Debug`-formats a comptime
+parameter and derives `Hash`/`Eq` over its `CompilationArg`, and `cube_struct!` emitted only
+`Clone`/`Copy`/`CubeType`/`CubeLaunch`. Measured at round 11 — a two-`u32` declared struct as
+`#[comptime] c: IntCfg` failed with `no method named 'hash'`, `no method named 'eq'` and "doesn't
+implement `Debug`", *with the `ConfigIdentity` impl present*. So the capability worked for **no**
+declared type at all, and for a float-field type it cannot work at any price (`f32` is neither `Hash`
+nor `Eq`).
+
+The rule as implemented:
+
+- a declared type is comptime-usable **iff** its whole transitive field shape is
+  integer/`bool`/`char`/declared-unit-enum — one `f32`/`f64` anywhere disqualifies it;
+- for those types `cube_struct!` emits `Debug`/`PartialEq`/`Eq`/`Hash` itself (skipping any the
+  author wrote) plus `ConfigIdentity`, so the author writes no recipe;
+- for the rest it emits neither, so naming one in comptime position is one `ConfigIdentity`
+  `on_unimplemented` note naming the reason instead of three raw trait errors at `#[cube(launch)]`.
+
+The same four derives are what made two other CS2-advertised shapes compile for the first time: a
+declared **unit enum** as a `#[cube(comptime)]` field (previously `E0204` on the owning struct's
+`Copy`), and a declared **struct** as a `#[cube(comptime)]` field, pinned whole by
+`instantiate(p.win = Win { … })`. Both now ship as examples (`blend_mode_map`,
+`strided_window_sum`).
 
 The converse does **not** hold: `vericl::config!` does not emit `StructIdentity`, because a config
 type's methods are gated for *host*-callability (config G3/G4) and nothing has checked them as device
@@ -823,7 +848,7 @@ Every cell measured unless marked. "PASS" = wgpu/Metal differential green at the
 | `gen(p.field in lo..=hi)` | **support** (new grammar) | §5.5; the two-segment form is the only contract-surface change |
 | `instantiate(p.field = …)` for a comptime field | **support** (new grammar) | §5.5, reusing `is_pinnable_config_expr` `lib.rs:2157-2185` |
 | f64 lane | **support** (inherited) | field precision is per-field; the compare tier still comes from the `ArrayMut` element type (`lib.rs:3390-3419`) |
-| declared struct also used as a `#[comptime]` param | **support** | §6 — `cube_struct!` emits `ConfigIdentity` too |
+| declared struct also used as a `#[comptime]` param | **support, when all fields are hashable** | §6 — `cube_struct!` emits `ConfigIdentity` + `Debug`/`PartialEq`/`Eq`/`Hash` for an all-integer/bool/char/unit-enum shape; a float field makes the position unavailable (round-11 correction) |
 | `vericl::config!` type used as a **runtime** struct param | **reject** (targeted, R6) | a config's methods are gated host-callable, not device-callable |
 | **`Array`/`Tensor` field** | **reject** (targeted, R3) → v1.1 | X6–X8 measured working; I3 measured identical IR; deferred on scope, §10.5 |
 | **`Slice`/`View`/`Sequence`/`SharedMemory` field** | **reject** (targeted, R3) | the View/Layout and `Sequence` milestones own these |

@@ -15,7 +15,8 @@
 //!
 //! | item | gate | config | cube_struct |
 //! |---|---|---|---|
-//! | [`check_use_items`] | `use` may not rebind an allowlisted root, and may not glob | G12 | CS8 |
+//! | [`check_use_items`] | `use` may not rebind an allowlisted root, a primitive **or a `std` derive name**, and may not glob | G12 | CS8 |
+//! | [`check_no_cfg_attr`] | no `#[cfg_attr(…)]` anywhere: it makes the attribute set the gates read and the one rustc expands two different sets | G14 | CS11 |
 //! | [`derive_paths`] / [`STD_DERIVES`] | only `std` derives (a custom derive's *definition* is unhashed) | G11 | CS5 |
 //! | [`PRIMITIVE_TYPES`] | the scalar names both blocks resolve field types against | G6 | CS2 |
 //! | [`EXTERNAL_ROOTS`] | the path roots that are not user code | G4/G9 | CS8 |
@@ -31,6 +32,7 @@
 use proc_macro2::TokenStream as TokenStream2;
 use quote::ToTokens;
 use syn::spanned::Spanned;
+use syn::visit::Visit;
 use syn::{Ident, Item};
 
 /// Scalar primitive names a declaration block resolves field types against, and
@@ -110,6 +112,24 @@ pub(crate) fn render_path(path: &syn::Path) -> String {
 /// field type by the name of its final segment: `use crate::evil as u32;` would
 /// make an arbitrary type pass the scalar check.
 ///
+/// # What this gate does and does not close (round-11 correction)
+///
+/// It closes exactly one shape: a `use` that **binds one of the names a gate
+/// reads**. That is the whole story for `config!`, whose G4/G9 require the path
+/// **root** to be `core`/`std`/`alloc` or a block-declared name — an unrelated
+/// alias (`use crate::evil as sm;`) cannot help, because `sm::cmp::max(…)` is
+/// rejected on the root.
+///
+/// It was **not** the whole story for `cube_struct!`, which resolves a field
+/// type by its **final segment**: `use crate::shady as sm;` binds `sm`, which
+/// this gate has no reason to refuse, and `f: sm::u32` then passes CS2 as a
+/// `u32` while resolving to whatever `shady::u32` is. Chasing that at the import
+/// is hopeless (the tail can come from any path). It is closed at the point of
+/// resolution instead: CS2 requires a field type to be a **single-segment**
+/// path, so there is no tail to trick. This gate's claim is therefore narrowed
+/// to what it actually enforces, rather than left reading as "field types cannot
+/// be re-pointed".
+///
 /// `macro_name` names the macro in the diagnostic; `resolved_by` names *what*
 /// resolves by name in that macro ("G4/G9 resolve a call/read", "CS2 resolves a
 /// field type"), so the message stays specific in both.
@@ -165,6 +185,26 @@ pub(crate) fn check_use_items(
                      library. Import it under a different name"
                 ),
             ));
+            return;
+        }
+        // The DERIVE-name sibling of the same escape (round-11 review). Both
+        // macros' derive gates admit a `#[derive(X)]` by comparing `X` to
+        // [`STD_DERIVES`] BY NAME, exactly as the root gate above compares a
+        // path root by name — so `use evil_derive::Evil as Hash;` followed by
+        // `#[derive(Hash)]` runs a proc-macro derive whose *definition* the
+        // block neither hashes nor gates, which is precisely the escape
+        // `check_derives` exists to close.
+        if is_std_derive(&s) {
+            errors.push(syn::Error::new(
+                name.span(),
+                format!(
+                    "a `use … as {s};` inside a {macro_name} block rebinds a DERIVE name the \
+                     block's derive gate admits BY NAME — after it, `#[derive({s})]` would run a \
+                     proc-macro derive whose DEFINITION decides the type's impls and which the \
+                     block neither hashes nor gates, while still spelling like a `std` derive. \
+                     Import it under a different name"
+                ),
+            ));
         }
     }
     for item in &file.items {
@@ -172,6 +212,71 @@ pub(crate) fn check_use_items(
             walk(&u.tree, macro_name, resolved_by, errors);
         }
     }
+}
+
+/// The shared **classification-split** gate — `vericl::config!`'s G14 and
+/// `vericl::cube_struct!`'s CS11, one implementation.
+///
+/// A `#[cfg_attr(pred, attr)]` is rejected **anywhere** inside a declaration
+/// block, on any item, field, variant or nested position.
+///
+/// Every gate in both macros reads the attribute list **as written**: CS4/G2 ask
+/// "is this attribute `cube`", `check_derives` asks "is this attribute `derive`
+/// and is its argument a `std` derive", and `cube_struct!`'s field classifier
+/// asks "does this field carry `#[cube(comptime)]`". `cfg_attr` is expanded by
+/// **rustc**, after the proc macro has already answered all of those questions,
+/// so the attribute set the gates classified against and the attribute set that
+/// decides what the code *means* are two different sets. That is not a gap in
+/// one gate — it is a re-spelling of every by-name gate at once.
+///
+/// Measured (round-11 review): `#[cfg_attr(all(), cube(comptime))]` on a
+/// `vericl::cube_struct!` field is classified **runtime** by VeriCL — it gets a
+/// `gen(...)` range, is drawn per case, and its `CompilationArg` entry is
+/// `Default::default()` — and **comptime** by CubeCL, which turns the launched
+/// value into a compile-time constant. The IR VeriCL extracts and hands the
+/// prover is therefore built with the field pinned at `0` while the kernel that
+/// actually runs is built with the drawn value: obligations discharged against a
+/// kernel that does not exist, i.e. a false `Proved`. The same spelling also
+/// bypasses the `#[cube]` gate (`#[cfg_attr(all(), cube)]`) and the derive gate
+/// (`#[cfg_attr(all(), derive(Evil))]`).
+///
+/// There is no narrower fix: evaluating the predicate would require the macro to
+/// know the crate's active features (it does not), and admitting `cfg_attr` only
+/// for attributes the block already rejects would still leave the *classifying*
+/// attributes conditional. Write the attribute unconditionally, or put the
+/// conditional compilation outside the block.
+pub(crate) fn check_no_cfg_attr(file: &syn::File, macro_name: &str, errors: &mut Vec<syn::Error>) {
+    struct CfgAttrCheck<'a> {
+        macro_name: &'a str,
+        errors: &'a mut Vec<syn::Error>,
+    }
+    impl<'ast> Visit<'ast> for CfgAttrCheck<'_> {
+        fn visit_attribute(&mut self, i: &'ast syn::Attribute) {
+            if i.path().is_ident("cfg_attr") {
+                let macro_name = self.macro_name;
+                self.errors.push(syn::Error::new(
+                    i.span(),
+                    format!(
+                        "a `#[cfg_attr(…)]` inside a {macro_name} block is outside the vericl v1 \
+                         subset — every gate in this block reads the attribute list AS WRITTEN, \
+                         but `cfg_attr` is expanded by rustc AFTER the macro has classified it, so \
+                         the attributes vericl gated against and the attributes that decide what \
+                         the code MEANS are two different sets. Measured: \
+                         `#[cfg_attr(all(), cube(comptime))]` on a cube_struct! field is classified \
+                         RUNTIME by vericl (drawn per case, `Default::default()` in the extracted \
+                         `CompilationArg`) and COMPTIME by CubeCL (a compile-time constant), so the \
+                         IR the prover discharges obligations against is not the IR that runs — a \
+                         false `Proved`. The same spelling re-writes the `#[cube]` gate \
+                         (`#[cfg_attr(all(), cube)]`) and the derive gate \
+                         (`#[cfg_attr(all(), derive(Evil))]`). Write the attribute unconditionally, \
+                         or move the conditional compilation outside the block"
+                    ),
+                ));
+            }
+            syn::visit::visit_attribute(self, i);
+        }
+    }
+    CfgAttrCheck { macro_name, errors }.visit_file(file);
 }
 
 /// Reject a custom `#[derive(...)]` on `attrs`, allowing [`STD_DERIVES`] plus

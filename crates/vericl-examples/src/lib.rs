@@ -2271,6 +2271,42 @@ pub fn stage_window_sum(x: &Array<f32>, cfg: &StageArgs, y: &mut Array<f32>) {
     }
 }
 
+/// The A/B partner of `stage_window_sum`: **byte-identical body**, pinned at
+/// `taps = 5` instead of 3.
+///
+/// It exists because the claim "the pinned comptime FIELD reaches the extracted
+/// IR" needs a discriminating measurement, and the test that asserted it did not
+/// have one (round-11 review, MODERATE 3): it checked the twin's arithmetic and
+/// that the pin appears in the recorded contract string, both of which stay true
+/// if the field never reaches the IR at all. Two pins, one body, two
+/// `kernel_ir_hash`es is the assertion that fails if it does not — and
+/// `kernel_ir_hash` deliberately skips `kernel_name` (see `vericl_ir::hash`), so
+/// the two differing names cannot be what moves it. Not suite-wired.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-4),
+    gen(
+        x in -10.0..=10.0,
+        y in 0.0..=0.0,
+        cfg.window.gain in 0.5..=2.0,
+        cfg.bias in -1.0..=1.0
+    ),
+    instantiate(cfg.window.taps = 5)
+)]
+#[cube(launch)]
+pub fn stage_window_sum_taps5(x: &Array<f32>, cfg: &StageArgs, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let mut acc = x[ABSOLUTE_POS];
+        for j in 1..cfg.window.taps {
+            let idx = ABSOLUTE_POS + j as usize;
+            if idx < x.len() {
+                acc += x[idx];
+            }
+        }
+        y[ABSOLUTE_POS] = acc * cfg.window.gain + cfg.bias;
+    }
+}
+
 vericl::cube_struct! {
     /// A **device-local aggregate**: built inside a kernel body, never launched.
     /// This is the shape the ecosystem actually uses — 19 of the corrected 20
@@ -4654,3 +4690,168 @@ mod tests {
         }
     }
 }
+
+// --- "One type, both positions", as corrected in round 11 -------------------
+//
+// The design's §6 claim shipped unconditionally: `vericl::cube_struct!` emitted
+// `ConfigIdentity` for every declared struct, so every declared type advertised
+// that it could also be a `#[comptime]` parameter. Measured in round 11, that
+// was false for ALL of them — the trait is only half the requirement, and
+// CubeCL's half (a comptime parameter is `Debug`-formatted and its
+// `CompilationArg` derives `Hash`/`Eq`) was never met, because the macro emitted
+// only `Clone`/`Copy`/`CubeType`/`CubeLaunch`. A two-`u32` declared struct in
+// comptime position failed with `no method named 'hash'`, `no method named 'eq'`
+// and "doesn't implement `Debug`".
+//
+// The macro now emits those four derives itself for a declared type whose whole
+// transitive field shape is integer/bool/char/unit-enum, and emits
+// `ConfigIdentity` for exactly that set. The two modules below are one kernel
+// per direction; `tests/cube_struct_identity.rs` asserts both. Not suite-wired —
+// these are capability probes, not claim surfaces.
+
+vericl::cube_struct! {
+    /// An ALL-INTEGER declared struct: usable in both positions, with no recipe
+    /// from the author. Note what is not written here — `Debug`, `PartialEq`,
+    /// `Eq`, `Hash` — exactly as `CubeType`/`CubeLaunch` are not.
+    pub struct ScaleCfg {
+        /// Multiplier.
+        pub m: u32,
+        /// Addend.
+        pub n: u32,
+    }
+}
+
+/// The COMPTIME direction of "one type, both positions": a `cube_struct!` type
+/// pinned whole by `instantiate(...)`, its fields read as host constants during
+/// expansion. This did not compile before round 11.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(exact),
+    gen(x in 0..=100, y in 0..=0),
+    instantiate(c = ScaleCfg { m: 2, n: 3 })
+)]
+#[cube(launch)]
+pub fn scale_cfg_comptime(x: &Array<u32>, #[comptime] c: ScaleCfg, y: &mut Array<u32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * c.m + c.n;
+    }
+}
+
+/// The RUNTIME direction, same type, same block, same hash — which is what
+/// "one type, both positions" is supposed to mean.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(exact),
+    gen(x in 0..=100, y in 0..=0, c.m in 1..=4, c.n in 0..=9)
+)]
+#[cube(launch)]
+pub fn scale_cfg_runtime(x: &Array<u32>, c: &ScaleCfg, y: &mut Array<u32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * c.m + c.n;
+    }
+}
+
+vericl::cube_struct! {
+    /// A unit enum as a `#[cube(comptime)]` FIELD — the shape CS2 has admitted
+    /// since the milestone, and which did not compile at all until round 11:
+    /// the enum was re-emitted untouched, so the owning struct's `Copy` failed
+    /// `E0204` and CubeCL's generated `CompilationArg` (which derives
+    /// `Hash`/`Eq` over every comptime field) could neither `hash` nor `clone`
+    /// it. The enum now carries the host derives both comptime positions need —
+    /// and still no `CubeType`, because it never reaches the device.
+    pub enum Blend {
+        /// Take the sample as-is.
+        Passthrough,
+        /// Double it.
+        Double,
+    }
+
+    /// Gain plus a pinned blend mode.
+    pub struct BlendCfg {
+        /// Runtime per-case gain.
+        pub gain: f32,
+        /// Pinned once by `instantiate(p.mode = Blend::Double)`. It enters the
+        /// `CompilationArg`, so two pins are two compiled kernels — but the v1
+        /// subset gives a kernel BODY no way to branch on it: a `match` on an
+        /// enum inside `#[cube]` is lowered as a DEVICE match and needs
+        /// `CubeEnum`, and a `comptime!` block may reference only `#[comptime]`
+        /// PARAMETERS, not a field of a runtime struct. So this field's honest
+        /// v1 role is the declaration/launch/identity path exercised here, not a
+        /// body-level switch. Stated rather than advertised.
+        #[cube(comptime)]
+        pub mode: Blend,
+    }
+}
+
+vericl::cube_struct! {
+    /// A declared STRUCT as a `#[cube(comptime)]` field — pinned **whole** by
+    /// `instantiate(p.win = Win { … })`, with the body reading its fields as
+    /// host constants at expansion.
+    ///
+    /// CS2 has always admitted this shape and it, too, did not compile before
+    /// round 11 for the same reason the enum did not: CubeCL's generated
+    /// `CompilationArg` derives `Hash`/`Eq` over every comptime field, and
+    /// `cube_struct!` emitted only `Clone`/`Copy`/`CubeType`/`CubeLaunch`. `Win`
+    /// is all-integer, so the macro now emits `Debug`/`PartialEq`/`Eq`/`Hash`
+    /// for it — the same detection that decides whether a declared type may be a
+    /// `#[comptime]` PARAMETER.
+    ///
+    /// The pin is whole-value, which is why there is no `gen(p.win.taps in …)`
+    /// or `instantiate(p.win.taps = …)` surface: writing one lands on the marker
+    /// type `WinHost__VericlSpec__win__is_a_comptime_field_pinned_whole_by_instantiate`
+    /// through rustc's own `E0560`, rather than on a raw `E0308` between two
+    /// generated type names (round-11 review, LOW 5).
+    pub struct Win {
+        /// Forward taps to accumulate.
+        pub taps: u32,
+        /// Stride between taps.
+        pub stride: u32,
+    }
+
+    /// Runtime gain plus a whole pinned window.
+    pub struct WinHost {
+        /// Runtime per-case gain.
+        pub gain: f32,
+        /// Pinned whole.
+        #[cube(comptime)]
+        pub win: Win,
+    }
+}
+
+/// A declared struct in `#[cube(comptime)]` FIELD position, end to end.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-4),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, p.gain in 0.5..=2.0),
+    instantiate(p.win = Win { taps: 3, stride: 2 })
+)]
+#[cube(launch)]
+pub fn strided_window_sum(x: &Array<f32>, p: &WinHost, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        let mut acc = x[ABSOLUTE_POS];
+        for j in 1..p.win.taps {
+            let idx = ABSOLUTE_POS + (j * p.win.stride) as usize;
+            if idx < x.len() {
+                acc += x[idx];
+            }
+        }
+        y[ABSOLUTE_POS] = acc * p.gain;
+    }
+}
+
+/// A declared unit enum in `#[cube(comptime)]` FIELD position, end to end:
+/// declared, hashed, pinned, launched. Before round 11 this module did not
+/// compile.
+#[vericl::kernel(
+    assumes(x.len() == y.len()),
+    compare(abs = 1e-4),
+    gen(x in -10.0..=10.0, y in 0.0..=0.0, p.gain in 0.5..=2.0),
+    instantiate(p.mode = Blend::Double)
+)]
+#[cube(launch)]
+pub fn blend_mode_map(x: &Array<f32>, p: &BlendCfg, y: &mut Array<f32>) {
+    if ABSOLUTE_POS < y.len() {
+        y[ABSOLUTE_POS] = x[ABSOLUTE_POS] * p.gain;
+    }
+}
+

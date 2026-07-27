@@ -63,7 +63,8 @@ pub use compare::{
 };
 pub use contract::{Compare, ConfigIdentity, Contract, ContractRecord, Identity, StructIdentity};
 pub use evidence::{
-    CaseOutcome, Claim, ClaimKind, ClaimResult, Entry, Manifest, describe_case_outcome, verify,
+    CaseOutcome, Claim, ClaimKind, ClaimResult, Entry, Manifest, describe_case_outcome,
+    obligation_count_changes, verify,
 };
 pub use rng::SplitMix64;
 pub use vericl_macros::{config, cube_struct, helper, kernel, reference, suite};

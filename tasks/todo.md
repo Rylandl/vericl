@@ -3061,3 +3061,149 @@ defect caught; `VERICL_UPDATE` run last.
   fields (§10.5), so it should be closed before that milestone: the fix is a kernel-body gate in the
   same family as the Float/Numeric reject list, rejecting device-only constructors at compile time
   instead of at twin run time.
+
+---
+
+## Round-11 adversarial review (2026-07-27) — 1 CRITICAL, 3 moderate, 3 low — ALL CLOSED
+
+Verdict on entry: **not clean**. The runtime-`CubeType` milestone shipped a gate family that
+classified attributes by name and a capability claim nobody had compiled. One critical (a
+classification split producing a false `Proved`), one shipped-false capability claim, two tests whose
+doc comments described assertions they did not make, and a by-name resolution the review walked around
+with a module alias. Every probe the review preserved now flips, and each flipped probe left behind a
+permanent regression.
+
+### CRITICAL 1 — the `cfg_attr` classification split (a false `Proved`)
+
+Every gate in both declaration macros reads the attribute list **as written**; rustc expands
+`cfg_attr` afterwards. So the attribute set VeriCL classified against and the set that decides what
+the code *means* were two different sets — not a gap in one gate, a re-spelling of every by-name gate
+at once.
+
+| probe | escape | measured before | now |
+|---|---|---|---|
+| `#[cfg_attr(all(), cube(comptime))]` on a field | classification split | spec `taps: (u32,u32)` (RUNTIME: drawn per case, `CompilationArg` entry `Default::default()`) while CubeCL sees COMPTIME → the extracted IR is built with the field at `0` while the launched kernel has the drawn value → **obligations discharged against a kernel that does not exist** | rejected, CS11/G14 |
+| `#[cfg_attr(all(), cube)]` on an item | CS4/G2 bypass | accepted | rejected |
+| `#[cfg_attr(all(), derive(Evil))]` | CS5/G11 bypass | accepted | rejected |
+| `#[serde(skip)]` on a field | no field-attribute gate at all | accepted silently | rejected by name |
+| `#[cube(comptime, launch)]` on a field | the marker was matched by *scanning* for the word | classified as the comptime marker | not the marker; falls to CS4 |
+| `use crate::evil as Hash; #[derive(Hash)]` | derive-name shadowing (co-reviewer) | accepted — the macro emitted `#[derive(Hash)]` beside its own derives | rejected, `decl_block.rs` `reject_bound_root` |
+
+Fixed by the **reject-`cfg_attr`-outright** option (`decl_block::check_no_cfg_attr`, one
+implementation shared by both macros, whole-file visitor) plus a field-attribute **whitelist**
+mirroring `classify_param`'s discipline — bare `#[cube(comptime)]` and doc comments only, everything
+else rejected by name, and "bare" checked structurally rather than by word-scan. An allowlist because
+the escape was a *spelling* no denylist naming `cube` could have caught.
+
+### MODERATE 2 — "one type, both positions" was false for EVERY declared type
+
+`cube_struct!` emitted `ConfigIdentity` unconditionally, which is only half of what `#[comptime]`
+position needs: CubeCL `Debug`-formats a comptime parameter and derives `Hash`/`Eq` over it. Measured
+— a two-`u32` declared struct as `#[comptime] c: IntCfg` failed with `no method named 'hash'`, `no
+method named 'eq'` and "doesn't implement `Debug`" **with the impl present**. For a float-field type
+it cannot work at any price.
+
+Fixed honestly and *capably*: the macro detects the all-hashable-fields case (transitively:
+integer/`bool`/`char`/declared-unit-enum) and emits `Debug`/`PartialEq`/`Eq`/`Hash` itself — skipping
+any the author wrote, since unlike `CubeType` those are `std` derives whose expansion is fixed —
+together with `ConfigIdentity`. A type with an `f32`/`f64` anywhere gets neither, so naming it in
+comptime position is one `ConfigIdentity` `on_unimplemented` note naming the reason instead of three
+raw trait errors at `#[cube(launch)]`. The `on_unimplemented` notes on both traits, the `cube_struct`
+module doc and design §6 now say this.
+
+**Two CS2-advertised shapes that had never compiled** fell out of the same fix, because CubeCL's
+generated `CompilationArg` derives `Hash`/`Eq` over every comptime field:
+
+- a declared **unit enum** as a `#[cube(comptime)]` field — `E0204` on the owning struct's `Copy`,
+  then `hash`/`clone` not found. The enum now carries the host derives (still no `CubeType`).
+- a declared **struct** as a `#[cube(comptime)]` field, pinned whole by
+  `instantiate(p.win = Win { … })` — this is also LOW 5's shape.
+
+One honesty note added rather than advertised: a comptime enum FIELD enters the `CompilationArg` (two
+pins are two compiled kernels) but the v1 subset gives a kernel *body* no way to branch on it — a
+`match` in `#[cube]` lowers as a DEVICE match and needs `CubeEnum`, and a `comptime!` block may
+reference only `#[comptime]` PARAMETERS.
+
+### MODERATE 3 — two tests that asserted less than their doc comments claimed
+
+- `a_comptime_struct_field_reaches_the_twin_and_the_ir` claimed the extracted IR's loop bound differs
+  from another spelling's and never compared an `ir_hash`. Both things it *did* check (twin
+  arithmetic, the contract string) stay true if the pinned field never reaches the IR at all. Now an
+  A/B: `stage_window_sum` and the new `stage_window_sum_taps5` have byte-identical bodies and differ
+  only in the pin, so their `kernel_ir_hash`es must differ (test (3) is the standing proof that
+  `kernel_ir_hash` skips `kernel_name`). **Injection** — drop the comptime field from the
+  `CompilationArg` — fails the new assertion and leaves the old ones passing.
+- `generated_struct_fields_respect_their_declared_ranges` hand-built two structs and tested
+  `check_assumes`; it never called the generator, so it held for any `gen(...)` ranges whatsoever.
+  Now it inspects 64 actual `generate_case` draws per kernel: in-range (fails on a widened range),
+  spread across the range (fails on a narrowed one, or a field wired to a constant), and the pinned
+  comptime field present in **every** case. **Injection** — narrow `cfg.window.gain` to `0.9..=1.1` —
+  fails it. `generate_case` is now `#[doc(hidden)] pub` so a test can see what the harness draws.
+
+**Risk-8 residual honesty.** `VERICL_UPDATE` refuses nothing by construction, so a change that keeps
+every claim present and passing while *shrinking what it proves* would be absorbed into the committed
+manifest silently. `vericl::obligation_count_changes` now compares the stored manifest to the fresh
+one on the update path and prints, per kernel, `check: old -> new` (and `N -> <none>` for a
+disappeared claim) before the file is written. A warning, not a refusal — obligation counts move
+legitimately whenever a kernel body does; what it buys is that the change is never invisible.
+Demonstrated by doctoring two stored counts to 99:
+
+```
+vericl WARNING — proof scope changed in this update (2 kernel(s)); confirm each is intended before committing the manifest:
+  kernel `axpy`: `smt-oob-freedom` obligations 99 -> 3
+  kernel `fir3`: `smt-oob-freedom` obligations 99 -> 4
+```
+
+### MODERATE 4 — CS8 overclaimed, and a module alias walked around it
+
+CS2 and `NumKind::of` both resolve a field type by its **final segment**, so with
+`use crate::shady as sm;` in scope, `a: sm::u32` passed the scalar check as a `u32` while resolving to
+`f32` — and generated the *integer* draw path for it. CS8 could not see this: the rebound name is
+`sm`, which no gate reads. Chasing it at the import is hopeless (the tail can come from any path), so
+it is closed at the point of resolution: **CS2 now requires a single-segment field-type path**. That
+also closes the cross-block struct spelling (`other::Inner` whose tail matches a declared name), which
+previously reached rustc as a raw `E0308` between two generated type names. CS8's own doc is narrowed
+to what it enforces, with the reason `config!` was never exposed (G4/G9 gate the path *root*). The
+buffer-valued deferral keeps its own diagnosis when written qualified.
+
+### LOW 5 / LOW 6 / LOW 7
+
+- **LOW 5** — a declared-struct `#[cube(comptime)]` field is now a *working*
+  capability (MODERATE 2's derives), pinned whole. The alias walk used to emit
+  `Cfg__VericlSpec__win = Win__VericlSpec` for that path while the spec entry's type is `Win`, so
+  `gen(p.win.taps in …)` was a raw `E0308`; it now points at a marker type named
+  `…__is_a_comptime_field_pinned_whole_by_instantiate`, so rustc's own `E0560` states the reason.
+- **LOW 6** — the **forged-identity bypass** recorded in both macros' residual sections with
+  complete-bypass wording: `StructIdentity`/`ConfigIdentity` are public and unsealed, so a
+  hand-written impl for a type the macro never saw skips every gate and pins a constant identity that
+  can never go stale. Not closable by a `#[proc_macro]`, and not the threat model — VeriCL's guarantee
+  is "an author who does not lie gets an identity that moves when the meaning does". Pinned as
+  `forged_struct_identity_is_a_complete_bypass`, written to stop **compiling** if the trait is sealed.
+- **LOW 7** — `enumerate_nested_paths` walks graph PATHS (`k` nested fields at depth `d` is `k^d`), so
+  a CS10-legal acyclic declaration could still hang the compiler. Capped at 4096 aliases with a
+  diagnosis stating the growth law; the shipped examples reach 2.
+
+### Tests, counts, gates
+
+- `vericl-macros` unit tests **132 → 140**: five CRITICAL-1 gates (cfg_attr in both macros, the field
+  whitelist, derive-name rebinding in both macros), one MODERATE-4 gate (qualified field-type paths,
+  with the buffer-deferral negative control), one MODERATE-2 (`ConfigIdentity` + the four derives
+  tracking transitive field hashability, both directions plus the no-duplicate-derive control), and
+  the two LOW gates.
+- `vericl` unit tests **40 → 41**: `obligation_count_changes_are_surfaced_per_kernel` (shrink, growth,
+  unchanged, claim-gone, new-kernel, non-proof-claim, per-kernel isolation).
+- `cube_struct_identity.rs` **8 → 11** (two rewritten to be discriminating; three new: both-positions,
+  the unit-enum comptime field, the declared-struct comptime field);
+  `cube_struct_out_of_block_backstop.rs` **4 → 5** (the forged-identity acknowledgment).
+- **Five new example kernels**, none suite-wired (capability and identity probes, not claim surfaces):
+  `stage_window_sum_taps5`, `scale_cfg_comptime`, `scale_cfg_runtime`, `blend_mode_map`,
+  `strided_window_sum`.
+- **Evidence byte-identical** — `git diff` on `crates/vericl-examples/evidence/` is empty. No shipped
+  kernel's identity or contract moved: the new derives change the macro's *output*, not the block
+  tokens it hashes.
+
+**Gates:** full workspace test green, **456 → 469**, 0 failures; `-p vericl-examples --features cpu`
+green (165); clippy clean on both feature sets (`--workspace --all-targets`, and
+`-p vericl-examples --all-targets --features cpu`), zero warnings; demo-defects exit 0 with every
+defect caught; `VERICL_UPDATE` run last (only to exercise and then undo the doctored counts — the
+manifest it wrote is byte-identical to `HEAD`).

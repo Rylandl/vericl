@@ -480,6 +480,64 @@ pub fn verify(stored: &Manifest, current: &Manifest) -> Vec<String> {
     problems
 }
 
+/// Per-kernel **proof-scope changes** between stored and freshly built
+/// evidence, as human-readable `kernel `k`: check N -> M` lines. Empty means
+/// every proved claim discharges the same number of obligations it did before.
+///
+/// # Why this exists (round-11 review, risk-8 residual)
+///
+/// [`verify`] refuses stale evidence and refuses a *dropped* proved claim, but
+/// the `VERICL_UPDATE` path refuses nothing — by construction, since its job is
+/// to rewrite the file. That leaves one shape unaccounted for: a change that
+/// keeps every claim present and passing while **shrinking what it proves**. A
+/// kernel whose bounds proof went from 12 obligations to 2 because a walk
+/// started bailing out early still records a passing `smt-oob-freedom` claim,
+/// and a routine `VERICL_UPDATE=1 cargo test` would absorb the regression into
+/// the committed manifest with nothing on screen.
+///
+/// This is deliberately a *printed warning* and not a refusal: an obligation
+/// count legitimately moves whenever the kernel body changes, so failing on it
+/// would make ordinary work impossible. What it buys is that the change is
+/// never invisible — the number appears in the update output next to the kernel
+/// it belongs to, where the author is already looking, and a drop they did not
+/// intend is one line rather than a diff they were not going to read.
+///
+/// A claim that disappeared entirely is reported as `N -> <none>`, which is the
+/// same regression at its limit (and is what [`verify`]'s downgrade check would
+/// have caught on the *verify* path).
+pub fn obligation_count_changes(stored: &Manifest, current: &Manifest) -> Vec<String> {
+    fn obligations(c: &Claim) -> Option<u64> {
+        c.config.get("obligations")?.as_u64()
+    }
+    let mut out = Vec::new();
+    for cur in &current.entries {
+        let Some(st) = stored.entries.iter().find(|e| e.kernel == cur.kernel) else {
+            continue; // a brand-new kernel has nothing to compare against
+        };
+        for st_claim in &st.claims {
+            let Some(old) = obligations(st_claim) else { continue };
+            match cur.claims.iter().find(|c| c.kind == st_claim.kind && c.check == st_claim.check) {
+                Some(cur_claim) => match obligations(cur_claim) {
+                    Some(new) if new != old => out.push(format!(
+                        "kernel `{}`: `{}` obligations {old} -> {new}",
+                        cur.kernel, st_claim.check
+                    )),
+                    Some(_) => {}
+                    None => out.push(format!(
+                        "kernel `{}`: `{}` obligations {old} -> <not recorded>",
+                        cur.kernel, st_claim.check
+                    )),
+                },
+                None => out.push(format!(
+                    "kernel `{}`: `{}` obligations {old} -> <none> (the claim is gone)",
+                    cur.kernel, st_claim.check
+                )),
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +652,73 @@ mod tests {
         let stored = Manifest::new(vec![stored_entry]);
         let current = Manifest::new(vec![current_entry]);
         assert!(verify(&stored, &current).is_empty());
+    }
+
+    /// The round-11 risk-8 residual: `VERICL_UPDATE` refuses nothing, so a
+    /// proof-scope regression that keeps every claim present and passing would
+    /// otherwise be absorbed into the committed manifest silently. Every
+    /// direction of the comparison, including the negative controls that make
+    /// it non-vacuous.
+    #[test]
+    fn obligation_count_changes_are_surfaced_per_kernel() {
+        fn with(kernel: &str, check: &str, obligations: u64) -> Entry {
+            let mut e = entry(kernel, "aaa");
+            e.claims.push(Claim {
+                kind: ClaimKind::Proved,
+                check: check.into(),
+                backend: None,
+                config: proved_config("z3 4.13", obligations as usize),
+                result: ClaimResult::Pass,
+            });
+            e
+        }
+
+        // A shrink — the regression this exists for.
+        let stored = Manifest::new(vec![with("k", "smt-oob-freedom", 12)]);
+        let current = Manifest::new(vec![with("k", "smt-oob-freedom", 2)]);
+        let msgs = obligation_count_changes(&stored, &current);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("kernel `k`"), "{msgs:?}");
+        assert!(msgs[0].contains("smt-oob-freedom"), "{msgs:?}");
+        assert!(msgs[0].contains("12 -> 2"), "{msgs:?}");
+
+        // A growth is reported too — an unexpected INCREASE is as much a
+        // signal that the kernel is not what the author thinks it is.
+        let grown = Manifest::new(vec![with("k", "smt-oob-freedom", 40)]);
+        assert!(obligation_count_changes(&stored, &grown)[0].contains("12 -> 40"));
+
+        // Unchanged: silent.
+        assert!(obligation_count_changes(&stored, &stored).is_empty());
+
+        // The claim disappearing entirely is the same regression at its limit.
+        let dropped = Manifest::new(vec![entry("k", "aaa")]);
+        let d = obligation_count_changes(&stored, &dropped);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("<none>"), "{d:?}");
+
+        // A brand-new kernel has nothing to compare against, and a claim with
+        // no `obligations` key (a differential claim) is not a proof scope.
+        let fresh = Manifest::new(vec![with("newly_added", "smt-oob-freedom", 5)]);
+        assert!(obligation_count_changes(&stored, &fresh).is_empty());
+        let mut tested_only = entry("k", "aaa");
+        tested_only.claims.push(Claim {
+            kind: ClaimKind::Tested,
+            check: "differential".into(),
+            backend: None,
+            config: differential_config(&[4], 1, 64),
+            result: ClaimResult::Pass,
+        });
+        let t = Manifest::new(vec![tested_only]);
+        assert!(obligation_count_changes(&t, &t).is_empty());
+
+        // Per-kernel, not global: two kernels, one moved.
+        let stored2 =
+            Manifest::new(vec![with("a", "smt-oob-freedom", 3), with("b", "smt-oob-freedom", 9)]);
+        let current2 =
+            Manifest::new(vec![with("a", "smt-oob-freedom", 3), with("b", "smt-oob-freedom", 1)]);
+        let m2 = obligation_count_changes(&stored2, &current2);
+        assert_eq!(m2.len(), 1, "{m2:?}");
+        assert!(m2[0].contains("kernel `b`"), "{m2:?}");
     }
 
     #[test]

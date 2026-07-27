@@ -73,9 +73,11 @@
 //! | G11 | only `std` derives ([`STD_DERIVES`]) | a custom derive's *definition* decides what impls the type has, and the hash covers only the invocation — the unhashed-impl sibling of G7 |
 //! | G12 | a `use` may not rebind an allowlisted path root, and may not be a glob | G4/G9 resolve roots BY NAME, so `use crate::evil as core;` would re-point the whole standard-library allowance at user code |
 //! | G13 | every declared `fn` must return a primitive, an array/tuple of those, `Self`, a block-declared type, or nothing | the value crosses into the kernel body, where only the FIRST link of a chain rooted at a config parameter is exempt from the Float/Numeric name list |
+//! | G14 | no `#[cfg_attr(…)]` anywhere in the block | every gate above reads attributes AS WRITTEN and rustc expands `cfg_attr` afterwards, so `#[cfg_attr(all(), cube)]` re-spells G2 and `#[cfg_attr(all(), derive(Evil))]` re-spells G11 (shared implementation in [`crate::decl_block`]) |
 //!
 //! G4's method-call half, G9's tail check, G10, G11 and G12 all come from the
-//! round-10 adversarial review, which measured each of them as a live escape.
+//! round-10 adversarial review, which measured each of them as a live escape;
+//! G12's derive-name half and G14 come from round 11, likewise measured.
 //!
 //! # The residual, precisely
 //!
@@ -105,6 +107,19 @@
 //!   method call and G9 the *tail* of a qualified path, so reaching an
 //!   out-of-block impl really does require the author to write the call on the
 //!   kernel side, in tokens `SOURCE_HASH` already covers.
+//!
+//! One residual of a *different* kind, recorded here so it is never mistaken
+//! for something the gates cover: `::vericl::ConfigIdentity` is a **public,
+//! unsealed** trait, so `impl vericl::ConfigIdentity for MyOwnType { const
+//! CONFIG_HASH: &'static str = "sha256:0000…"; }` for a type this macro never
+//! saw is a **complete bypass of the mechanism** — no gate runs on the type, and
+//! its recorded identity is a constant the author chose, which by construction
+//! never goes stale. A `#[proc_macro]` cannot seal a trait, and VeriCL's
+//! guarantee has never been "an author cannot lie to their own evidence file";
+//! it is "an author who does not lie gets an identity that moves when the
+//! meaning does". Every gate above is aimed at *accidental* drift. The same
+//! bypass exists for `StructIdentity` and is stated in `cube_struct`'s residual
+//! section, with a compiling acknowledgment test.
 //!
 //! Three narrower residuals of the same family, stated rather than papered
 //! over: a trait `impl` for a declared type written outside the block (including
@@ -327,6 +342,10 @@ pub(crate) fn expand(ts: TokenStream2) -> syn::Result<TokenStream2> {
         "G4/G9 resolve a call/read",
         &mut errors,
     );
+    // G14 — shared with `vericl::cube_struct!`'s CS11 (round-11 review): a
+    // `cfg_attr` makes the attribute set G2/G11 classify against and the one
+    // rustc expands two different sets, which re-spells both gates at once.
+    crate::decl_block::check_no_cfg_attr(&file, "vericl::config!", &mut errors);
     gate_bodies(&file, &declared, &mut errors);
 
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
@@ -1777,6 +1796,45 @@ mod tests {
         ok("#[derive(Clone, Copy, Default)] pub struct C { pub m: u32 } \
             impl C { pub fn d(&self) -> u32 { Self::default().m } \
                      pub fn c(&self) -> C { self.clone() } }");
+    }
+
+    /// G14 (round 11) — the classification split. `cfg_attr` is expanded by
+    /// rustc *after* G2/G11 have read the attribute list, so it re-spells both
+    /// gates at once: `#[cfg_attr(all(), cube)]` puts a `#[cube]` method past
+    /// G2 (the measured ×24-vs-×11 divergence class) and
+    /// `#[cfg_attr(all(), derive(Evil))]` puts a custom derive past G11.
+    #[test]
+    fn cfg_attr_anywhere_in_the_block_is_rejected() {
+        for src in [
+            "#[cfg_attr(all(), cube)] pub struct C { pub m: u32 }",
+            "#[cfg_attr(all(), derive(serde::Serialize))] pub struct C { pub m: u32 }",
+            "pub struct C { #[cfg_attr(all(), serde(skip))] pub m: u32 }",
+            "pub struct C { pub m: u32 } #[cfg_attr(all(), cube)] impl C { pub fn t(&self) -> u32 { self.m } }",
+            "pub struct C { pub m: u32 } impl C { #[cfg_attr(all(), cube)] pub fn t(&self) -> u32 { self.m } }",
+        ] {
+            let e = err(src);
+            assert!(e.contains("`#[cfg_attr(…)]`"), "{src}: {e}");
+            assert!(e.contains("vericl::config!"), "the message must name THIS macro: {src}: {e}");
+        }
+        // Negative control: an ordinary `#[derive]` and a doc comment are
+        // untouched by this gate.
+        ok("/// docs\n#[derive(Clone, Copy)] pub struct C { pub m: u32 }");
+    }
+
+    /// G12's derive-name half (round 11): the derive gate admits `#[derive(X)]`
+    /// by comparing `X` to the `std` set BY NAME, exactly as G4/G9 resolve a
+    /// path root by name — so a `use … as Hash;` is the same escape one
+    /// namespace over.
+    #[test]
+    fn rebinding_a_std_derive_name_is_rejected() {
+        for d in ["Hash", "Debug", "Clone", "Ord"] {
+            let e = err(&format!(
+                "use crate::evil as {d}; #[derive({d})] pub struct C {{ pub m: u32 }}"
+            ));
+            assert!(e.contains("rebinds a DERIVE name"), "{d}: {e}");
+            assert!(e.contains("vericl::config!"), "{d}: {e}");
+        }
+        ok("use core::cmp as _c; pub struct C { pub m: u32 }");
     }
 
     /// G10 (purity) — round-10 review probe P2. `std::env::var` passed every one

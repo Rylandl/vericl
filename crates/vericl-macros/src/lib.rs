@@ -6083,7 +6083,12 @@ fn build_conformance_items(
         /// declared `gen(...)` ranges are inconsistent with the kernel's
         /// own `assumes(...)` clauses, an authoring bug to fix rather than
         /// a runtime condition to recover from.
-        fn generate_case(n: usize, seed: u64) -> ( #(#owned_tys,)* ) {
+        ///
+        /// Public (and `#[doc(hidden)]`) so a test can inspect the values the
+        /// harness ACTUALLY draws rather than hand-building a struct and
+        /// asserting something about it — round-11 review, MODERATE 3.
+        #[doc(hidden)]
+        pub fn generate_case(n: usize, seed: u64) -> ( #(#owned_tys,)* ) {
             let mut __vericl_rng = ::vericl::SplitMix64::new(seed);
             for _vericl_attempt in 0..64u32 {
                 #(#gen_stmts)*
@@ -6519,7 +6524,11 @@ fn build_vector_conformance_items(
         /// the scalar path. Resamples up to 64 times if `check_assumes` rejects
         /// the draw, then panics naming the kernel (an authoring-time
         /// gen/assumes inconsistency, not a runtime condition).
-        fn generate_case(n: usize, seed: u64) -> ( #(#owned_tys,)* ) {
+        ///
+        /// Public (and `#[doc(hidden)]`) for the same reason as the scalar
+        /// path's: a test must be able to inspect the drawn values.
+        #[doc(hidden)]
+        pub fn generate_case(n: usize, seed: u64) -> ( #(#owned_tys,)* ) {
             let mut __vericl_rng = ::vericl::SplitMix64::new(seed);
             for _vericl_attempt in 0..64u32 {
                 #(#gen_stmts)*

@@ -780,6 +780,27 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
                         bad.kernel
                     );
                 }
+                // Proof-SCOPE changes, surfaced before the file is overwritten
+                // (round-11 review, risk-8 residual). `VERICL_UPDATE` refuses
+                // nothing by construction, so a change that keeps every claim
+                // present and passing while shrinking what it proves — a bounds
+                // walk that started bailing out early, say — would otherwise be
+                // absorbed into the committed manifest with nothing on screen.
+                // A warning rather than a refusal: an obligation count moves
+                // legitimately whenever the kernel body does.
+                if let Ok(__vericl_prev) = ::vericl::Manifest::load(&__vericl_evidence_path) {
+                    let __vericl_scope = ::vericl::obligation_count_changes(&__vericl_prev, &current);
+                    if !__vericl_scope.is_empty() {
+                        println!(
+                            "vericl WARNING — proof scope changed in this update ({} kernel(s)); \
+                             confirm each is intended before committing the manifest:",
+                            __vericl_scope.len()
+                        );
+                        for __vericl_line in &__vericl_scope {
+                            println!("  {}", __vericl_line);
+                        }
+                    }
+                }
                 current.save(&__vericl_evidence_path).unwrap_or_else(|e| {
                     panic!(
                         "vericl: could not write the evidence manifest to {} ({e}) — check the \
