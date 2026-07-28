@@ -11,6 +11,7 @@
     "lanes": [
       "\"cpu\""
     ],
+    "salt_scheme": "fnv1a-name^splitmix-case/v1",
     "device": "()"
   },
   "entries": [

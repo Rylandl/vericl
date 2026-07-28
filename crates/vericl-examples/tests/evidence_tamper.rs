@@ -379,6 +379,7 @@ fn a_tampered_provenance_record_is_stale() {
         ("vericl", serde_json::json!("0.0.1")),
         ("vericl_ir", serde_json::json!("0.0.1")),
         ("vericl_macros", serde_json::json!("0.0.1")),
+        ("salt_scheme", serde_json::json!("fnv1a-name^splitmix-case/v2")),
         ("device", serde_json::json!("Vulkan")),
     ] {
         let problems = tamper("evidence/vericl.json", |v| {
@@ -413,6 +414,57 @@ fn a_duplicated_entry_is_refused() {
         entries(v).push(dup);
     });
     assert!(one(&problems).contains("more than one entry for kernel"), "{problems:#?}");
+}
+
+/// FIX 8 (round-13A) — an unknown key spliced into the manifest is refused at
+/// PARSE time, before `verify` ever runs, so a doctored file cannot smuggle a
+/// blessing vericl never issued past a consumer that reads it. The reviewer's
+/// exact injected strings: an `"audit"` line at manifest level and a
+/// `"summary": "PROVED CORRECT"` inside a claim. Without `deny_unknown_fields`
+/// serde parses-and-drops them, and the junk rides along in the file the human
+/// actually opens.
+#[test]
+fn unknown_manifest_keys_are_refused_at_parse_time() {
+    // The junk keys, at each schema level a consumer would trust.
+    type Inject = fn(&mut serde_json::Value);
+    let injections: &[(&str, Inject)] = &[
+        ("audit @ manifest", |v| {
+            v["audit"] = serde_json::json!("independently certified correct by a third party");
+        }),
+        ("summary @ manifest", |v| {
+            v["summary"] = serde_json::json!("PROVED CORRECT");
+        }),
+        ("summary @ claim", |v| {
+            claims(v, 0)[0]["summary"] = serde_json::json!("PROVED CORRECT");
+        }),
+        ("audit @ entry", |v| {
+            entries(v)[0]["audit"] = serde_json::json!("independently certified");
+        }),
+        ("blessing @ provenance", |v| {
+            v["provenance"]["blessing"] = serde_json::json!("shipped by vericl");
+        }),
+        ("badge @ identity", |v| {
+            entries(v)[0]["identity"]["badge"] = serde_json::json!("gold");
+        }),
+        ("note @ contract", |v| {
+            entries(v)[0]["contract"]["note"] = serde_json::json!("hand-blessed");
+        }),
+    ];
+    for (label, inject) in injections {
+        // NEGATIVE CONTROL: the untouched file parses.
+        let mut json = load_json("evidence/vericl.json");
+        assert!(
+            serde_json::from_value::<Manifest>(json.clone()).is_ok(),
+            "{label}: the pristine file must still parse"
+        );
+        inject(&mut json);
+        let err = serde_json::from_value::<Manifest>(json)
+            .expect_err(&format!("{label}: an unknown key must be refused, not parsed-and-dropped"));
+        assert!(
+            err.to_string().contains("unknown field"),
+            "{label}: the refusal must name the unknown field: {err}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,50 +519,98 @@ fn json_object_key_order_is_not_content() {
 }
 
 // ---------------------------------------------------------------------------
-// The one exemption, on the real files.
+// The one exemption, on the real files (round-13A fixes 1+2). The committed
+// conformance manifest is the SUPERSET of lanes: it records the cpu `extra_lane`
+// (produced under `--features cpu`), so a default `cargo test` verifies the
+// wgpu lane and NOTES the recorded-but-unexercised cpu lane, while `--features
+// cpu` verifies both. The two directions are not symmetric: a lane the file
+// records but this run skipped is a note; a lane this run produced but the file
+// omits is a problem (the strip-detection).
 // ---------------------------------------------------------------------------
 
-/// An execution lane the stored evidence does not record contributes additional
-/// evidence, not a mismatch — the `cargo test --features cpu` case. And the
-/// exemption is narrow: the same claim on a lane the file DOES record is
-/// refused.
-#[test]
-fn an_extra_execution_lane_is_additional_evidence_but_the_exemption_is_narrow() {
-    let stored = load("evidence/vericl.json");
+/// The non-primary (cpu) lane the committed conformance manifest records under
+/// `--features cpu`. Panics with an actionable message if the file was not
+/// regenerated to record it — fixes 1+2 RECORD the cpu lane rather than
+/// exempting-and-hiding it, so its absence is a real problem, not a test skip.
+fn committed_cpu_lane() -> String {
+    let m = load("evidence/vericl.json");
+    m.provenance.lanes.get(1).cloned().unwrap_or_else(|| {
+        panic!(
+            "evidence/vericl.json records only {:?} — fixes 1+2 require the cpu lane to be RECORDED \
+             (regenerate: VERICL_UPDATE=1 cargo test --features cpu)",
+            m.provenance.lanes
+        )
+    })
+}
 
-    let cpu_claim = |c: &serde_json::Value| {
-        let mut c = c.clone();
-        c["backend"] = serde_json::json!("\"cpu\"");
-        c
-    };
-    let mut json = load_json("evidence/vericl.json");
-    json["provenance"]["lanes"] =
-        serde_json::json!(["\"wgpu<wgsl>\"".to_string(), "\"cpu\"".to_string()]);
-    for i in 0..entries(&mut json).len() {
-        let extra = cpu_claim(&claims(&mut json, i)[0]);
-        claims(&mut json, i).push(extra);
-        entries(&mut json)[i]["trusted"].as_array_mut().unwrap().push(serde_json::json!(
-            vericl::shared_frontend_lane_trust("\"cpu\"")
-        ));
+/// Remove the cpu lane, its per-entry claims, and its per-entry trust from a
+/// manifest JSON — either a wgpu-only "current run" derived from the committed
+/// file, or a "stripped file".
+fn without_cpu_lane(json: &mut serde_json::Value, cpu: &str) {
+    json["provenance"]["lanes"].as_array_mut().unwrap().retain(|l| l.as_str() != Some(cpu));
+    for e in entries(json) {
+        e["claims"].as_array_mut().unwrap().retain(|c| c["backend"].as_str() != Some(cpu));
+        e["trusted"].as_array_mut().unwrap().retain(|t| {
+            let s = t.as_str().unwrap();
+            !(s == cpu || s.starts_with(&format!("{cpu} ")))
+        });
     }
-    let with_cpu_lane = reparse(json.clone());
+}
 
-    let problems = verify(&stored, &with_cpu_lane);
-    assert!(problems.is_empty(), "an added lane must not be a mismatch: {problems:#?}");
-    let notes = unrecorded_evidence(&stored, &with_cpu_lane);
-    assert_eq!(notes.len(), 1 + 2 * stored.entries.len(), "{notes:#?}");
-    assert!(notes.iter().any(|n| n.contains("execution lane(s) \"cpu\"")), "{notes:#?}");
+/// SKIPPED-lane direction, on the committed file: a default `cargo test` (wgpu
+/// only) against the manifest committed under `--features cpu`. The cpu lane it
+/// records is NOT re-verified here — a NOTE, never a problem, because the lane
+/// is strictly verified under its own feature.
+#[test]
+fn a_skipped_cpu_lane_is_a_note_on_the_committed_file() {
+    let cpu = committed_cpu_lane();
+    let stored = load("evidence/vericl.json"); // records wgpu + cpu
+    let mut json = load_json("evidence/vericl.json");
+    without_cpu_lane(&mut json, &cpu);
+    let wgpu_only_run = reparse(json);
 
-    // NARROWNESS: declare the cpu lane in the stored file's provenance and the
-    // very same additions become problems again.
-    let mut stored_json = load_json("evidence/vericl.json");
-    stored_json["provenance"]["lanes"] =
-        serde_json::json!(["\"wgpu<wgsl>\"".to_string(), "\"cpu\"".to_string()]);
-    let stored_claiming_cpu = reparse(stored_json);
-    let problems = verify(&stored_claiming_cpu, &with_cpu_lane);
+    let problems = verify(&stored, &wgpu_only_run);
+    assert!(problems.is_empty(), "a skipped cpu lane must not be a problem: {problems:#?}");
+    let notes = unrecorded_evidence(&stored, &wgpu_only_run);
     assert!(
-        problems.iter().any(|m| m.contains("MISSING from the stored evidence")),
-        "{problems:#?}"
+        notes.iter().any(|n| n.contains("did not exercise") && n.contains(&cpu)),
+        "the unexercised cpu lane must be a note: {notes:#?}"
+    );
+    assert!(
+        notes.iter().any(|n| n.contains(&format!("(backend {cpu})"))),
+        "the skipped cpu claim(s) must be notes: {notes:#?}"
+    );
+}
+
+/// STRIPPED-lane direction, on the committed file: delete the cpu lane + its
+/// claims + its trust and run `--features cpu` against the stripped file. The
+/// cpu evidence the build produces is MISSING — a problem SET, not the pre-fix
+/// `0 problems, all notes` the reviewer demonstrated (fixes 1+2).
+#[test]
+fn a_stripped_cpu_lane_is_a_problem_on_the_committed_file() {
+    let cpu = committed_cpu_lane();
+    let full_run = load("evidence/vericl.json"); // the --features cpu build
+    let mut json = load_json("evidence/vericl.json");
+    without_cpu_lane(&mut json, &cpu);
+    let stripped_file = reparse(json);
+
+    let problems = verify(&stripped_file, &full_run);
+    assert!(
+        problems.iter().any(|m| m.contains(&format!("execution lane {cpu} ran")) && m.contains("NOT recorded")),
+        "the stripped lane must be a problem: {problems:#?}"
+    );
+    assert!(
+        problems.iter().any(|m| m.contains(&format!("(backend {cpu})"))
+            && m.contains("MISSING from the stored evidence")),
+        "the cpu claim(s) must be problems: {problems:#?}"
+    );
+    assert!(
+        problems.iter().any(|m| m.contains("stronger")),
+        "the cpu trust must be a problem: {problems:#?}"
+    );
+    assert!(
+        unrecorded_evidence(&stripped_file, &full_run).is_empty(),
+        "nothing may be exempted in the strip direction"
     );
 }
 
@@ -520,10 +620,13 @@ fn an_extra_execution_lane_is_additional_evidence_but_the_exemption_is_narrow() 
 /// problems, simply by also removing the corresponding string from
 /// `stored.provenance.lanes`."*
 ///
-/// The lane list is the exemption's only input and the attacker controls it, so
-/// every lane deleted from it widens the exempt set by one. Two edits, one
-/// green run — against the code as first written. Both guards are exercised
-/// here: the empty list, and a *plausible* list naming a lane that did not run.
+/// The lane list scopes the (now stored-only) exemption, and the attacker
+/// controls it. Deleting the wgpu tested claim and editing `provenance.lanes`
+/// so its backend looks "unrecorded" must still be refused: the empty-lane guard
+/// (an empty list cannot make a build's lanes verify against nothing) and the
+/// primary-lane guard (a plausible `["cpu"]` list changes the PRIMARY, itself a
+/// problem) both close it. Two edits, one green run — against the code as first
+/// written; caught here.
 #[test]
 fn deleting_a_claim_and_its_lane_marker_together_is_still_refused() {
     let pristine = load("evidence/vericl.json");
@@ -572,23 +675,36 @@ fn erasing_a_lane_scoped_trust_entry_with_its_lane_marker_is_still_refused() {
     );
 }
 
-/// The reverse: a lane the file records that did not run this time is a loss,
-/// reported both at the provenance level and per lost claim.
+/// A tested claim on a lane the file DOES record that this run exercised but
+/// did NOT produce is still a loss (not the skipped-lane note): the recorded
+/// claim set is not this build's. Here the committed cpu lane runs but the
+/// stored file carries an *extra* cpu claim the build never emitted.
 #[test]
-fn a_lane_that_stopped_running_is_refused() {
-    let current = load("evidence/vericl.json");
+fn a_recorded_lane_claim_the_build_did_not_emit_is_a_problem() {
+    let cpu = committed_cpu_lane();
+    let current = load("evidence/vericl.json"); // the --features cpu build
     let mut json = load_json("evidence/vericl.json");
-    json["provenance"]["lanes"] =
-        serde_json::json!(["\"wgpu<wgsl>\"".to_string(), "\"cpu\"".to_string()]);
+    // Append a SECOND cpu claim to entry 0 — a claim on the recorded cpu lane
+    // that this build does not produce.
     let extra = {
         let mut c = claims(&mut json, 0)[0].clone();
-        c["backend"] = serde_json::json!("\"cpu\"");
+        c["backend"] = serde_json::json!(cpu);
+        c["check"] = serde_json::json!("hand-added-extra");
         c
     };
     claims(&mut json, 0).push(extra);
     let stored = reparse(json);
 
     let problems = verify(&stored, &current);
-    assert!(problems.iter().any(|m| m.contains("execution lane \"cpu\"")), "{problems:#?}");
-    assert!(problems.iter().any(|m| m.contains("did not produce it")), "{problems:#?}");
+    assert!(
+        problems.iter().any(|m| m.contains("hand-added-extra") && m.contains("did not produce it")),
+        "an extra claim on a recorded, exercised lane must be a problem: {problems:#?}"
+    );
+    // It is NOT downgraded to a note (the lane ran, so it is not "skipped").
+    assert!(
+        unrecorded_evidence(&stored, &current)
+            .iter()
+            .all(|n| !n.contains("hand-added-extra")),
+        "the extra claim must not be exempted"
+    );
 }

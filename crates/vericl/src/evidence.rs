@@ -18,6 +18,7 @@ use crate::provenance::Provenance;
 /// check it against a freshly built manifest with [`verify`]; `vericl::suite!`
 /// does exactly this on every `cargo test` run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// The `vericl` version that produced this manifest.
     pub vericl_version: String,
@@ -36,6 +37,7 @@ pub struct Manifest {
 /// One kernel's evidence: its identity, contract, established claims, and the
 /// components the entry trusts rather than checks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     /// The kernel's name.
     pub kernel: String,
@@ -52,7 +54,16 @@ pub struct Entry {
 
 /// A single claim. `kind` states what the result establishes — these are
 /// never interchangeable (see README "Claims and trust boundaries").
+///
+/// `deny_unknown_fields`: a consumer reads this file, so a hand-added key at
+/// claim level (`"audit": "independently certified"`, `"summary": "PROVED
+/// CORRECT"`) is refused at deserialization rather than parsed-and-ignored,
+/// which would let a doctored manifest *look* like it carries a blessing vericl
+/// never issued. `config` is intentionally a free-form [`serde_json::Value`],
+/// so genuinely check-specific keys live inside it; the denial is on the claim
+/// envelope, not its payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Claim {
     /// What this result establishes (proved / tested / assumed).
     pub kind: ClaimKind,
@@ -517,14 +528,25 @@ impl Manifest {
 //
 // The converse — this build producing MORE than the file records — is also a
 // mismatch (the file records a claim SET, and a different set is a different
-// statement), with **one** exemption, scoped by the provenance record rather
-// than by shape: a claim or trust entry contributed by an execution LANE that
-// the stored provenance says did not run. That is what lets a single manifest
-// serve both `cargo test` and `cargo test --features cpu`, where the second
-// `cfg`-enables a whole extra execution lane and adds one claim plus one trust
-// entry per kernel. Those additions are reported by [`unrecorded_evidence`] as
-// printed notes — never silent, and never able to mask a loss, a mutation, or a
-// failure on the lanes the file does record.
+// statement), with **one** exemption, scoped by the provenance lane list: a
+// claim or trust entry recorded on a non-primary execution LANE that this run
+// did not exercise because its `cfg` feature is off. The committed manifest is
+// the SUPERSET of lanes (produced under `--features cpu`), and any single run
+// executes a SUBSET; the lane a run skipped is not lost, it is strictly
+// verified under the config that enables it. That is what lets one manifest
+// serve both `cargo test` (wgpu only) and `cargo test --features cpu` (wgpu +
+// cpu): under `--features cpu` the recorded cpu lane is VERIFIED, and under the
+// default run it is a [`unrecorded_evidence`] note (a lane recorded but not
+// exercised here). The mirror direction is a hard problem: a lane THIS RUN
+// produced that the file does not record means the recorded set is not this
+// build's — which is exactly what catches stripping a whole lane out of the
+// committed file.
+//
+// (This exemption used to point the other way — a run's extra lane was the
+// "additive" note and a stored extra lane was STALE — which let a whole
+// non-primary lane be stripped for `0 problems, all notes`, and let the shipped
+// default note-and-hide the cpu lane instead of verifying it. Recording the
+// lane and flipping the exemption, round-13A fixes 1+2, is the correction.)
 //
 // `trusted` is where the asymmetry bites hardest and is worth stating on its
 // own: a component this build trusts that the file OMITS makes the recorded
@@ -726,9 +748,10 @@ fn contract_problems(kernel: &str, st: &ContractRecord, cur: &ContractRecord, ou
     note("uses", format!("{:?}", st.uses), format!("{:?}", cur.uses));
 }
 
-/// Compare the verification-environment fingerprints, returning the execution
-/// lanes present in this run that the stored evidence does not record (the
-/// additive-lane exemption set for the `trusted` check).
+/// Compare the verification-environment fingerprints, returning the **absent
+/// lanes**: non-primary execution lanes the stored evidence records that this
+/// run did not exercise (the exemption scope for stored-only claims and trust —
+/// round-13A fixes 1+2).
 fn provenance_problems(
     stored: &Provenance,
     current: &Provenance,
@@ -757,6 +780,11 @@ fn provenance_problems(
     cmp("vericl-ir", &stored.vericl_ir, &current.vericl_ir);
     cmp("vericl-macros", &stored.vericl_macros, &current.vericl_macros);
     cmp("cubecl", &stored.cubecl, &current.cubecl);
+    // The RNG salt scheme: a differential's `config.seed` is only the base
+    // seed, so a change to how per-kernel/per-case salts are folded in retests
+    // every kernel against different inputs while leaving `seed` byte-stable.
+    // Recording and comparing the scheme tag is what makes that a staleness.
+    cmp("salt_scheme", &stored.salt_scheme, &current.salt_scheme);
     cmp(
         "z3",
         stored.z3.as_deref().unwrap_or("<none>"),
@@ -777,48 +805,53 @@ fn provenance_problems(
         ));
     }
 
-    // Lanes are SUBSET-checked rather than compared: a lane the stored evidence
-    // recorded that is missing now is a loss (and every claim it produced is
-    // separately reported as stored-only), while a lane this run adds is the
-    // additive `extra_lane` case — strictly more evidence, so a note.
-    for lane in &stored.lanes {
-        if !current.lanes.contains(lane) {
-            problems.push(format!(
-                "STALE evidence — execution lane {lane} is recorded in the stored evidence but did \
-                 not run in this build (a `cfg` feature that was enabled when the evidence was \
-                 produced is off now?)"
-            ));
-        }
-    }
-
-    // The lane list is the ONLY input to the exemption, so it is also the only
-    // thing an attacker editing the stored file would go after: every lane
-    // deleted from it widens the exempt set by one, and a claim or trust entry
-    // from an exempt lane is a note instead of a refusal. Two guards close that,
-    // and they are why the exemption is safe to have at all.
+    // --- lanes: the stored file is the AUTHORITY on the lane set ---
     //
-    // (1) A manifest that records claims must record the lane that produced
-    //     them, whenever this run has lanes that could be exempted by its
-    //     silence. (Both sides empty is not a risk and not a `suite!` shape:
-    //     nothing can be exempt when there is no current lane to exempt, so a
-    //     hand-built `Manifest::new` manifest is compared at maximum strictness
-    //     rather than refused.)
+    // Round-13A fixes 1+2. A `suite!` with a `cfg`-gated `extra_lane` records
+    // MORE lanes than any single `cargo test` invocation runs: the committed
+    // manifest is the SUPERSET (produced under `--features cpu`), and each run
+    // executes a SUBSET of it. So the two directions are not symmetric loss and
+    // gain — one is a config that did less, the other is a build the file does
+    // not describe:
+    //
+    //   * a lane in STORED but not in this run  = a recorded lane whose `cfg`
+    //     feature is off now. Its claims are not re-verified here, but they are
+    //     not lost either — they are strictly verified under the config that
+    //     enables the lane (`--features cpu`), where any mismatch is a hard test
+    //     failure with visible output. Here: a NOTE, and this lane scopes the
+    //     stored-only claim/trust exemption below.
+    //   * a lane in this RUN but not in stored  = the build produced a whole
+    //     execution lane the file never recorded. The recorded lane set is not
+    //     this build's lane set: a PROBLEM. This is what catches stripping a
+    //     recorded lane out of the committed file (delete the cpu lane + its
+    //     claims + its trust, run `--features cpu`, and the cpu evidence the
+    //     build produces is now MISSING from the file rather than exempted).
+    //
+    // Before this arc the directions were flipped — a run's extra lane was the
+    // additive exemption and a stored extra lane was STALE — which let a whole
+    // non-primary lane be stripped for `0 problems, all notes`, and made the
+    // shipped default (a wgpu-only file) note-and-hide the cpu lane rather than
+    // verify it. Recording the lane and flipping the exemption is the fix.
+
+    // A manifest that records claims must record the lane that produced them.
+    // (Both sides empty is a hand-built `Manifest::new` manifest with no lane
+    // structure at all — compared at maximum strictness, not refused, since
+    // there is no lane to be authoritative about.)
     if stored.lanes.is_empty() && !current.lanes.is_empty() {
         problems.push(
             "the stored evidence records no execution lane at all — the lane list is what scopes \
-             the additive-lane exemption, so an empty one would excuse every difference on every \
-             backend. Regenerate with `VERICL_UPDATE=1`"
+             the recorded-lane exemption, so an empty one would let this build's lanes verify \
+             against nothing. Regenerate with `VERICL_UPDATE=1`"
                 .to_string(),
         );
         return Vec::new();
     }
-    // (2) The PRIMARY lane is never exempt, whatever the list says. The
-    //     exemption exists for an `extra_lane` that a `cfg` feature switched on;
-    //     the lane a suite always runs is not that, and letting it in would
-    //     excuse an erased `"<primary>" buffer upload/readback integrity` trust
-    //     entry (which starts with the backend name) as an "unrecorded lane".
-    let primary = current.lanes.first();
-    if let (Some(st_primary), Some(cur_primary)) = (stored.lanes.first(), primary) {
+    // The PRIMARY lane (the one every proved claim and the primary tested lane
+    // was measured on) must match. It is never in either exempt direction: a
+    // suite always runs it, so it is never a "feature off" note, and the
+    // primary-changed message is clearer than a bare lane-set diff.
+    let stored_primary = stored.lanes.first();
+    if let (Some(st_primary), Some(cur_primary)) = (stored_primary, current.lanes.first()) {
         if st_primary != cur_primary {
             problems.push(format!(
                 "STALE evidence — the PRIMARY execution lane changed: stored {st_primary} -> \
@@ -827,25 +860,38 @@ fn provenance_problems(
             ));
         }
     }
-    let exempt: Vec<String> = current
+    // Direction A — a lane this build ran that the file does not record. Blank
+    // names are ignored (a Debug-formatted runtime name is never blank; this is
+    // belt-and-suspenders so a degenerate name cannot manufacture a problem).
+    for lane in &current.lanes {
+        if !lane.trim().is_empty() && !stored.lanes.contains(lane) {
+            problems.push(format!(
+                "execution lane {lane} ran in this build but is NOT recorded in the stored \
+                 evidence (stored lanes: {}) — the recorded lane set is not this build's lane set \
+                 (a lane was stripped from the file, or new-lane evidence needs recording: \
+                 regenerate with `VERICL_UPDATE=1` under the same features)",
+                stored.lanes.join(", ")
+            ));
+        }
+    }
+    // Direction B — non-primary lanes the file records that this run did not
+    // exercise. A NOTE, and the exemption scope for stored-only claims/trust.
+    // The blank filter is the same wildcard guard as Direction A.
+    let absent: Vec<String> = stored
         .lanes
         .iter()
-        // A blank/whitespace-only lane name can never scope an exemption — it
-        // would match everything. Real runtime names (Debug-formatted) are never
-        // blank; this is belt-and-suspenders should one ever be, so the
-        // exemption cannot degenerate into a wildcard (round 13).
-        .filter(|l| Some(*l) != primary && !stored.lanes.contains(l) && !l.trim().is_empty())
+        .filter(|l| Some(*l) != stored_primary && !current.lanes.contains(l) && !l.trim().is_empty())
         .cloned()
         .collect();
-    if !exempt.is_empty() {
+    if !absent.is_empty() {
         unrecorded.push(format!(
-            "execution lane(s) {} ran but are not recorded in the stored evidence (stored lanes: \
-             {}) — their claims are additional evidence, not a mismatch",
-            exempt.join(", "),
-            stored.lanes.join(", ")
+            "the stored evidence records execution lane(s) {} that this build did not exercise (a \
+             `cfg` feature that records them is off) — their recorded claims are not re-verified \
+             in this configuration; run with that feature (e.g. `--features cpu`) to verify them",
+            absent.join(", ")
         ));
     }
-    exempt
+    absent
 }
 
 fn compare_manifests(stored: &Manifest, current: &Manifest) -> Comparison {
@@ -895,7 +941,10 @@ fn compare_manifests(stored: &Manifest, current: &Manifest) -> Comparison {
         ));
     }
 
-    let exempt_lanes =
+    // The non-primary lanes the file records that this run did not exercise —
+    // the ONLY direction in which a claim/trust entry may be absent from this
+    // run and be a note rather than a problem (round-13A fixes 1+2).
+    let absent_lanes =
         provenance_problems(&stored.provenance, &current.provenance, &mut problems, &mut unrecorded);
 
     for cur in &current.entries {
@@ -983,7 +1032,23 @@ fn compare_manifests(stored: &Manifest, current: &Manifest) -> Comparison {
 
         for si in stored_only {
             let s = &st.claims[si];
-            if s.kind == ClaimKind::Proved {
+            // The recorded-lane exemption (round-13A fixes 1+2), on the
+            // stored-only side now that the file is the lane-set authority: a
+            // tested claim recorded on a non-primary lane this run did not
+            // exercise (its `cfg` feature is off) is a NOTE, not a loss — it is
+            // strictly verified under the config that enables the lane. A proved
+            // claim has no backend, so it can never match an absent lane and is
+            // never exempted here: losing a proof stays the downgrade below.
+            let from_absent_lane =
+                s.backend.as_deref().is_some_and(|b| absent_lanes.iter().any(|l| l == b));
+            if from_absent_lane {
+                unrecorded.push(format!(
+                    "kernel `{}`: {} is recorded on an execution lane this build did not exercise \
+                     — run with its feature (e.g. `--features cpu`) to re-verify it",
+                    cur.kernel,
+                    claim_label(s)
+                ));
+            } else if s.kind == ClaimKind::Proved {
                 // Keep the downgrade wording: losing a proof is the specific
                 // regression this check was originally written for, and
                 // "proved" and "never claimed" are never interchangeable
@@ -1006,29 +1071,17 @@ fn compare_manifests(stored: &Manifest, current: &Manifest) -> Comparison {
 
         for ci in current_only {
             let c = &cur.claims[ci];
-            // The additive-lane exemption, keyed on the stored provenance's
-            // lane list — the same one `trusted` below uses, and the only way
-            // a claim this build produced is allowed to be absent from the
-            // file. Everything else is a mismatch: the file records a claim SET
-            // and this build's set is different.
-            let from_unrecorded_lane =
-                c.backend.as_deref().is_some_and(|b| exempt_lanes.iter().any(|l| l == b));
-            if from_unrecorded_lane {
-                unrecorded.push(format!(
-                    "kernel `{}`: {} was produced by an execution lane the stored evidence does \
-                     not record",
-                    cur.kernel,
-                    claim_label(c)
-                ));
-            } else {
-                problems.push(format!(
-                    "kernel `{}`: {} was produced by this build but is MISSING from the stored \
-                     evidence — the recorded claim set is not this build's claim set (a claim was \
-                     deleted from the file, or new evidence needs recording: VERICL_UPDATE=1)",
-                    cur.kernel,
-                    claim_label(c)
-                ));
-            }
+            // A claim this build produced that the file does not record. With
+            // the file as the lane-set authority (Direction A above already
+            // flags a whole unrecorded lane), there is no exempt direction here:
+            // the recorded claim SET is not this build's set.
+            problems.push(format!(
+                "kernel `{}`: {} was produced by this build but is MISSING from the stored \
+                 evidence — the recorded claim set is not this build's claim set (a claim was \
+                 deleted from the file, or new evidence needs recording: VERICL_UPDATE=1)",
+                cur.kernel,
+                claim_label(c)
+            ));
         }
 
         // --- trusted: a SET, and the asymmetry inverts (see the module note) ---
@@ -1038,35 +1091,41 @@ fn compare_manifests(stored: &Manifest, current: &Manifest) -> Comparison {
         let st_trust: BTreeSet<&str> = st.trusted.iter().map(String::as_str).collect();
         let cur_trust: BTreeSet<&str> = cur.trusted.iter().map(String::as_str).collect();
         for missing in cur_trust.difference(&st_trust) {
-            // Lane-scoped like the claim path: a trusted string is `<backend> <rest>`,
-            // so exempt only on an exact match or a `<backend> `-delimited prefix — never a
-            // bare `starts_with`, which a zero-length or unbalanced lane name would turn into
-            // a wildcard. (`exempt_lanes` derives from the trusted current build and real
-            // runtime names are always balanced-quoted, so this is defense-in-depth; it makes
-            // the guard hold literally rather than by accident of Debug-quoting — round 13.)
-            if exempt_lanes
+            // A trust entry this build produced that the file omits makes the
+            // recorded claim look STRONGER than the one established (fewer things
+            // taken on faith). With the file as the lane-set authority, any such
+            // entry is on a lane the file should have recorded — always a
+            // problem (Direction A already named the missing lane).
+            problems.push(format!(
+                "kernel `{}`: trusted component `{missing}` is produced by this build but \
+                 MISSING from the stored evidence — an omitted trust dependency makes the \
+                 recorded claim look stronger than the one actually established",
+                cur.kernel
+            ));
+        }
+        for extra in st_trust.difference(&cur_trust) {
+            // A trust entry the file records that this build did not produce. If
+            // it is scoped to a non-primary lane this run did not exercise — an
+            // exact match, or a `<lane> `-delimited prefix (never a bare
+            // `starts_with`, which a zero-length or unbalanced lane name would
+            // turn into a wildcard) — the lane's `cfg` feature is simply off:
+            // a NOTE. Otherwise the file trusts something this build does not.
+            let from_absent_lane = absent_lanes
                 .iter()
-                .any(|l| !l.is_empty() && (*missing == l.as_str() || missing.starts_with(&format!("{l} "))))
-            {
+                .any(|l| !l.is_empty() && (*extra == l.as_str() || extra.starts_with(&format!("{l} "))));
+            if from_absent_lane {
                 unrecorded.push(format!(
-                    "kernel `{}`: trusted component contributed by an unrecorded lane: `{missing}`",
+                    "kernel `{}`: trusted component recorded on an execution lane this build did \
+                     not exercise: `{extra}`",
                     cur.kernel
                 ));
             } else {
                 problems.push(format!(
-                    "kernel `{}`: trusted component `{missing}` is produced by this build but \
-                     MISSING from the stored evidence — an omitted trust dependency makes the \
-                     recorded claim look stronger than the one actually established",
+                    "kernel `{}`: stored evidence records a trusted component this build does not \
+                     produce: `{extra}`",
                     cur.kernel
                 ));
             }
-        }
-        for extra in st_trust.difference(&cur_trust) {
-            problems.push(format!(
-                "kernel `{}`: stored evidence records a trusted component this build does not \
-                 produce: `{extra}`",
-                cur.kernel
-            ));
         }
 
         // --- failures ---
@@ -1126,7 +1185,7 @@ fn compare_manifests(stored: &Manifest, current: &Manifest) -> Comparison {
 /// | part | compared as | order |
 /// |---|---|---|
 /// | manifest `vericl_version` | exact | — |
-/// | [`Provenance`] | exact per field; `lanes` subset-checked | `lanes` preserved |
+/// | [`Provenance`] | exact per field; a run's lanes must be a subset of the file's | `lanes` preserved |
 /// | entries | keyed by kernel name; duplicates refused | insensitive |
 /// | [`Identity`] | exact, per field | — |
 /// | [`ContractRecord`] | exact, per field | **sensitive** (authored, hash-covered) |
@@ -1142,30 +1201,40 @@ fn compare_manifests(stored: &Manifest, current: &Manifest) -> Comparison {
 /// produces that the file does not record, a mutated backend / config / result,
 /// an erased trust dependency — all are problems.
 ///
-/// There is exactly **one** exemption, and it is scoped by the provenance
-/// record rather than by shape: a claim or trust entry contributed by an
-/// execution lane the stored [`Provenance::lanes`] says did not run. That is
-/// the `suite!` `extra_lane` case (`cargo test --features cpu` adds a whole
-/// second backend), and those additions are reported by
-/// [`unrecorded_evidence`] as printed notes rather than dropped.
+/// There is exactly **one** exemption, and it is scoped by the provenance lane
+/// list: a claim or trust entry recorded on a non-primary execution lane this
+/// run did not exercise (its `cfg` feature is off). The committed manifest is
+/// the superset of lanes and a run executes a subset; the skipped lane is not
+/// lost — it is strictly verified under the config that enables it (`cargo test
+/// --features cpu`). Those skipped-lane items are reported by
+/// [`unrecorded_evidence`] rather than dropped. The mirror direction — a lane
+/// THIS RUN produced that the file omits — is a problem (round-13A fixes 1+2).
 pub fn verify(stored: &Manifest, current: &Manifest) -> Vec<String> {
     compare_manifests(stored, current).problems
 }
 
-/// Evidence produced by an execution lane the stored manifest does **not**
-/// record — [`verify`]'s one exemption, surfaced rather than dropped.
+/// Evidence the stored manifest records on an execution lane this run did
+/// **not** exercise — [`verify`]'s one exemption, surfaced rather than dropped.
 ///
-/// `cargo test --features cpu` `cfg`-enables a suite's `extra_lane`, which adds
-/// one differential claim and one trust entry per kernel. A manifest committed
-/// from a default (wgpu-only) run does not have them, and refusing it for that
-/// would make one of the two configurations permanently red. Those additions
-/// are strictly more evidence on a lane the file never spoke about, so they are
-/// exempt — and reported here, printed by the `suite!`-generated runner on
-/// every verifying run, so "this evidence file is missing a whole execution
-/// lane" is a line on screen rather than a silence.
+/// The committed manifest is the SUPERSET of lanes a suite can run: a `suite!`
+/// with a `cfg`-gated `extra_lane` records one differential claim and one trust
+/// entry per kernel on the extra backend (`cargo test --features cpu`), and the
+/// committed file carries them. A default (wgpu-only) `cargo test` does not run
+/// that lane, so it cannot re-verify those items *this run* — but they are not
+/// lost: they are strictly checked whenever the feature is on. This surfaces
+/// them as notes so the omission from *this configuration* is not silent.
 ///
-/// Nothing else appears here. A claim added or removed on a lane the file
-/// *does* record is a [`verify`] problem.
+/// **Visibility note (round-13A fix 1).** These notes are informational, not a
+/// soundness signal: the lane that actually RAN is verified strictly (a loss or
+/// mutation there is a [`verify`] problem, which fails the test and prints), and
+/// the skipped lane is verified strictly under its own feature. libtest captures
+/// `println!` on a passing test, so the `suite!`-generated runner writes these
+/// notes to real stderr (bypassing the capture) — that is what makes "this run
+/// did not exercise a recorded lane" a line on screen rather than a silence,
+/// which a `println!` inside a passing test never was.
+///
+/// Nothing else appears here. A claim added or removed on a lane this run
+/// *does* exercise is a [`verify`] problem.
 pub fn unrecorded_evidence(stored: &Manifest, current: &Manifest) -> Vec<String> {
     compare_manifests(stored, current).unrecorded
 }
@@ -1581,70 +1650,70 @@ mod tests {
         assert!(only_problem(&p).contains("does not produce"), "{p:?}");
     }
 
-    /// ROUND 13 — the trusted-exemption must be lane-scoped exactly like the
-    /// claim path, not a bare `starts_with`. A zero-length or whitespace-only
-    /// current lane name must never turn the exemption into a wildcard that
-    /// excuses an erased primary-lane trust entry. (Reachable runtime names are
-    /// always balanced-quoted, so this is defense-in-depth; the guard must hold
-    /// literally, not by that accident.)
+    /// ROUND-13A — the stored-only trust exemption (fixes 1+2 moved it to the
+    /// skipped-lane direction) must be lane-scoped, not a bare `starts_with`. A
+    /// zero-length or whitespace-only recorded lane must never turn it into a
+    /// wildcard that excuses a trust entry the build genuinely does not produce.
+    /// (Reachable runtime names are always balanced-quoted, so this is
+    /// defense-in-depth; the guard must hold literally, not by that accident —
+    /// blank names are filtered out of the absent-lane set.)
     #[test]
-    fn a_blank_exempt_lane_cannot_wildcard_the_trust_exemption() {
-        // Stored file (attacker-controlled) erases the primary lane's trust
-        // entry and lists a blank extra lane to try to excuse it.
-        let mut current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\"", "   "]);
-        current.provenance.lanes = vec!["\"wgpu<wgsl>\"".into(), "   ".into()];
-        let mut stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
-        // stored records only the primary lane, and its trust list is missing
-        // the primary "buffer upload/readback integrity" entry.
+    fn a_blank_absent_lane_cannot_wildcard_the_trust_exemption() {
+        // Stored records a blank non-primary lane and a bogus trust entry the
+        // build does not produce; the blank lane must not turn that into a note.
+        let mut stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\"", "   "]);
         stored.entries[0]
             .trusted
-            .retain(|t| !t.contains("buffer upload/readback integrity"));
+            .push("a component the build never trusts".into());
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
         let problems = verify(&stored, &current);
         assert!(
-            problems.iter().any(|p| p.contains("buffer upload/readback integrity")
-                && p.contains("MISSING from the stored evidence")),
-            "a blank exempt lane must NOT excuse the erased primary trust entry: {problems:?}"
+            problems.iter().any(|p| p.contains("a component the build never trusts")
+                && p.contains("does not produce")),
+            "a blank absent lane must NOT excuse a stored-only trust the build lacks: {problems:?}"
         );
     }
 
-    /// ROUND 13 sibling — an exempt lane that is a bare PREFIX of a primary
-    /// trust string (not delimited by a space) must not exempt it. Only an
-    /// exact match or a `<lane> `-delimited prefix is a genuine lane scope.
+    /// ROUND-13A sibling — an absent lane that is a bare PREFIX of a stored-only
+    /// trust string (not `<lane> `-delimited) must not exempt it. Only an exact
+    /// match or a `<lane> `-delimited prefix is a genuine lane scope.
     #[test]
-    fn a_prefix_exempt_lane_does_not_exempt_a_primary_trust_entry() {
-        // Primary trust entry begins `"wgpu<wgsl>" buffer ...`; a malicious
-        // stored file adds an extra lane `"wgpu` (a prefix, no delimiter) and
-        // deletes that entry.
-        let mut current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
-        current.provenance.lanes = vec!["\"wgpu<wgsl>\"".into(), "\"wgpu".into()];
-        let mut stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
-        stored.provenance.lanes = vec!["\"wgpu<wgsl>\"".into()];
+    fn a_prefix_absent_lane_does_not_exempt_an_undelimited_trust_entry() {
+        // Stored records an absent lane `"cpu` and a trust `"cpufoo" ...` — the
+        // lane is an undelimited prefix of the trust, which must NOT match.
+        let mut stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\"", "\"cpu"]);
         stored.entries[0]
             .trusted
-            .retain(|t| !t.contains("buffer upload/readback integrity"));
+            .push("\"cpufoo\" buffer upload/readback integrity".into());
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
         let problems = verify(&stored, &current);
         assert!(
-            problems.iter().any(|p| p.contains("buffer upload/readback integrity")
-                && p.contains("MISSING from the stored evidence")),
-            "a prefix (undelimited) exempt lane must NOT excuse the primary trust entry: {problems:?}"
+            problems.iter().any(|p| p.contains("\"cpufoo\"") && p.contains("does not produce")),
+            "a prefix (undelimited) absent lane must NOT excuse the trust entry: {problems:?}"
         );
     }
 
-    /// ROUND 13 positive control — a GENUINE extra-lane trust entry (properly
-    /// `<lane> `-delimited) is still exempted, so the tightening did not break
-    /// the legitimate `extra_lane` case the exemption exists for.
+    /// ROUND-13A positive control — a GENUINE skipped-lane trust entry (recorded
+    /// on a non-primary lane this run did not exercise, properly `<lane> `-
+    /// delimited) is a NOTE, not a problem: the committed manifest's superset
+    /// includes a lane whose `cfg` feature is off this run.
     #[test]
-    fn a_genuine_extra_lane_trust_entry_is_still_exempted() {
-        let mut current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\"", "\"cpu\""]);
-        current.provenance.lanes = vec!["\"wgpu<wgsl>\"".into(), "\"cpu\"".into()];
-        current.entries[0]
+    fn a_genuine_skipped_lane_trust_entry_is_a_note() {
+        let mut stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\"", "\"cpu\""]);
+        stored.entries[0]
             .trusted
             .push("\"cpu\" buffer upload/readback integrity".into());
-        let stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
         let problems = verify(&stored, &current);
         assert!(
             problems.is_empty(),
-            "a properly lane-scoped extra-lane trust entry must be exempted, not a problem: {problems:?}"
+            "a properly lane-scoped skipped-lane trust entry must be a note, not a problem: {problems:?}"
+        );
+        let notes = unrecorded_evidence(&stored, &current);
+        assert!(
+            notes.iter().any(|n| n.contains("buffer upload/readback integrity")
+                && n.contains("did not exercise")),
+            "the skipped-lane trust entry must appear as a note: {notes:?}"
         );
     }
 
@@ -1769,6 +1838,7 @@ mod tests {
             ("cubecl", Box::new(|p: &mut crate::Provenance| p.cubecl = "=0.9.0".into())),
             ("vericl-ir", Box::new(|p: &mut crate::Provenance| p.vericl_ir = "0.0.9".into())),
             ("vericl-macros", Box::new(|p: &mut crate::Provenance| p.vericl_macros = "0.0.9".into())),
+            ("salt_scheme", Box::new(|p: &mut crate::Provenance| p.salt_scheme = "fnv1a-name^splitmix-case/v2".into())),
             ("z3", Box::new(|p: &mut crate::Provenance| p.z3 = Some("z3 4.8.7".into()))),
             ("device", Box::new(|p: &mut crate::Provenance| p.device = Some("Vulkan".into()))),
         ] {
@@ -1797,14 +1867,19 @@ mod tests {
         assert!(p.iter().any(|m| m.contains("no verification-environment record")), "{p:#?}");
     }
 
-    /// The ONE exemption: an execution lane the stored evidence does not
-    /// record contributes claims and trust entries that are notes, not
-    /// problems. This is `cargo test --features cpu` against a manifest
-    /// committed from a default run.
+    /// ROUND-13A fixes 1+2 — a whole execution lane THIS RUN produced that the
+    /// file does not record is a PROBLEM, not additive evidence. This is the
+    /// direction that catches stripping a recorded lane (its provenance entry +
+    /// its claims + its trust) out of the committed file: run `--features cpu`
+    /// against the stripped file and the cpu evidence the build produces is
+    /// MISSING, not exempted-and-hidden. Before fix 1+2 this was the "additive"
+    /// note direction and returned `0 problems, all notes`.
     #[test]
-    fn an_extra_execution_lane_is_additional_evidence_not_a_mismatch() {
+    fn a_lane_this_run_produced_that_the_file_omits_is_a_problem() {
+        // Stored = the cpu lane stripped out (a wgpu-only file).
         let stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
 
+        // This run = wgpu + cpu (the `--features cpu` build).
         let mut cur_entry = realistic_entry();
         cur_entry.claims.push(Claim {
             kind: ClaimKind::Tested,
@@ -1817,12 +1892,24 @@ mod tests {
         let current = recorded(vec![cur_entry], &["\"wgpu<wgsl>\"", "\"cpu\""]);
 
         let p = verify(&stored, &current);
-        assert!(p.is_empty(), "an added lane must not be a mismatch: {p:#?}");
-        let u = unrecorded_evidence(&stored, &current);
-        assert_eq!(u.len(), 3, "{u:#?}");
-        assert!(u.iter().any(|m| m.contains("execution lane(s) \"cpu\"")), "{u:#?}");
-        assert!(u.iter().any(|m| m.contains("tested `differential` (backend \"cpu\")")), "{u:#?}");
-        assert!(u.iter().any(|m| m.contains("trusted component contributed")), "{u:#?}");
+        // The lane, the claim, and the trust are ALL problems — none exempted.
+        assert!(
+            p.iter().any(|m| m.contains("execution lane \"cpu\" ran") && m.contains("NOT recorded")),
+            "the unrecorded lane must be a problem: {p:#?}"
+        );
+        assert!(
+            p.iter().any(|m| m.contains("tested `differential` (backend \"cpu\")")
+                && m.contains("MISSING from the stored evidence")),
+            "the cpu claim must be a problem: {p:#?}"
+        );
+        assert!(
+            p.iter().any(|m| m.contains("stronger")),
+            "the cpu trust must be a problem (recorded claim looks stronger): {p:#?}"
+        );
+        assert!(
+            unrecorded_evidence(&stored, &current).is_empty(),
+            "nothing may be exempted in the run-produced-a-lane direction"
+        );
     }
 
     /// ATTACK ON THE EXEMPTION ITSELF. The lane list is its only input, so it
@@ -2007,10 +2094,13 @@ mod tests {
         assert!(p.iter().any(|m| m.contains("MISSING from the stored evidence")), "{p:#?}");
     }
 
-    /// A lane the stored evidence records that did NOT run is a loss, not an
-    /// exemption — the reverse direction of the test above.
+    /// ROUND-13A fixes 1+2 — a non-primary lane the file records that this run
+    /// did not exercise (its `cfg` feature is off) is a NOTE, not a refusal: the
+    /// committed manifest is the superset, and that lane is strictly verified
+    /// under the config that enables it. This is a default `cargo test` (wgpu
+    /// only) against a manifest committed under `--features cpu`.
     #[test]
-    fn a_lane_that_stopped_running_is_refused() {
+    fn a_recorded_lane_this_run_did_not_exercise_is_a_note() {
         let mut st_entry = realistic_entry();
         st_entry.claims.push(Claim {
             kind: ClaimKind::Tested,
@@ -2019,11 +2109,27 @@ mod tests {
             config: differential_config(&[1, 7, 256], 0xE901, 256),
             result: ClaimResult::Pass,
         });
+        st_entry.trusted.push(crate::shared_frontend_lane_trust("\"cpu\""));
         let stored = recorded(vec![st_entry], &["\"wgpu<wgsl>\"", "\"cpu\""]);
         let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+
         let p = verify(&stored, &current);
-        assert!(p.iter().any(|m| m.contains("execution lane \"cpu\"")), "{p:#?}");
-        assert!(p.iter().any(|m| m.contains("did not produce it")), "{p:#?}");
+        assert!(p.is_empty(), "a recorded-but-unexercised lane must not be a problem: {p:#?}");
+        // The lane, its claim, and its trust are all surfaced as notes so the
+        // configuration's gap is not silent — never dropped, never escalated.
+        let u = unrecorded_evidence(&stored, &current);
+        assert!(
+            u.iter().any(|n| n.contains("did not exercise") && n.contains("\"cpu\"")),
+            "the unexercised lane must be a note: {u:#?}"
+        );
+        assert!(
+            u.iter().any(|n| n.contains("tested `differential` (backend \"cpu\")")),
+            "the skipped-lane claim must be a note: {u:#?}"
+        );
+        assert!(
+            u.iter().any(|n| n.contains("shares CubeCL's front end")),
+            "the skipped-lane trust must be a note: {u:#?}"
+        );
     }
 
     // ---- normalization: the deliberate order choices ----

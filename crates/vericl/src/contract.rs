@@ -173,6 +173,7 @@ pub struct Contract {
 
 /// Serializable form of a [`Contract`] for the evidence manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ContractRecord {
     /// Pretty-printed `assumes(...)` clauses.
     pub assumes: Vec<String>,
@@ -198,6 +199,7 @@ pub struct ContractRecord {
 /// Identity a piece of evidence is bound to. Any mismatch between a stored
 /// identity and the currently built kernel makes the evidence stale.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Identity {
     /// Hash of the kernel source tokens + contract + vericl version (composition-
     /// aware for a kernel with `uses(...)`; see `<kernel>_vericl::identity()`).

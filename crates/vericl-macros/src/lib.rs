@@ -8938,6 +8938,74 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Vacuity-rejection guards (round-13A fix 5). A differential that
+    // compares NOTHING must be refused where it is written — never recorded
+    // as a passing `tested` claim that established nothing. These guards
+    // shipped without a committed regression; one structural test per class,
+    // driven end-to-end through `expand()` (better than the uncommitted
+    // scratch compile-fail crate the arc otherwise uses, since the expander
+    // is directly callable). Each pairs the rejection with a negative
+    // control that must still expand.
+    // -----------------------------------------------------------------
+
+    /// A kernel declaring no `&mut Array<T>` output: `conformance_case` builds
+    /// one `(param, report)` per mut array, so this produces `reports: []` and
+    /// `all()` over zero reports is `true` — a PASSING claim over nothing.
+    /// Refused at expansion (lib.rs, the vacuous-differential gate).
+    #[test]
+    fn a_kernel_with_no_mut_output_is_rejected() {
+        let func: ItemFn = syn::parse_str("pub fn k(x: &Array<f32>) { let _z = x[ABSOLUTE_POS]; }")
+            .expect("valid fn");
+        let err = expand(quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0)), &func)
+            .expect_err("a kernel with no &mut Array output must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("no `&mut Array<T>` output parameter"), "got: {msg}");
+        assert!(msg.contains("nothing for the differential to compare"), "got: {msg}");
+
+        // NEGATIVE CONTROL: add a `&mut Array` output and the same body expands.
+        let ok: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        assert!(
+            expand(quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0)), &ok).is_ok(),
+            "adding a &mut output must lift the vacuity rejection"
+        );
+    }
+
+    /// A `gen(len(y = 0))` pin makes every case compare ZERO elements of the
+    /// output, and unlike `sizes: [0]` it is not part of the recorded contract,
+    /// so the claim would advertise the suite's real sizes while comparing
+    /// nothing. Refused where it is written (lib.rs `resolve_gen_entries`).
+    #[test]
+    fn a_gen_len_zero_pin_is_rejected() {
+        let func: ItemFn = syn::parse_str(
+            "pub fn k(x: &Array<f32>, y: &mut Array<f32>) { \
+             if ABSOLUTE_POS < y.len() { y[ABSOLUTE_POS] = x[ABSOLUTE_POS]; } }",
+        )
+        .expect("valid fn");
+        let err = expand(
+            quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0, len(y = 0))),
+            &func,
+        )
+        .expect_err("a gen len(y = 0) pin must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("len(y) = 0"), "got: {msg}");
+        assert!(msg.contains("compares ZERO elements"), "got: {msg}");
+
+        // NEGATIVE CONTROL: a positive pin expands.
+        assert!(
+            expand(
+                quote!(compare(max_ulp = 0), gen(x in -1.0..=1.0, y in 0.0..=0.0, len(y = 4))),
+                &func,
+            )
+            .is_ok(),
+            "a positive gen len must expand"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Core `Slice` twin rewrite (docs/design-view-slice.md §4.1) — the
     // method-call -> Rust-subslice mapping and the laundering rejects.
     // -----------------------------------------------------------------

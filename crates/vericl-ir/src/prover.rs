@@ -918,6 +918,23 @@ fn prove_bounds_freedom_impl(
     }
 
     match prover.process_scope(&def.body) {
+        // A walk that reached zero bounds obligations "proves" out-of-bounds
+        // freedom vacuously — 0 of 0 discharged. A `#[vericl::kernel]` writes
+        // its results through an `&mut Array` output (the vacuous-differential
+        // guard enforces one), and every such write is an `IndexAssign` that
+        // raises an obligation, so obligations == 0 means either the body has no
+        // array access at all or every access sits behind a provably-dead
+        // branch — neither is a `Proved` smt-oob-freedom claim we should mint.
+        // Reported as OutOfSubset (no claim), never a `Proved{0}` (round-13A
+        // fix 10). No committed evidence has obligations == 0, so this changes
+        // no recorded count.
+        Ok(()) if prover.obligations == 0 => ProveResult::OutOfSubset {
+            reason: "no Index/IndexAssign bounds obligation was reached, so a `Proved` \
+                     smt-oob-freedom claim would discharge nothing (0 of 0) — a vacuous proof. \
+                     Outside the vericl subset for a proved claim: emit no claim rather than a \
+                     `Proved` over zero obligations"
+                .to_string(),
+        },
         Ok(()) => ProveResult::Proved {
             obligations: prover.obligations,
         },
@@ -4859,6 +4876,15 @@ mod tests {
         }
     }
 
+    /// An `&mut Array` output that is never indexed: pure scalar work, no
+    /// `Index`/`IndexAssign`, so the bounds walk reaches ZERO obligations. Used
+    /// to pin that a `Proved{0}` is refused as OutOfSubset (round-13A fix 10).
+    #[cube(launch)]
+    fn prover_test_no_array_access(x: &Array<f32>, y: &mut Array<f32>) {
+        let _pos = ABSOLUTE_POS + x.len();
+        let _also = y.len();
+    }
+
     fn build_axpy() -> KernelDefinition {
         let mut builder = KernelBuilder::default();
         builder.runtime_properties(Default::default());
@@ -4887,8 +4913,42 @@ mod tests {
         builder.build(KernelSettings::default())
     }
 
+    fn build_no_array_access() -> KernelDefinition {
+        let mut builder = KernelBuilder::default();
+        builder.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut builder.scope);
+        let x = <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut builder);
+        let y = <Array<f32> as LaunchArg>::expand_output(
+            &ArrayCompilationArg { inplace: None },
+            &mut builder,
+        );
+        prover_test_no_array_access::expand(&mut builder.scope, x, y);
+        builder.build(KernelSettings::default())
+    }
+
     const AXPY_BUFFERS: &[BufferParam] =
         &[BufferParam { name: "x", is_output: false }, BufferParam { name: "y", is_output: true }];
+
+    /// FIX 10 (round-13A) — a bounds walk that discharges ZERO obligations does
+    /// not earn a `Proved` smt-oob-freedom claim: 0 of 0 is a vacuous proof, and
+    /// "proved" must never mean "proved nothing". It is OutOfSubset (no claim),
+    /// never `Proved{obligations: 0}`. The negative control is `build_axpy`,
+    /// which reaches three real obligations and proves.
+    #[test]
+    fn a_zero_obligation_bounds_walk_is_out_of_subset_not_a_vacuous_proof() {
+        let def = build_no_array_access();
+        match prove_bounds_freedom(&def, AXPY_BUFFERS, &[]) {
+            ProveResult::OutOfSubset { reason } => {
+                assert!(reason.contains("0 of 0"), "reason must name the vacuity: {reason}");
+            }
+            other => panic!("a zero-obligation walk must be OutOfSubset, not {other:?}"),
+        }
+        // NEGATIVE CONTROL: a kernel with real accesses still proves.
+        match prove_bounds_freedom(&build_axpy(), AXPY_BUFFERS, &[Assume::LenEq { a: "x", b: "y" }]) {
+            ProveResult::Proved { obligations } => assert!(obligations > 0),
+            other => panic!("expected Proved, got {other:?}"),
+        }
+    }
 
     /// Positive control: a properly guarded access (`ABSOLUTE_POS <
     /// y.len()`) proves, given the `x.len() == y.len()` assume that makes

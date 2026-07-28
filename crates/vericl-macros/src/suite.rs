@@ -505,12 +505,29 @@ fn build_spec(fields: Punctuated<SuiteField, Token![,]>) -> syn::Result<SuiteSpe
     })
 }
 
+/// The RNG salt-scheme tag, recorded verbatim in `Provenance::salt_scheme` on
+/// every manifest this macro produces (round-13A fix 7). A differential claim's
+/// `config.seed` records only the suite's *base* seed; each case actually draws
+/// at `seed ^ kernel_salt(name) ^ case_salt(shape)`. Change either derivation —
+/// the FNV constants in [`kernel_salt`], or the SplitMix multipliers in
+/// [`case_call_tokens`]'s per-case decorrelation — and every kernel is retested
+/// against a different input distribution while `config.seed` and the identity
+/// stay byte-identical, so the evidence would look fresh while describing inputs
+/// it was never produced under. Bumping this tag in the same edit makes
+/// `verify` treat the old evidence as stale. `the_salt_scheme_pins_its_exact_
+/// outputs` fails the moment a salt derivation changes without a bump, so the
+/// discipline is enforced rather than trusted.
+pub(crate) const SALT_SCHEME: &str = "fnv1a-name^splitmix-case/v1";
+
 /// Deterministic FNV-1a 64-bit hash of a kernel name, used only to decorrelate
 /// different kernels' RNG streams within one suite run (two kernels sharing a
 /// seed would otherwise draw from the same underlying bit stream — harmless
 /// since their parameter shapes differ, but needlessly suspicious). Computed
 /// at macro-expansion time so it's a fixed, reproducible per-kernel constant,
 /// not a hand-maintained salt list.
+///
+/// The [`SALT_SCHEME`] tag must be bumped whenever this derivation changes; the
+/// `the_salt_scheme_pins_its_exact_outputs` test enforces that coupling.
 fn kernel_salt(name: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in name.bytes() {
@@ -1176,6 +1193,10 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
     // vericl-macros' own version, resolved when THIS crate was compiled — a
     // proc-macro crate cannot export a constant, so the literal is emitted.
     let macros_version = env!("CARGO_PKG_VERSION");
+    // The salt-scheme tag, emitted the same way (a proc-macro crate cannot
+    // export a const for the runner to read). Bumped whenever the salt
+    // derivation changes; recorded in `Provenance::salt_scheme` (fix 7).
+    let salt_scheme_lit = SALT_SCHEME;
 
     let kernel_blocks: Vec<TokenStream2> = spec.kernels.iter().map(|k| kernel_block(k, spec.sizes_rank)).collect();
 
@@ -1196,10 +1217,12 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
                         <__VericlExtraR as ::cubecl::prelude::Runtime>::name(&__vericl_extra_client),
                     );
                     println!("vericl conformance — additional lane, backend {}", __vericl_extra_backend);
-                    // The lane list is what lets `verify` tell "this build ran
-                    // a lane the evidence file never recorded" (additional
-                    // evidence, a note) from "the recorded claim set is not
-                    // this build's claim set" (a refusal).
+                    // Record the lane this run executed. The committed manifest
+                    // is the superset of lanes, so under `--features cpu` this
+                    // lane matches the file and is VERIFIED; a file that does
+                    // NOT record a lane this run produced is a `verify` problem
+                    // (round-13A fixes 1+2), which is what catches stripping the
+                    // cpu lane out of the committed evidence.
                     __vericl_lanes.push(__vericl_extra_backend.clone());
                     #(#extra_kernel_blocks)*
                 }
@@ -1257,11 +1280,20 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
             __vericl_provenance.vericl_macros = #macros_version.to_string();
             __vericl_provenance.z3 = __vericl_solver.clone();
             __vericl_provenance.lanes = __vericl_lanes;
-            // CubeCL's generic device identity. For wgpu this is the SELECTED
-            // graphics backend (Metal / Vulkan / Dx12) — two materially
+            // The RNG salt-scheme tag (round-13A fix 7). `config.seed` records
+            // only the base seed; the per-kernel/per-case salt fold is what a
+            // change here would silently alter, so the scheme is recorded and
+            // `verify` compares it.
+            __vericl_provenance.salt_scheme = #salt_scheme_lit.to_string();
+            // The graphics-API / backend CLASS the runtime exposes cheaply
+            // (`ComputeClient::info()`), not device identity. For wgpu this is
+            // the SELECTED backend (Metal / Vulkan / Dx12) — two materially
             // different code generators that both report the runtime name
             // `wgpu<wgsl>`, so recording only the name would let evidence
-            // measured on one verify against the other.
+            // measured on one verify against the other. It does NOT distinguish
+            // two Metal GPUs or a driver update (both report `"Metal"`); real
+            // device identity would need `wgpu::AdapterInfo`, which this
+            // runtime-generic call does not surface. See `Provenance::device`.
             __vericl_provenance.device = Some(format!("{:?}", __vericl_client.info()));
 
             let current = ::vericl::Manifest::with_provenance(entries, __vericl_provenance);
@@ -1289,13 +1321,23 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
                 if let Ok(__vericl_prev) = ::vericl::Manifest::load(&__vericl_evidence_path) {
                     let __vericl_scope = ::vericl::obligation_count_changes(&__vericl_prev, &current);
                     if !__vericl_scope.is_empty() {
-                        println!(
+                        // Direct stderr, NOT println!: libtest captures the
+                        // print macros on a passing test, and `VERICL_UPDATE`
+                        // passes (it writes and returns). A proof-scope shrink
+                        // the author did not intend must be visible in that
+                        // passing run, so it goes to real fd 2, which the
+                        // capture does not intercept (round-13A fix 1).
+                        use ::std::io::Write as _;
+                        let __vericl_err = ::std::io::stderr();
+                        let mut __vericl_err = __vericl_err.lock();
+                        let _ = writeln!(
+                            __vericl_err,
                             "vericl WARNING — proof scope changed in this update ({} kernel(s)); \
                              confirm each is intended before committing the manifest:",
                             __vericl_scope.len()
                         );
                         for __vericl_line in &__vericl_scope {
-                            println!("  {}", __vericl_line);
+                            let _ = writeln!(__vericl_err, "  {}", __vericl_line);
                         }
                     }
                 }
@@ -1315,22 +1357,28 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
                         __vericl_evidence_path.display()
                     )
                 });
-                // Evidence this build produced on an execution lane the file
-                // does not record (`cargo test --features cpu` against a
-                // manifest committed from a default run). Not a mismatch —
-                // strictly more evidence on a lane the file never spoke about —
-                // but printed on every run so it is never a silence.
+                // Evidence the file records on an execution lane this run did
+                // not exercise (a `cfg` feature that is off — e.g. the cpu lane
+                // under a default `cargo test`). Not a mismatch: that lane is
+                // strictly verified under its own feature. Written to real
+                // stderr, NOT println!, because libtest captures the print
+                // macros on a passing test — so this note is genuinely on
+                // screen on every run rather than swallowed (round-13A fix 1).
                 let __vericl_extra = ::vericl::unrecorded_evidence(&stored, &current);
                 if !__vericl_extra.is_empty() {
-                    println!(
-                        "vericl note — {} item(s) of evidence produced by this build are not \
-                         recorded in {} (an execution lane the file was not produced with); \
-                         re-run with VERICL_UPDATE=1 under the same features to record them:",
+                    use ::std::io::Write as _;
+                    let __vericl_err = ::std::io::stderr();
+                    let mut __vericl_err = __vericl_err.lock();
+                    let _ = writeln!(
+                        __vericl_err,
+                        "vericl note — {} recorded item(s) in {} were NOT re-verified in this run \
+                         (an execution lane this configuration did not exercise); run under the \
+                         lane's feature (e.g. `--features cpu`) to verify them:",
                         __vericl_extra.len(),
                         __vericl_evidence_path.display(),
                     );
                     for __vericl_line in &__vericl_extra {
-                        println!("  {}", __vericl_line);
+                        let _ = writeln!(__vericl_err, "  {}", __vericl_line);
                     }
                 }
                 let problems = ::vericl::verify(&stored, &current);
@@ -1753,7 +1801,7 @@ mod tests {
     fn the_provenance_record_is_populated_and_carried_into_the_manifest() {
         let g = ok(minimal());
         assert!(g.contains(":: vericl :: Provenance :: current ()"), "{g}");
-        for field in ["vericl_ir", "vericl_macros", "z3", "lanes", "device"] {
+        for field in ["vericl_ir", "vericl_macros", "z3", "lanes", "salt_scheme", "device"] {
             assert!(
                 g.contains(&format!("__vericl_provenance . {field} =")),
                 "provenance field `{field}` is not populated: {g}"
@@ -1807,6 +1855,36 @@ mod tests {
         assert_eq!(kernel_salt("axpy"), kernel_salt("axpy"));
         assert_ne!(kernel_salt("axpy"), kernel_salt("fir3"));
         assert_ne!(kernel_salt("axpy"), kernel_salt("axpz"));
+    }
+
+    /// FIX 7 (round-13A) — the salt scheme is recorded in `Provenance::
+    /// salt_scheme` so a salt-derivation change invalidates evidence, but that
+    /// only works if a change is *noticed*. These exact-value pins fail the
+    /// instant `kernel_salt`'s FNV constants change; the failure message is the
+    /// reminder to bump `SALT_SCHEME` (and regenerate every manifest) in the
+    /// same edit. `config.seed` alone would not have moved.
+    #[test]
+    fn the_salt_scheme_pins_its_exact_outputs() {
+        // FNV-1a/64 of the kernel names in the shipped suites. If these change,
+        // the input distribution every case is tested against changed with them.
+        assert_eq!(
+            kernel_salt("axpy"),
+            0x326a_9c84_0d77_2967,
+            "kernel_salt changed — bump SALT_SCHEME and regenerate all evidence"
+        );
+        assert_eq!(
+            kernel_salt("block_sum_reduce"),
+            0x6c87_edd9_4564_c209,
+            "kernel_salt changed — bump SALT_SCHEME and regenerate all evidence"
+        );
+        assert_eq!(
+            kernel_salt(""),
+            0xcbf2_9ce4_8422_2325,
+            "the FNV offset basis changed — bump SALT_SCHEME and regenerate all evidence"
+        );
+        // The tag itself is stable across this arc (the derivation did not
+        // change), so committed evidence is byte-stable in this field.
+        assert_eq!(SALT_SCHEME, "fnv1a-name^splitmix-case/v1");
     }
 
     /// A dispatch (tuple-`sizes`) suite and a 1-D suite generate different

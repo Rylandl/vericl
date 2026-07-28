@@ -3732,6 +3732,22 @@ missing lane is a line on screen rather than a silence. Its narrowness is pinned
 control in both test files: declare the cpu lane in the stored provenance and the very same additions
 become problems again.
 
+> **Round-13A correction (2026-07-28).** The claim just above — "printed on every verifying run … a
+> line on screen rather than a silence" — was **false as shipped**. The note went out via `println!`
+> inside a passing `#[test]`, and libtest **captures** the print macros on a pass: measured, `cargo
+> test --features cpu` verified 31 cpu-lane claims against a wgpu-only file and produced **zero visible
+> output**, silently dropping the "cpu shares CubeCL's front end, NOT independent" caveat. And the
+> exemption's *direction* let a whole non-primary lane be stripped (lane + claims + trust) for `0
+> problems, all notes`. Round-13A fixes 1+2 replace **exempt-and-hide** with **record-and-verify**: the
+> committed conformance manifest now RECORDS the cpu lane (regenerated under `--features cpu`), so
+> `--features cpu` **verifies** those claims and their shared-front-end caveat instead of noting-and-
+> hiding them; the exemption flips to the *skipped-lane* direction (a recorded lane whose `cfg` feature
+> is off this run is a note, strictly verified under its own feature), and a lane THIS RUN produced
+> that the file omits is now a **problem** — which is what catches the strip. The residual skipped-lane
+> note is written to **real stderr** (`writeln!(io::stderr(), …)`), which libtest's capture does not
+> intercept, so it genuinely is a line on screen on every run. Same fix routes the `VERICL_UPDATE`
+> proof-scope warning to stderr. See the Round-13A record at the end of this file.
+
 **The exemption's own attack surface, found in self-review and closed.** The lane list is the
 exemption's only input, and the attacker edits the stored file — so *deleting* lanes from it widens
 the exempt set by one each. Emptying it entirely would exempt every backend this run used, and
@@ -4054,3 +4070,138 @@ with at least one reviewer aimed at:
 4. the provenance fingerprint's *absence* claims — the residual list is the thing to attack, not the
    fields that are there.
 5. the four vacuity siblings recorded above under fix 2, item 4, which are open.
+
+## Round-13A — second independent review of the evidence-integrity arc — DONE 2026-07-28
+
+A **second, independent reviewer** (review "A", credited) re-checked the arc after round 13's
+double-review. It confirmed the tamper checker holds, but found **honesty and coverage gaps that
+undercut STATED properties** — and for an evidence tool, a *false honesty claim is close to a
+soundness defect*. Ten findings; all addressed (fix 10's cooperative half deliberately left open).
+Every fixed finding ships a regression that fails without the fix, and a negative-per-positive control.
+
+### Fix 1 (MODERATE) — the false "never silent" property, and the design decision
+
+**The measured defect.** The lane-exemption notes and the `VERICL_UPDATE` "proof scope changed"
+warning were emitted with `println!` inside a **passing** `#[test]`. libtest **captures** the print
+macros on a pass (verified with a scratch probe: `println!`/`eprintln!` captured, a direct
+`writeln!(io::stderr(), …)` is *not*). So `cargo test --features cpu` verified **31 cpu-lane claims
+against a wgpu-only file** and produced **zero visible output**, silently dropping the "cpu shares
+CubeCL's front end, NOT independent" caveat. The prior record's "printed on every verifying run … a
+line on screen rather than a silence" (corrected inline above) was false as shipped.
+
+**The record-vs-exempt decision, with the two-direction analysis.** The root cause was pairing the
+exemption with an invisible print. The fix makes the committed conformance manifest the **AUTHORITY on
+the lane set** — a SUPERSET of any single `cfg` config's lanes — and flips the exemption's two
+directions:
+
+- *Before.* `current` has a lane `stored` lacks ⇒ **additive note** (the exemption). `stored` has a
+  lane `current` lacks ⇒ **STALE problem**. This is what let `--features cpu` note-and-hide the cpu
+  lane, and (fix 2) let a whole lane be stripped for `0 problems, all notes`.
+- *After (fixes 1+2).* The committed `vericl.json` now **records the cpu lane** (regenerated under
+  `--features cpu`: +31 cpu tested claims, +31 shared-front-end trust entries, the cpu lane in
+  `provenance.lanes`). A lane `stored` records that `current` did NOT exercise (its `cfg` feature is
+  off) ⇒ **skipped-lane note**, because that lane is strictly verified under the config that enables
+  it — it is not lost, it is checked elsewhere. A lane `current` produced that `stored` omits ⇒
+  **problem** (the recorded lane set is not this build's), which is exactly what catches the strip.
+  The PRIMARY lane is in neither exempt direction (a suite always runs it; a primary change stays a
+  hard problem). The stored-only claim/trust exemption is lane-scoped exactly as before (exact match
+  or `<lane> `-delimited prefix, blank names filtered) — the round-13 wildcard defenses were carried
+  to the new direction.
+
+Net effect: under `--features cpu` the cpu claims and their caveat are **VERIFIED** (0 problems, 0
+notes), not noted-and-hidden. The **residual** — a default `cargo test` cannot re-verify the recorded
+cpu lane — is a genuine, additive note, and it is written to **real stderr** (`writeln!(io::stderr(),
+…)`), which libtest's capture does not intercept: it is a line on screen on every run, making the
+corrected claim literally true. The `VERICL_UPDATE` proof-scope warning is routed the same way.
+
+### Fix 2 (MODERATE) — a whole non-primary lane was strippable and silent
+
+After fix 1 records the cpu lane, deleting it from the file (lane + its claims + its trust) and
+running `--features cpu` is now a **problem set**, not `0 problems, 63 notes`: the cpu evidence the
+build produces is MISSING from the file (Direction A). Regressions on the real committed manifest:
+`a_stripped_cpu_lane_is_a_problem_on_the_committed_file` (the strip is a problem set),
+`a_skipped_cpu_lane_is_a_note_on_the_committed_file` (the feature-off direction is a note), and
+`a_recorded_lane_claim_the_build_did_not_emit_is_a_problem` (an extra claim on the *recorded,
+exercised* lane is still a loss). Unit-level twins in `evidence.rs`.
+
+### Fix 3 (MODERATE) — `vericl_f64.json` was unverified in the default `cargo test`
+
+`conformance_f64.rs` is `#![cfg(feature = "cpu")]`, so a plain `cargo test` never touched the f64
+manifest, contradicting the README's "cargo test is the whole CI story". New default-build test
+`tests/f64_manifest_integrity.rs` recomputes `axpy_f64`'s **identity (`source_hash` + `ir_hash`) +
+contract** from *this tree's* source — `ir_hash` via the same `kernel_ir_hash(kernel_definition())`
+the runner uses, which needs no cpu runtime — and refuses the manifest on any mismatch, plus checks
+the re-derivable toolchain fingerprint. The differential *tested-claim* itself (cpu vs twin) remains
+cpu-lane-verified only, and the test says so.
+
+### Fix 5 (LOW) — the vacuity guards shipped without regressions
+
+The no-`&mut`-output guard and the `gen(len=0)` guard (both in `vericl-macros/src/lib.rs`) had zero
+tests. Added `a_kernel_with_no_mut_output_is_rejected` and `a_gen_len_zero_pin_is_rejected`, driven
+end-to-end through the internal `expand()` (strictly better than the arc's uncommitted scratch
+compile-fail crate, since the expander is directly callable), each paired with a negative control that
+must still expand.
+
+### Fix 6 (LOW) — `device` overclaimed "device identity"
+
+`vericl_f64.json`'s `"device": "()"` proves the field is a graphics-API / backend **class**, not
+device identity (two Metal GPUs, or one across a driver update, both report `"Metal"`). Threading real
+`wgpu::AdapterInfo` would need backend-specific code in the runtime-generic runner (disproportionate),
+so the **doc was corrected** honestly in `provenance.rs` (module bullet + field) and `suite.rs`.
+
+### Fix 7 (LOW) — a salt-scheme change was invisible
+
+`config.seed` records only the base seed; cases run at `seed ^ kernel_salt(name) ^ case_salt(shape)`,
+so a salt-derivation change retests every kernel while every manifest stays byte-identical. Added
+`SALT_SCHEME` (vericl-macros), recorded in the new `Provenance::salt_scheme` and compared by `verify`,
+plus `the_salt_scheme_pins_its_exact_outputs` — an exact-value pin on `kernel_salt` that fails the
+instant the derivation changes, forcing a tag bump + regeneration.
+
+### Fix 8 (LOW) — junk keys were parsed-and-blessed
+
+`Manifest`/`Entry`/`Claim`/`Provenance`/`ContractRecord`/`Identity` gained `#[serde(deny_unknown_
+fields)]`, so a hand-added `"audit": "independently certified"` or `"summary": "PROVED CORRECT"` is
+refused at parse time, not silently dropped into the file a human reads. `config` stays a free-form
+`Value` (the denial is on the claim envelope, not its payload). Regression uses the reviewer's exact
+injected strings at every schema level.
+
+### Fix 9 (LOW) — the cubecl drift check missed a package rename
+
+The pin check compared only the version *string*, so a `package = "cubecl-fork"` rename or a `[patch]`
+keeping `=0.10.0` slipped past. Extended to the resolved package identity (refactored to a pure
+`cubecl_pin_drift` fn) with synthetic regressions for a rename and a patch. Residual (a redirect below
+the workspace manifest — `.cargo/config.toml`, registry substitution) is documented, not silently
+covered.
+
+### Fix 10 (LOW, prover-adjacent) — the two proving vacuities
+
+`Proved{obligations: 0}` (a bounds proof that discharged nothing) is now `OutOfSubset` (no vacuous
+"proved nothing" claim), guarded in `prove_bounds_freedom`. Proven trivially safe: no committed
+evidence has `obligations == 0`, and the full `vericl-ir` suite (139), example unit tests (105), and
+interp crosscheck (18) stay green. Regression `a_zero_obligation_bounds_walk_is_out_of_subset_not_a_
+vacuous_proof` with `build_axpy` as the >0 negative control. The **cooperative `race()==0 ⇒
+Discharged`** vacuity is **left open** for the atomics round (no committed cooperative kernel has
+`race()==0` — they carry 11; forcing a gate there would perturb the coupling logic). The reviewer's
+"record an obligation-coverage denominator" suggestion is noted for that milestone.
+
+### Evidence delta (regenerated last, VERICL_UPDATE under `--features cpu`)
+
+- `vericl.json`: **+31 cpu tested claims + 31 shared-front-end trust entries**, cpu lane added to
+  `provenance.lanes`, `salt_scheme` added. **Every pre-existing wgpu/proved claim, obligation count,
+  `source_hash` and `ir_hash` is byte-stable** (diffed before/after: PROVED content and identity show
+  no diff).
+- `vericl_2d.json`, `vericl_f64.json`, `cooperative_fallback.json`: **identical apart from the additive
+  `salt_scheme` field** (byte-diffed with the field elided → identical).
+
+### Process note (binding)
+
+**A concurrent-agent inject-revert must snapshot the file to the scratchpad and restore FROM THERE —
+never `git checkout`.** A git-revert on a shared working tree can clobber another writer's uncommitted
+changes. This round snapshotted `prover.rs` to the scratchpad before the fix-10 guard experiment, and
+snapshotted all four evidence files before regeneration for the byte-stability diff.
+
+### Gates
+
+589-baseline suite + all prior rounds + `--features cpu` green; clippy clean on both feature sets;
+demo-defects 0; the three cpu-lane regressions fail loudly (actionable message) if `vericl.json` is
+ever committed without the cpu lane.
