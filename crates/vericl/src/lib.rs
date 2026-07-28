@@ -24,9 +24,9 @@
 //     only by `vericl::config!`, never by hand), and its runtime counterpart
 //     [`StructIdentity`] (implemented only by `vericl::cube_struct!`);
 //   * the evidence-reading types — [`Manifest`], [`Entry`], [`Claim`],
-//     [`ClaimKind`], [`ClaimResult`], [`ContractRecord`], [`Identity`], and
-//     [`verify`] — for anyone parsing or checking an `evidence/*.json` file
-//     programmatically.
+//     [`ClaimKind`], [`ClaimResult`], [`ContractRecord`], [`Identity`],
+//     [`Provenance`], [`verify`] and [`unrecorded_evidence`] — for anyone
+//     parsing or checking an `evidence/*.json` file programmatically.
 //
 // Everything else exported below is `pub` only because the *generated* code
 // (the `suite!` test body and the derived reference twins) references it across
@@ -39,6 +39,7 @@
 pub mod compare;
 pub mod contract;
 pub mod evidence;
+pub mod provenance;
 pub mod rng;
 
 // Plumbing modules: referenced only by macro-generated twin / suite code
@@ -64,8 +65,9 @@ pub use compare::{
 pub use contract::{Compare, ConfigIdentity, Contract, ContractRecord, Identity, StructIdentity};
 pub use evidence::{
     CaseOutcome, Claim, ClaimKind, ClaimResult, Entry, Manifest, describe_case_outcome,
-    obligation_count_changes, verify,
+    obligation_count_changes, unrecorded_evidence, verify,
 };
+pub use provenance::Provenance;
 pub use rng::SplitMix64;
 pub use vericl_macros::{config, cube_struct, helper, kernel, reference, suite};
 

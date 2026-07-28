@@ -472,8 +472,8 @@ What VeriCL records is honest about this rather than silent: the pin's **express
 editing the pin re-stales the evidence — but the *environment that resolved it* is not hashed, and
 cannot be. So evidence produced by such a build is per-build deterministic, not per-source
 reproducible: rebuilding the same source with a different `MY_BUILD_M` produces a kernel with the
-same recorded identity and different behavior, and `ir_hash` (populated under `prove: true`) is what
-catches it. If reproducibility across builds matters to you, do not derive a pin from the build
+same recorded identity and different behavior, and `ir_hash` — populated on every run, `prove: true`
+or not, since extracting the expanded IR needs no solver — is what catches it. If reproducibility across builds matters to you, do not derive a pin from the build
 environment — write the value out.
 
 **What a config method body may contain.** Ordinary host Rust: field reads, arithmetic, `if`,
@@ -922,7 +922,7 @@ vericl::suite! {
     // seed: 0xE901,
     // cube_dim: 256,
     // prove: true,
-    // frontend_independent: true,
+    // frontend_independent: <derived from `runtime:` — see below>,
     // extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime),
 }
 ```
@@ -945,9 +945,14 @@ vericl::suite! {
   under `--features cpu`. It is folded into the *same* test (two independent tests sharing one
   evidence file would race), and its claims are recorded as *not* front-end-independent (see section
   10). A cpu extra-lane appears only when you build with that feature.
-- **`frontend_independent`** — set `false` for a suite whose primary runtime shares CubeCL's front
-  end with the kernel (the f64/cubecl-cpu case), so the trusted list records "host CPU execution
-  hardware" and the shared-front-end caveat honestly, rather than implying an independent GPU lane.
+- **`frontend_independent`** — whether the primary runtime is an execution lane independent of the
+  CubeCL front end the kernel goes through. **Normally you omit it**: it is derived from `runtime:`
+  (`WgpuRuntime` → independent, trusted list records "GPU hardware"; `CpuRuntime` → shared front end,
+  trusted list records "host CPU execution hardware" plus the explicit caveat that only the derived
+  twin is independent). It is not a defaulted bool — writing `true` on `CpuRuntime` is a compile
+  error, and an unrecognized runtime must declare which it is, because neither default is safe there.
+  A literal `true`/`false` only. Declaring `false` on a recognized-independent runtime is always
+  allowed: downgrading to the weaker claim cannot overstate anything.
 
 One suite invocation always produces exactly one manifest. Use a second `suite!` in a second test
 file for a kernel that needs a different runtime (the f64-on-cpu case is
@@ -975,27 +980,55 @@ The mental model:
 - **`VERICL_UPDATE=1 cargo test`** runs everything and *writes* the manifest. It refuses to store
   failing evidence — if a differential check or proof fails, it panics telling you to fix the kernel
   or contract first, so you can never bake a red result into the record.
-- **`cargo test`** (no env var) runs everything and *verifies* against the committed manifest. It
-  fails, with the problem list, if the evidence is missing, if the kernel's identity has drifted
-  (source, contract, IR, or vericl version), or if a claim now fails. It also catches a **downgrade**:
-  if the committed evidence has a proved claim the current build no longer produces (z3 went missing,
-  or `prove: false`), that is a reported problem, not a silent pass.
+- **`cargo test`** (no env var) runs everything and *verifies* against the committed manifest,
+  **completely**: the stored claim set has to be this build's claim set, field for field. See
+  "What `verify` compares" in section 11 for the table and the normalization rules.
 
 You commit the evidence files. A reviewer diffing a PR sees exactly which claims changed. A change to
-the kernel body without re-running `VERICL_UPDATE` fails CI with an identity mismatch naming both the
+the kernel body without re-running `VERICL_UPDATE` fails with an identity mismatch naming both the
 source and IR hash — the whole point.
 
 > Tip: when regenerating with multiple feature sets, run the *default* `VERICL_UPDATE=1 cargo test`
-> **last**, so the committed evidence is left in the default (non-cpu) shape. Running a
-> `--features cpu` update last would leave cpu-lane claims in the default manifest and the next plain
-> `cargo test` would report them as unexpected.
+> **last**, so the committed evidence is left in the default (non-cpu) shape. A `--features cpu`
+> update leaves cpu-lane claims in the default manifest, and the next plain `cargo test` reports each
+> of them as a claim the build did not produce. The reverse direction is fine and is the intended
+> steady state: running `cargo test --features cpu` against default-shape evidence prints the extra
+> lane's claims as a note (`vericl note — N item(s) of evidence produced by this build are not
+> recorded in …`) and passes.
 
 ---
 
 ## 11. Reading an evidence file
 
-An evidence manifest is JSON: a `vericl_version` and a list of `entries`, one per kernel. Here is
-`axpy`'s entry (abridged):
+An evidence manifest is JSON: a `vericl_version`, a `provenance` record, and a list of `entries`, one
+per kernel.
+
+The `provenance` record is the **verification environment** the file was produced in — the toolchain,
+the pinned crate versions, the solver, the execution lanes, and the device:
+
+```json
+"provenance": {
+  "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+  "target": "aarch64-apple-darwin",
+  "vericl": "0.1.0",
+  "vericl_ir": "0.1.0",
+  "vericl_macros": "0.1.0",
+  "cubecl": "=0.10.0",
+  "z3": "z3 Z3 version 4.16.0 - 64 bit",
+  "lanes": ["\"wgpu<wgsl>\""],
+  "device": "Metal"
+}
+```
+
+Every one of those changes what the evidence *means* while leaving kernel identity bit-identical: the
+reference twin is compiled by that rustc, the kernel under test goes through that cubecl, the proofs
+were discharged by that z3, and `"wgpu<wgsl>"` on Metal and on Vulkan are two different code
+generators reporting one name. So an evidence file carried to a different environment is **stale**,
+in the same class as a kernel edit, and `verify` says so with the field and both values. What it does
+**not** cover is stated in the `vericl::provenance` module docs — `RUSTFLAGS`, cargo profile,
+transitive dependency versions, and GPU driver builds are all invisible to it.
+
+Here is `axpy`'s entry (abridged):
 
 ```json
 {
@@ -1066,14 +1099,51 @@ tokens + contract + vericl version, composition-aware for `uses(...)` kernels) a
 from the freshly built one — that is what "stale evidence" means. Both hashes are reported on a
 mismatch, so a source edit and a codegen change are distinguishable.
 
+### What `verify` compares
+
+Everything the manifest records. The normalization is deliberate in both directions — insensitive
+where order carries no information, sensitive where it does:
+
+| part | compared as | order |
+|---|---|---|
+| `vericl_version` | exact | — |
+| `provenance` | exact per field; `lanes` subset-checked | `lanes` preserved |
+| entries | keyed by kernel name; a duplicate name is refused | insensitive |
+| `identity` | exact, per field, all reported on a mismatch | — |
+| `contract` | exact, per field, each named | **sensitive** (authored, hash-covered) |
+| claim set | multiset on `(kind, check, backend)`, then `(kind, check)` | insensitive |
+| claim `config` | structural JSON diff to a dotted path | objects insensitive, **arrays sensitive** |
+| claim `result` | exact | — |
+| `trusted` | a **set** — order- and duplicate-insensitive | insensitive |
+
+Claim order is an artifact of the pipeline (tested is pushed first, a cooperative kernel *inserts* its
+tested claim at the front, an extra lane appends), so it is ignored. A `sizes` array is a declared
+sequence, so it is not: reordering it re-stales the evidence. Sensitivity is the safe direction —
+being wrong there costs one regeneration, being wrong the other way lets a real change through.
+
+The property, stated once: **the stored claim set must be this build's claim set**. A claim the file
+records that the build does not produce, a claim the build produces that the file does not record, a
+mutated backend / seed / size list / solver / obligation count / result, an erased trust dependency —
+each is a named problem with the stored and current values shown. There is exactly one exemption, and
+it is scoped by the provenance record rather than by shape: a claim or trust entry contributed by an
+execution lane the stored `lanes` says did not run (the `extra_lane` case), which is printed as a
+note.
+
 ### Independence of lanes
 
 The differential twin is derived by VeriCL's macros and shares **only source text** with the kernel —
 it is genuinely independent of CubeCL's pipeline. A `cubecl-cpu` extra lane, by contrast, shares
 CubeCL's front end (macro expansion + IR) with the kernel under test, so it is recorded as **not** an
 independent reference. For an f64 kernel — where wgpu is unusable — the macro-derived twin is the
-*sole* independent leg, which is why the f64 suite declares `frontend_independent: false` and records
-"host CPU execution hardware" honestly.
+*sole* independent leg.
+
+Which of the two an entry records is **derived from `runtime:`**, not defaulted: `WgpuRuntime`
+resolves to the independent lane (trusted list records "GPU hardware"), `CpuRuntime` to the shared
+front end (trusted list records "host CPU execution hardware" plus an explicit caveat that only the
+derived twin is independent). Writing `frontend_independent: true` on `CpuRuntime` is a compile
+error, and a runtime VeriCL does not recognize must declare which it is — neither default is safe
+there, so the macro asks. The field takes a literal `true`/`false` only; a claim that depends on a
+runtime value cannot be checked when it is made.
 
 ---
 
@@ -1098,6 +1168,14 @@ are the common ones and what to do.
 | `` `ABSOLUTE_POS_X` is a per-axis topology builtin outside the ordinary vericl v0 subset; add a `dispatch(cube_dim = (Wx, Wy), extents = (w, h))` clause `` | You indexed by axis in a kernel with no dispatch clause | Add the clause (section 8) |
 | `` `ABSOLUTE_POS` is outside the vericl v0 subset in a `dispatch(...)` kernel — in a multi-axis dispatch it is NOT `CUBE_POS * CUBE_DIM + UNIT_POS` … `` | You mixed the flat and the per-axis addressing schemes | Index with the per-axis builtins, or drop the clause and stay flat (section 8.5) |
 | `` this kernel declares `dispatch(...)` but its body reads no per-axis topology builtin `` | An unused dispatch clause — it still changes the launch shape and the evidence | Remove the clause, or index by axis |
+| `` kernel `k` declares no `&mut Array<T>` output parameter, so there is nothing for the differential to compare `` | The kernel writes no output buffer. Every case would report zero compared parameters, and `all()` over zero reports is `true` — a passing `tested` claim that established nothing | Add an `&mut Array<T>` output, or make it a `#[vericl::helper]` |
+| `` gen(...) pins `len(y) = 0` `` | A pinned buffer length of zero compares no elements — and `gen(...)` is not in the contract record, so the claim would advertise the suite's sizes having compared nothing | Use a positive length |
+| `` suite!: `kernels: []` declares a conformance suite over no kernels `` | A suite that checks nothing and prints `vericl evidence OK` | List a kernel, or delete the `suite!` |
+| `` suite!: `sizes: []` declares a differential over no cases `` | `all()` over zero outcomes is `true`: every kernel would record a passing `tested` claim having executed nothing | Declare a size, or omit the field for the default list |
+| `` suite!: a `sizes:` entry of 0 runs a case that compares ZERO elements `` | Same vacuity one level down | Use a positive size (`1` is the honest degenerate case) |
+| `` suite!: this suite's `runtime:` … shares CubeCL's front end … would record a claim that is not true `` | `frontend_independent: true` on a runtime that is not an independent lane | Remove the field — it is derived from `runtime:` |
+| `` suite!: vericl does not recognize this runtime … `` | A runtime VeriCL has not measured; neither lane-independence default is safe | Declare `frontend_independent: true` or `false` (the message says what each records) |
+| `` suite!: `frontend_independent:` takes a literal `true` or `false`, not an expression `` | A claim selected by a runtime value cannot be checked when it is made | Write the literal |
 | `` `ABSOLUTE_POS_Z` names the Z axis, which this kernel's `dispatch(...)` clause does not enable `` | A rank-3 read under a 2-tuple `cube_dim` | Widen the clause to a 3-tuple, or drop the Z read (section 8.5) |
 | `` `out.len() == (w * h) as usize` multiplies in u32 and then widens … `` | The wrapping product spelling — a measured false `Proved` | Write `out.len() == (w as usize) * (h as usize)` (section 8.2) |
 | `` `dispatch(cube_dim = ...)` takes 2 or 3 positive integer *literals* `` / `` … has 2048 units per cube, above the 1024 `` | A runtime or over-large cube dim | Pin literals whose product is `<= 1024` (section 8) |

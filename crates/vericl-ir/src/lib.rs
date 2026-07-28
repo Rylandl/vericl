@@ -9,6 +9,14 @@
 //! minimal and self-describing rather than sharing types with the contract
 //! layer; callers (the conformance harness) translate between the two.
 
+/// The `vericl-ir` crate version, recorded in an evidence manifest's
+/// verification-environment fingerprint (`vericl::Provenance`).
+///
+/// `vericl` core cannot read it — it does not depend on this crate (the
+/// dependency runs the other way, and only through the `suite!`-generated code
+/// at the user's call site), so the `suite!` runner reads it from here.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod fuzz;
 mod hash;
 mod interp;

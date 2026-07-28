@@ -214,6 +214,16 @@ pub struct Identity {
     /// `Identity` comparison catches IR-level drift (e.g. a CubeCL upgrade
     /// that changes codegen without changing kernel source) in addition to
     /// source-level drift.
+    ///
+    /// **The `suite!` harness now sets it unconditionally**, which is what this
+    /// doc always said and what the code did not do: the assignment used to
+    /// live inside the `if prove` branches, so a `prove: false` suite recorded
+    /// `"ir_hash": null` and had no defence against IR-level drift at all.
+    /// Extracting the expanded IR needs a `KernelDefinition`, not a solver, so
+    /// there was never a reason for the two to be coupled
+    /// (`docs/design-struct-comptime.md` M4 listed this and it was deferred;
+    /// the external consumer review is what un-deferred it). A `None` here now
+    /// means evidence written by something other than `suite!`.
     #[serde(default)]
     pub ir_hash: Option<String>,
 }

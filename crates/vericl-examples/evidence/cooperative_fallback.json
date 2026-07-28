@@ -1,12 +1,24 @@
 {
   "vericl_version": "0.1.0",
+  "provenance": {
+    "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "target": "aarch64-apple-darwin",
+    "vericl": "0.1.0",
+    "vericl_ir": "0.1.0",
+    "vericl_macros": "0.1.0",
+    "cubecl": "=0.10.0",
+    "lanes": [
+      "\"wgpu<wgsl>\""
+    ],
+    "device": "Metal"
+  },
   "entries": [
     {
       "kernel": "block_sum_reduce",
       "identity": {
         "source_hash": "sha256:a1b1ed1eaff3e165ebf10ae58472aad8f2c1d8587c70c34781dd208cff3eeb80",
         "vericl_version": "0.1.0",
-        "ir_hash": null
+        "ir_hash": "sha256:5d2dd12d28e2f3acc2e4b521e167d33117d29ac5daf306c1ec6497927d858d3f"
       },
       "contract": {
         "assumes": [

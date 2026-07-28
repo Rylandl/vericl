@@ -2,12 +2,14 @@
 //! produced from. Evidence that no longer matches the current build is
 //! rejected, not warned about.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::compare::CompareReport;
 use crate::contract::{ContractRecord, Identity};
+use crate::provenance::Provenance;
 
 /// The evidence manifest — the serialized form of an `evidence/*.json` file.
 ///
@@ -19,6 +21,14 @@ use crate::contract::{ContractRecord, Identity};
 pub struct Manifest {
     /// The `vericl` version that produced this manifest.
     pub vericl_version: String,
+    /// The verification environment this manifest was produced in — toolchain,
+    /// crate versions, solver, execution lanes. See [`Provenance`].
+    ///
+    /// `#[serde(default)]` so an evidence file written before the fingerprint
+    /// existed still loads for a programmatic consumer; [`verify`] refuses it
+    /// rather than accepting a file whose toolchain is unknown.
+    #[serde(default)]
+    pub provenance: Provenance,
     /// One entry per kernel in the suite.
     pub entries: Vec<Entry>,
 }
@@ -107,10 +117,32 @@ pub struct CaseOutcome {
 }
 
 impl CaseOutcome {
-    /// `true` iff the reference didn't panic and every compared parameter's
-    /// report passed.
+    /// `true` iff the reference didn't panic, **something was actually
+    /// compared**, and every compared parameter's report passed.
+    ///
+    /// # The non-vacuity clauses
+    ///
+    /// `reports.iter().all(…)` alone is `true` over an empty list, and
+    /// `CompareReport { pass: true, checked: 0 }` is what a zero-length buffer
+    /// produces — so the plain "nothing diverged" reading of this method has
+    /// two ways to be green while comparing nothing:
+    ///
+    /// * **no compared parameter at all** — a kernel declaring no `&mut Array`
+    ///   output. `#[vericl::kernel]` now rejects that shape at compile time, so
+    ///   this clause is a backstop rather than the primary gate;
+    /// * **a zero-element comparison** — reachable from a size that evaluates
+    ///   to `0` (`sizes: [0]`, or a `gen(len(y = 0))` pin). Both literal
+    ///   spellings are rejected by the macros; a size behind a `const` or an
+    ///   arbitrary expression is not, and lands here.
+    ///
+    /// A case that compared nothing is not a passing case, so both are `false`
+    /// and [`describe_case_outcome`] says which one happened. This is the same
+    /// discipline the suite applies to `kernels: []` and `sizes: []`: an empty
+    /// set is refused, never reported as agreement.
     pub fn pass(&self) -> bool {
-        self.reference_panic.is_none() && self.reports.iter().all(|(_, r)| r.pass)
+        self.reference_panic.is_none()
+            && !self.reports.is_empty()
+            && self.reports.iter().all(|(_, r)| r.pass && r.checked > 0)
     }
 }
 
@@ -138,6 +170,22 @@ pub fn describe_case_outcome(o: &CaseOutcome) -> String {
                 o.case
             )
         };
+    }
+    // The two vacuity shapes [`CaseOutcome::pass`] refuses. Named explicitly:
+    // "0/0 elements diverge" would otherwise read as agreement.
+    if o.reports.is_empty() {
+        return format!(
+            "{}: NOTHING WAS COMPARED — the case produced no compared parameter at all, so \
+             agreement here is vacuous",
+            o.case
+        );
+    }
+    if let Some((param, _)) = o.reports.iter().find(|(_, r)| r.checked == 0) {
+        return format!(
+            "{}: NOTHING WAS COMPARED — parameter `{param}` has zero elements, so agreement here \
+             is vacuous (a size or a `gen(len(...))` pin evaluated to 0?)",
+            o.case
+        );
     }
     let failing: Vec<String> = o
         .reports
@@ -410,10 +458,30 @@ pub fn proved_race_config(
 }
 
 impl Manifest {
-    /// A manifest over `entries`, stamped with the current `vericl` version.
+    /// A manifest over `entries`, stamped with the current `vericl` version and
+    /// the part of the verification environment this crate can see on its own
+    /// ([`Provenance::current`]). Use [`Manifest::with_provenance`] to supply
+    /// the rest (solver, lanes, device, sibling crate versions) — the
+    /// `suite!`-generated runner does.
     pub fn new(entries: Vec<Entry>) -> Self {
         Self {
             vericl_version: crate::VERSION.to_string(),
+            provenance: Provenance::current(),
+            entries,
+        }
+    }
+
+    /// A manifest over `entries` with a fully-populated verification-environment
+    /// record.
+    ///
+    /// Generated-code plumbing: the `suite!` runner is the only place that can
+    /// see the solver version, the execution lanes, the device, and the
+    /// `vericl-ir` / `vericl-macros` versions.
+    #[doc(hidden)]
+    pub fn with_provenance(entries: Vec<Entry>, provenance: Provenance) -> Self {
+        Self {
+            vericl_version: crate::VERSION.to_string(),
+            provenance,
             entries,
         }
     }
@@ -434,94 +502,591 @@ impl Manifest {
     }
 }
 
-/// Verify stored evidence against the current build's freshly produced
-/// manifest. Returns human-readable problems; empty means the evidence stands.
-pub fn verify(stored: &Manifest, current: &Manifest) -> Vec<String> {
-    let mut problems = Vec::new();
+// ---------------------------------------------------------------------------
+// Verification
+//
+// The completeness property, stated once, because everything below is an
+// instance of it:
+//
+//   **The stored file must not claim anything this build does not produce.**
+//
+// Every tamper class is an instance of that sentence being violated — a tested
+// claim deleted from the build while the file still advertises it, a backend
+// swapped, a `sizes` list shortened, a trust dependency erased, a passing claim
+// typed into the file by hand. Each is a *problem*: `verify` refuses.
+//
+// The converse — this build producing MORE than the file records — is also a
+// mismatch (the file records a claim SET, and a different set is a different
+// statement), with **one** exemption, scoped by the provenance record rather
+// than by shape: a claim or trust entry contributed by an execution LANE that
+// the stored provenance says did not run. That is what lets a single manifest
+// serve both `cargo test` and `cargo test --features cpu`, where the second
+// `cfg`-enables a whole extra execution lane and adds one claim plus one trust
+// entry per kernel. Those additions are reported by [`unrecorded_evidence`] as
+// printed notes — never silent, and never able to mask a loss, a mutation, or a
+// failure on the lanes the file does record.
+//
+// `trusted` is where the asymmetry bites hardest and is worth stating on its
+// own: a component this build trusts that the file OMITS makes the recorded
+// claim look STRONGER than the one established (fewer things taken on faith),
+// so the missing direction is a problem there too.
+// ---------------------------------------------------------------------------
+
+/// Both directions of a stored-vs-current manifest comparison.
+struct Comparison {
+    /// The stored file claims something this build does not support.
+    problems: Vec<String>,
+    /// This build produces evidence the stored file does not record.
+    unrecorded: Vec<String>,
+}
+
+fn kind_word(k: ClaimKind) -> &'static str {
+    match k {
+        ClaimKind::Proved => "proved",
+        ClaimKind::Tested => "tested",
+        ClaimKind::Assumed => "assumed",
+    }
+}
+
+fn result_word(r: &ClaimResult) -> &'static str {
+    match r {
+        ClaimResult::Pass => "pass",
+        ClaimResult::Fail { .. } => "fail",
+        ClaimResult::Declared => "declared",
+    }
+}
+
+fn claim_label(c: &Claim) -> String {
+    match &c.backend {
+        Some(b) => format!("{} `{}` (backend {b})", kind_word(c.kind), c.check),
+        None => format!("{} `{}`", kind_word(c.kind), c.check),
+    }
+}
+
+/// Render a pair of JSON values for one diff line, each truncated so a long
+/// `statement` string cannot bury the rest of the report.
+///
+/// Truncating the two sides *independently from the start* is what a first
+/// attempt does, and it has a defect worth avoiding: two values that agree on
+/// their first `MAX` characters and differ after render **identically**, so the
+/// line reads `stored X -> current X` for a difference that is really there.
+/// The values that hit this are exactly the ones where it matters most — the
+/// whole-array blob an unequal-length `sizes` diff produces.
+///
+/// So the window is centred on the **first divergence** instead: if the common
+/// prefix is longer than the budget, both sides are shown from a little before
+/// the point where they part company, elided at the front with `…`.
+fn render_json_pair(stored: &serde_json::Value, current: &serde_json::Value) -> (String, String) {
+    const MAX: usize = 160;
+    /// Characters of agreeing context to keep before the divergence.
+    const LEAD: usize = 24;
+
+    let a: Vec<char> = stored.to_string().chars().collect();
+    let b: Vec<char> = current.to_string().chars().collect();
+    if a.len() <= MAX && b.len() <= MAX {
+        return (a.into_iter().collect(), b.into_iter().collect());
+    }
+    let common = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    let start = if common + 1 > MAX { common.saturating_sub(LEAD) } else { 0 };
+    let window = |v: &[char]| {
+        let head = if start > 0 { "…" } else { "" };
+        let tail = if v.len() > start + MAX { "…" } else { "" };
+        let body: String = v.iter().skip(start).take(MAX).collect();
+        format!("{head}{body}{tail}")
+    };
+    (window(&a), window(&b))
+}
+
+/// Structural diff of two claim `config` values as `path: stored X -> current Y`
+/// lines.
+///
+/// **Normalization.** Object keys are compared as a *set* (the union, sorted) —
+/// `serde_json`'s `Map` is a `BTreeMap` in this build, so both sides are already
+/// canonically key-ordered on load and key order carries no information.
+/// **Arrays are order-sensitive**: a config array is a declared sequence
+/// (`sizes`, `cube_dim`), and reordering `sizes:` is a different declaration
+/// even though the same cases run. Sensitivity is the safe direction here — it
+/// can only ask for a regeneration after a cosmetic edit, never let a real
+/// change through (the same argument `combine_source_hash` already records for
+/// `uses(...)` order).
+fn json_diff(path: &str, stored: &serde_json::Value, current: &serde_json::Value, out: &mut Vec<String>) {
+    match (stored, current) {
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            let mut keys: Vec<&str> = a.keys().chain(b.keys()).map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            for k in keys {
+                let p = if path.is_empty() { k.to_string() } else { format!("{path}.{k}") };
+                match (a.get(k), b.get(k)) {
+                    (Some(x), Some(y)) => json_diff(&p, x, y, out),
+                    (Some(x), None) => {
+                        let (r, _) = render_json_pair(x, &serde_json::Value::Null);
+                        out.push(format!("{p}: stored {r} -> current <absent>"))
+                    }
+                    (None, Some(y)) => {
+                        let (_, r) = render_json_pair(&serde_json::Value::Null, y);
+                        out.push(format!("{p}: stored <absent> -> current {r}"))
+                    }
+                    (None, None) => unreachable!("key came from one of the two maps"),
+                }
+            }
+        }
+        (serde_json::Value::Array(a), serde_json::Value::Array(b)) if a.len() == b.len() => {
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                json_diff(&format!("{path}[{i}]"), x, y, out);
+            }
+        }
+        _ => {
+            if stored != current {
+                let (a, b) = render_json_pair(stored, current);
+                out.push(format!("{path}: stored {a} -> current {b}"));
+            }
+        }
+    }
+}
+
+/// Match a stored entry's claims against the current build's.
+///
+/// **Normalization: claim order is meaningless and is ignored.** The order
+/// claims appear in is an artifact of the pipeline (tested pushed first, then
+/// proved; the cooperative branch *inserts* its tested claim at index 0; an
+/// extra lane appends), not a property of the kernel. Claims are matched as a
+/// multiset in three passes, narrowing:
+///
+/// 1. **whole claim equal** — identical `(kind, check, backend, config,
+///    result)`. This pass exists for attribution, not detection: when a group
+///    shares a key, first-fit on the key alone can pair a stored claim with a
+///    *different* current claim of the same key and then blame the wrong one
+///    for the config diff. Matching identical content first leaves only the
+///    genuinely-changed claims for the later passes;
+/// 2. key `(kind, check, backend)` — the common case, and the one that keeps
+///    two same-`check` claims from two execution lanes apart;
+/// 3. `(kind, check)` for whatever is left — so a *changed* backend is reported
+///    as one field diff rather than as an unrelated removal plus addition.
+///
+/// Whether a difference is reported at all does not depend on the passes:
+/// every stored claim ends up paired (and any field diff on the pair is
+/// reported) or in `stored_only`, and every unpaired current claim is in
+/// `current_only`. The passes decide *which* claim a diff is attributed to.
+///
+/// Returns `(pairs, stored_only, current_only)`, `pairs` sorted by stored index
+/// so the report order is deterministic.
+fn pair_claims(stored: &[Claim], current: &[Claim]) -> (Vec<(usize, usize)>, Vec<usize>, Vec<usize>) {
+    let mut taken = vec![false; current.len()];
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut unpaired: Vec<usize> = (0..stored.len()).collect();
+
+    // Each pass keeps whatever it could not match for the next, looser one.
+    let matchers: [fn(&Claim, &Claim) -> bool; 3] = [
+        |s, c| s == c,
+        |s, c| s.kind == c.kind && s.check == c.check && s.backend == c.backend,
+        |s, c| s.kind == c.kind && s.check == c.check,
+    ];
+    for matches in matchers {
+        let mut still = Vec::new();
+        for si in unpaired {
+            let s = &stored[si];
+            match current.iter().enumerate().find(|(ci, c)| !taken[*ci] && matches(s, c)) {
+                Some((ci, _)) => {
+                    taken[ci] = true;
+                    pairs.push((si, ci));
+                }
+                None => still.push(si),
+            }
+        }
+        unpaired = still;
+    }
+
+    pairs.sort_unstable();
+    let current_only = (0..current.len()).filter(|i| !taken[*i]).collect();
+    (pairs, unpaired, current_only)
+}
+
+/// Field-level diff of the contract record.
+///
+/// **Normalization: order-SENSITIVE on all three lists.** `assumes`,
+/// `instantiate` and `uses` are authored clause lists whose order is already
+/// covered by `SOURCE_HASH` (and, for `uses`, by `combine_source_hash`), so a
+/// reorder is already an identity change — being sensitive here keeps the two
+/// checks from disagreeing about the same fact.
+fn contract_problems(kernel: &str, st: &ContractRecord, cur: &ContractRecord, out: &mut Vec<String>) {
+    let mut note = |field: &str, a: String, b: String| {
+        if a != b {
+            out.push(format!(
+                "kernel `{kernel}`: contract field `{field}` drifted without an identity change: \
+                 stored {a} -> current {b} — `source_hash` covers the contract tokens, so this \
+                 should be unreachable; treat it as a vericl bug rather than as evidence to renew"
+            ));
+        }
+    };
+    note("assumes", format!("{:?}", st.assumes), format!("{:?}", cur.assumes));
+    note("compare", format!("{:?}", st.compare), format!("{:?}", cur.compare));
+    note("wrapping", st.wrapping.to_string(), cur.wrapping.to_string());
+    note("instantiate", format!("{:?}", st.instantiate), format!("{:?}", cur.instantiate));
+    note("uses", format!("{:?}", st.uses), format!("{:?}", cur.uses));
+}
+
+/// Compare the verification-environment fingerprints, returning the execution
+/// lanes present in this run that the stored evidence does not record (the
+/// additive-lane exemption set for the `trusted` check).
+fn provenance_problems(
+    stored: &Provenance,
+    current: &Provenance,
+    problems: &mut Vec<String>,
+    unrecorded: &mut Vec<String>,
+) -> Vec<String> {
+    if !stored.is_recorded() {
+        problems.push(
+            "STALE evidence — the stored manifest carries no verification-environment record (it \
+             predates the provenance fingerprint). Evidence whose toolchain is unknown is not \
+             merely older, it is unverifiable: regenerate it with `VERICL_UPDATE=1 cargo test`"
+                .to_string(),
+        );
+        return Vec::new();
+    }
+
+    let mut fields: Vec<String> = Vec::new();
+    let mut cmp = |name: &str, a: &str, b: &str| {
+        if a != b {
+            fields.push(format!("{name} `{a}` -> `{b}`"));
+        }
+    };
+    cmp("rustc", &stored.rustc, &current.rustc);
+    cmp("target", &stored.target, &current.target);
+    cmp("vericl", &stored.vericl, &current.vericl);
+    cmp("vericl-ir", &stored.vericl_ir, &current.vericl_ir);
+    cmp("vericl-macros", &stored.vericl_macros, &current.vericl_macros);
+    cmp("cubecl", &stored.cubecl, &current.cubecl);
+    cmp(
+        "z3",
+        stored.z3.as_deref().unwrap_or("<none>"),
+        current.z3.as_deref().unwrap_or("<none>"),
+    );
+    cmp(
+        "device",
+        stored.device.as_deref().unwrap_or("<none>"),
+        current.device.as_deref().unwrap_or("<none>"),
+    );
+    if !fields.is_empty() {
+        problems.push(format!(
+            "STALE evidence — the verification environment changed ({}). This evidence was \
+             produced by a different toolchain/solver/device than the one running now, so what it \
+             measured is not what this build measures. Regenerate it here (`VERICL_UPDATE=1 cargo \
+             test`), or check out the environment that produced it",
+            fields.join("; ")
+        ));
+    }
+
+    // Lanes are SUBSET-checked rather than compared: a lane the stored evidence
+    // recorded that is missing now is a loss (and every claim it produced is
+    // separately reported as stored-only), while a lane this run adds is the
+    // additive `extra_lane` case — strictly more evidence, so a note.
+    for lane in &stored.lanes {
+        if !current.lanes.contains(lane) {
+            problems.push(format!(
+                "STALE evidence — execution lane {lane} is recorded in the stored evidence but did \
+                 not run in this build (a `cfg` feature that was enabled when the evidence was \
+                 produced is off now?)"
+            ));
+        }
+    }
+
+    // The lane list is the ONLY input to the exemption, so it is also the only
+    // thing an attacker editing the stored file would go after: every lane
+    // deleted from it widens the exempt set by one, and a claim or trust entry
+    // from an exempt lane is a note instead of a refusal. Two guards close that,
+    // and they are why the exemption is safe to have at all.
+    //
+    // (1) A manifest that records claims must record the lane that produced
+    //     them, whenever this run has lanes that could be exempted by its
+    //     silence. (Both sides empty is not a risk and not a `suite!` shape:
+    //     nothing can be exempt when there is no current lane to exempt, so a
+    //     hand-built `Manifest::new` manifest is compared at maximum strictness
+    //     rather than refused.)
+    if stored.lanes.is_empty() && !current.lanes.is_empty() {
+        problems.push(
+            "the stored evidence records no execution lane at all — the lane list is what scopes \
+             the additive-lane exemption, so an empty one would excuse every difference on every \
+             backend. Regenerate with `VERICL_UPDATE=1`"
+                .to_string(),
+        );
+        return Vec::new();
+    }
+    // (2) The PRIMARY lane is never exempt, whatever the list says. The
+    //     exemption exists for an `extra_lane` that a `cfg` feature switched on;
+    //     the lane a suite always runs is not that, and letting it in would
+    //     excuse an erased `"<primary>" buffer upload/readback integrity` trust
+    //     entry (which starts with the backend name) as an "unrecorded lane".
+    let primary = current.lanes.first();
+    if let (Some(st_primary), Some(cur_primary)) = (stored.lanes.first(), primary) {
+        if st_primary != cur_primary {
+            problems.push(format!(
+                "STALE evidence — the PRIMARY execution lane changed: stored {st_primary} -> \
+                 current {cur_primary}. The primary lane is the one every claim in this manifest \
+                 was measured on"
+            ));
+        }
+    }
+    let exempt: Vec<String> = current
+        .lanes
+        .iter()
+        .filter(|l| Some(*l) != primary && !stored.lanes.contains(l))
+        .cloned()
+        .collect();
+    if !exempt.is_empty() {
+        unrecorded.push(format!(
+            "execution lane(s) {} ran but are not recorded in the stored evidence (stored lanes: \
+             {}) — their claims are additional evidence, not a mismatch",
+            exempt.join(", "),
+            stored.lanes.join(", ")
+        ));
+    }
+    exempt
+}
+
+fn compare_manifests(stored: &Manifest, current: &Manifest) -> Comparison {
+    let mut problems: Vec<String> = Vec::new();
+    let mut unrecorded: Vec<String> = Vec::new();
+
+    // A manifest with no entries passes every check below vacuously — each one
+    // quantifies over `entries`. `suite!` rejects `kernels: []` at compile time,
+    // but `verify` is public API that anything can call, so it refuses the shape
+    // here too rather than returning "no problems" for an empty file.
+    if current.entries.is_empty() {
+        problems.push(
+            "this build produced NO kernel entries — every check below quantifies over the entry \
+             list, so an empty manifest verifies vacuously. Refused rather than reported as OK"
+                .to_string(),
+        );
+    }
+    if stored.entries.is_empty() && current.entries.is_empty() {
+        problems.push(
+            "the stored evidence file contains no entries — there is nothing recorded to verify \
+             against"
+                .to_string(),
+        );
+    }
+
+    // Entries are matched by kernel NAME (entry order is meaningless — it is
+    // just the `kernels:` list order). That makes a duplicated name lossy: the
+    // second copy would never be looked at. `suite!` cannot produce one; a
+    // hand-edited file can.
+    for (side, m) in [("stored", stored), ("current", current)] {
+        let mut seen = BTreeSet::new();
+        for e in &m.entries {
+            if !seen.insert(e.kernel.as_str()) {
+                problems.push(format!(
+                    "{side} manifest has more than one entry for kernel `{}` — entries are keyed \
+                     by kernel name, so a duplicate hides everything after the first",
+                    e.kernel
+                ));
+            }
+        }
+    }
+
+    if stored.vericl_version != current.vericl_version {
+        problems.push(format!(
+            "STALE evidence — manifest `vericl_version` {} -> {}",
+            stored.vericl_version, current.vericl_version
+        ));
+    }
+
+    let exempt_lanes =
+        provenance_problems(&stored.provenance, &current.provenance, &mut problems, &mut unrecorded);
 
     for cur in &current.entries {
-        match stored.entries.iter().find(|e| e.kernel == cur.kernel) {
-            None => problems.push(format!(
-                "kernel `{}`: no stored evidence — run update",
+        let Some(st) = stored.entries.iter().find(|e| e.kernel == cur.kernel) else {
+            problems.push(format!("kernel `{}`: no stored evidence — run update", cur.kernel));
+            continue;
+        };
+
+        if st.identity != cur.identity {
+            // Report every mismatched identity field, not just the first — a
+            // kernel edit typically changes both the source-level and IR-level
+            // hash together, and both must be visible in the failure, not just
+            // whichever field happens to differ.
+            let mut fields = Vec::new();
+            if st.identity.source_hash != cur.identity.source_hash {
+                fields.push(format!(
+                    "source_hash {} -> {}",
+                    st.identity.source_hash, cur.identity.source_hash
+                ));
+            }
+            if st.identity.ir_hash != cur.identity.ir_hash {
+                fields.push(format!(
+                    "ir_hash {} -> {}",
+                    st.identity.ir_hash.as_deref().unwrap_or("<none>"),
+                    cur.identity.ir_hash.as_deref().unwrap_or("<none>"),
+                ));
+            }
+            if st.identity.vericl_version != cur.identity.vericl_version {
+                fields.push(format!(
+                    "vericl_version {} -> {}",
+                    st.identity.vericl_version, cur.identity.vericl_version
+                ));
+            }
+            problems.push(format!(
+                "kernel `{}`: STALE evidence — identity mismatch ({}) (kernel source, contract, \
+                 IR, or vericl version changed without renewing evidence)",
+                cur.kernel,
+                fields.join(", ")
+            ));
+            // Identity mismatch invalidates everything else about the entry.
+            continue;
+        }
+
+        contract_problems(&cur.kernel, &st.contract, &cur.contract, &mut problems);
+
+        // --- claims: the full set, normalized ---
+        let (pairs, stored_only, current_only) = pair_claims(&st.claims, &cur.claims);
+
+        for (si, ci) in pairs {
+            let (s, c) = (&st.claims[si], &cur.claims[ci]);
+            // When the backend is what moved, name the claim without it — the
+            // dedicated line below carries both values.
+            let label = if s.backend == c.backend {
+                claim_label(s)
+            } else {
+                format!("{} `{}`", kind_word(s.kind), s.check)
+            };
+            if s.backend != c.backend {
+                problems.push(format!(
+                    "kernel `{}`: {label} — backend changed: stored {} -> current {}",
+                    cur.kernel,
+                    s.backend.as_deref().unwrap_or("<none>"),
+                    c.backend.as_deref().unwrap_or("<none>"),
+                ));
+            }
+            let mut cfg = Vec::new();
+            json_diff("config", &s.config, &c.config, &mut cfg);
+            for line in cfg {
+                problems.push(format!("kernel `{}`: {label} — {line}", cur.kernel));
+            }
+            // A `Fail` on either side is reported in full (with its detail) by
+            // the failure pass below; reporting the status change too would say
+            // the same thing twice.
+            let either_failed = matches!(s.result, ClaimResult::Fail { .. })
+                || matches!(c.result, ClaimResult::Fail { .. });
+            if !either_failed && s.result != c.result {
+                problems.push(format!(
+                    "kernel `{}`: {label} — result changed: stored {} -> current {}",
+                    cur.kernel,
+                    result_word(&s.result),
+                    result_word(&c.result),
+                ));
+            }
+        }
+
+        for si in stored_only {
+            let s = &st.claims[si];
+            if s.kind == ClaimKind::Proved {
+                // Keep the downgrade wording: losing a proof is the specific
+                // regression this check was originally written for, and
+                // "proved" and "never claimed" are never interchangeable
+                // (README "Claims and trust boundaries").
+                problems.push(format!(
+                    "kernel `{}`: evidence downgraded — stored evidence has a proved `{}` claim \
+                     that the current build did not produce (prove disabled, or z3 unavailable?)",
+                    cur.kernel, s.check
+                ));
+            } else {
+                problems.push(format!(
+                    "kernel `{}`: {} is recorded in the stored evidence but this build did not \
+                     produce it — the file claims more than the build supports (a check was \
+                     removed, or the claim was written into the file by hand)",
+                    cur.kernel,
+                    claim_label(s)
+                ));
+            }
+        }
+
+        for ci in current_only {
+            let c = &cur.claims[ci];
+            // The additive-lane exemption, keyed on the stored provenance's
+            // lane list — the same one `trusted` below uses, and the only way
+            // a claim this build produced is allowed to be absent from the
+            // file. Everything else is a mismatch: the file records a claim SET
+            // and this build's set is different.
+            let from_unrecorded_lane =
+                c.backend.as_deref().is_some_and(|b| exempt_lanes.iter().any(|l| l == b));
+            if from_unrecorded_lane {
+                unrecorded.push(format!(
+                    "kernel `{}`: {} was produced by an execution lane the stored evidence does \
+                     not record",
+                    cur.kernel,
+                    claim_label(c)
+                ));
+            } else {
+                problems.push(format!(
+                    "kernel `{}`: {} was produced by this build but is MISSING from the stored \
+                     evidence — the recorded claim set is not this build's claim set (a claim was \
+                     deleted from the file, or new evidence needs recording: VERICL_UPDATE=1)",
+                    cur.kernel,
+                    claim_label(c)
+                ));
+            }
+        }
+
+        // --- trusted: a SET, and the asymmetry inverts (see the module note) ---
+        //
+        // Duplicate-insensitive on purpose: it is a list of components taken on
+        // faith, and whether one was pushed twice says nothing about the claim.
+        let st_trust: BTreeSet<&str> = st.trusted.iter().map(String::as_str).collect();
+        let cur_trust: BTreeSet<&str> = cur.trusted.iter().map(String::as_str).collect();
+        for missing in cur_trust.difference(&st_trust) {
+            if exempt_lanes.iter().any(|l| missing.starts_with(l.as_str())) {
+                unrecorded.push(format!(
+                    "kernel `{}`: trusted component contributed by an unrecorded lane: `{missing}`",
+                    cur.kernel
+                ));
+            } else {
+                problems.push(format!(
+                    "kernel `{}`: trusted component `{missing}` is produced by this build but \
+                     MISSING from the stored evidence — an omitted trust dependency makes the \
+                     recorded claim look stronger than the one actually established",
+                    cur.kernel
+                ));
+            }
+        }
+        for extra in st_trust.difference(&cur_trust) {
+            problems.push(format!(
+                "kernel `{}`: stored evidence records a trusted component this build does not \
+                 produce: `{extra}`",
                 cur.kernel
-            )),
-            Some(st) => {
-                if st.identity != cur.identity {
-                    // Report every mismatched identity field, not just the
-                    // first — a kernel edit typically changes both the
-                    // source-level and IR-level hash together, and both
-                    // must be visible in the failure, not just whichever
-                    // field happens to differ.
-                    let mut fields = Vec::new();
-                    if st.identity.source_hash != cur.identity.source_hash {
-                        fields.push(format!(
-                            "source_hash {} -> {}",
-                            st.identity.source_hash, cur.identity.source_hash
-                        ));
-                    }
-                    if st.identity.ir_hash != cur.identity.ir_hash {
-                        fields.push(format!(
-                            "ir_hash {} -> {}",
-                            st.identity.ir_hash.as_deref().unwrap_or("<none>"),
-                            cur.identity.ir_hash.as_deref().unwrap_or("<none>"),
-                        ));
-                    }
-                    if st.identity.vericl_version != cur.identity.vericl_version {
-                        fields.push(format!(
-                            "vericl_version {} -> {}",
-                            st.identity.vericl_version, cur.identity.vericl_version
-                        ));
-                    }
-                    problems.push(format!(
-                        "kernel `{}`: STALE evidence — identity mismatch ({}) (kernel source, \
-                         contract, IR, or vericl version changed without renewing evidence)",
+            ));
+        }
+
+        // --- failures ---
+        //
+        // Reported per SIDE, and labelled with the backend. Both matter:
+        //
+        // * a failure this build produced and one the *file* records are
+        //   different statements — `VERICL_UPDATE` refuses to write failing
+        //   evidence, so a stored `Fail` means the file was hand-edited or
+        //   written by an older version, which is worth its own sentence
+        //   rather than being phrased as if this run is failing;
+        // * the backend is part of the identity of a failure. Two lanes
+        //   diverging the same way produce the same `detail`, and a message
+        //   that omitted the backend would collapse them into one line —
+        //   under-reporting how much is broken.
+        for (side, claims) in [("stored", &st.claims), ("current", &cur.claims)] {
+            for claim in claims.iter() {
+                let ClaimResult::Fail { detail } = &claim.result else { continue };
+                problems.push(if side == "current" {
+                    format!(
+                        "kernel `{}`: {} FAILED in this build: {detail}",
                         cur.kernel,
-                        fields.join(", ")
-                    ));
-                    // Identity mismatch invalidates everything else about the entry.
-                    continue;
-                }
-                if st.contract != cur.contract {
-                    problems.push(format!(
-                        "kernel `{}`: contract record drifted without identity change (bug?)",
-                        cur.kernel
-                    ));
-                }
-                // Downgrade check: a `Proved` claim recorded in stored
-                // evidence must still be produced by the current build.
-                // Silently dropping one (e.g. `prove: false`, or z3 going
-                // missing) is a downgrade, not a pass — proved and "never
-                // claimed" are never presented as interchangeable (README
-                // "Claims and trust boundaries").
-                for st_claim in st.claims.iter().filter(|c| c.kind == ClaimKind::Proved) {
-                    let still_present = cur
-                        .claims
-                        .iter()
-                        .any(|c| c.kind == ClaimKind::Proved && c.check == st_claim.check);
-                    if !still_present {
-                        problems.push(format!(
-                            "kernel `{}`: evidence downgraded — stored evidence has a proved \
-                             `{}` claim that the current build did not produce (prove disabled, \
-                             or z3 unavailable?)",
-                            cur.kernel, st_claim.check
-                        ));
-                    }
-                }
-                for claim in st.claims.iter().chain(&cur.claims) {
-                    if let ClaimResult::Fail { detail } = &claim.result {
-                        problems.push(format!(
-                            "kernel `{}`: {} `{}` claim failed: {}",
-                            cur.kernel,
-                            match claim.kind {
-                                ClaimKind::Proved => "proved",
-                                ClaimKind::Tested => "tested",
-                                ClaimKind::Assumed => "assumed",
-                            },
-                            claim.check,
-                            detail
-                        ));
-                    }
-                }
+                        claim_label(claim)
+                    )
+                } else {
+                    format!(
+                        "kernel `{}`: the stored evidence records a FAILING {}: {detail} — \
+                         `VERICL_UPDATE` refuses to write failing evidence, so this entry was \
+                         hand-edited or written by an older vericl",
+                        cur.kernel,
+                        claim_label(claim)
+                    )
+                });
             }
         }
     }
@@ -535,7 +1100,61 @@ pub fn verify(stored: &Manifest, current: &Manifest) -> Vec<String> {
         }
     }
 
-    problems
+    Comparison { problems, unrecorded }
+}
+
+/// Verify stored evidence against the current build's freshly produced
+/// manifest. Returns human-readable problems; empty means the evidence stands.
+///
+/// # What is compared
+///
+/// Everything the manifest records, normalized (see below):
+///
+/// | part | compared as | order |
+/// |---|---|---|
+/// | manifest `vericl_version` | exact | — |
+/// | [`Provenance`] | exact per field; `lanes` subset-checked | `lanes` preserved |
+/// | entries | keyed by kernel name; duplicates refused | insensitive |
+/// | [`Identity`] | exact, per field | — |
+/// | [`ContractRecord`] | exact, per field | **sensitive** (authored, hash-covered) |
+/// | [`Claim`] set | multiset on `(kind, check, backend)`, then `(kind, check)` | insensitive |
+/// | claim `config` | structural JSON diff | objects insensitive, **arrays sensitive** |
+/// | claim `result` | exact | — |
+/// | `trusted` | **set** (order- and duplicate-insensitive) | insensitive |
+///
+/// # The property it enforces
+///
+/// **The stored claim set must be this build's claim set, field for field.**
+/// A claim the file records that the build does not produce, a claim the build
+/// produces that the file does not record, a mutated backend / config / result,
+/// an erased trust dependency — all are problems.
+///
+/// There is exactly **one** exemption, and it is scoped by the provenance
+/// record rather than by shape: a claim or trust entry contributed by an
+/// execution lane the stored [`Provenance::lanes`] says did not run. That is
+/// the `suite!` `extra_lane` case (`cargo test --features cpu` adds a whole
+/// second backend), and those additions are reported by
+/// [`unrecorded_evidence`] as printed notes rather than dropped.
+pub fn verify(stored: &Manifest, current: &Manifest) -> Vec<String> {
+    compare_manifests(stored, current).problems
+}
+
+/// Evidence produced by an execution lane the stored manifest does **not**
+/// record — [`verify`]'s one exemption, surfaced rather than dropped.
+///
+/// `cargo test --features cpu` `cfg`-enables a suite's `extra_lane`, which adds
+/// one differential claim and one trust entry per kernel. A manifest committed
+/// from a default (wgpu-only) run does not have them, and refusing it for that
+/// would make one of the two configurations permanently red. Those additions
+/// are strictly more evidence on a lane the file never spoke about, so they are
+/// exempt — and reported here, printed by the `suite!`-generated runner on
+/// every verifying run, so "this evidence file is missing a whole execution
+/// lane" is a line on screen rather than a silence.
+///
+/// Nothing else appears here. A claim added or removed on a lane the file
+/// *does* record is a [`verify`] problem.
+pub fn unrecorded_evidence(stored: &Manifest, current: &Manifest) -> Vec<String> {
+    compare_manifests(stored, current).unrecorded
 }
 
 /// Per-kernel **proof-scope changes** between stored and freshly built
@@ -779,9 +1398,673 @@ mod tests {
         assert!(m2[0].contains("kernel `b`"), "{m2:?}");
     }
 
+    // -----------------------------------------------------------------------
+    // COMPLETE-MANIFEST VERIFICATION — one regression per tamper class the
+    // external consumer review listed, each with the untampered pair as its
+    // own negative control (before: clean; after: named problem).
+    //
+    // `tampered(f)` returns `(problems, unrecorded)` for a realistic entry with
+    // `f` applied to the STORED side — i.e. someone edited the committed
+    // evidence file — and asserts the *untampered* pair is clean first, so no
+    // test in this block can pass by the comparison being broken.
+    // -----------------------------------------------------------------------
+
+    /// A realistic entry: the shape every non-cooperative suite kernel records
+    /// — one tested differential claim on a backend, one proved bounds claim,
+    /// and the trust list those two imply.
+    fn realistic_entry() -> Entry {
+        let mut e = entry("axpy", "sha256:aaa");
+        e.identity.ir_hash = Some("sha256:ir-aaa".into());
+        e.contract.assumes = vec!["x.iter().all(| v | v.abs() <= 1000.0)".into()];
+        e.contract.compare = "f32 max_ulp=0".into();
+        e.claims = vec![
+            Claim {
+                kind: ClaimKind::Tested,
+                check: "differential".into(),
+                backend: Some("\"wgpu<wgsl>\"".into()),
+                config: differential_config(&[1, 7, 256], 0xE901, 256),
+                result: ClaimResult::Pass,
+            },
+            Claim {
+                kind: ClaimKind::Proved,
+                check: "smt-oob-freedom".into(),
+                backend: None,
+                config: proved_config("z3 4.16.0", 3),
+                result: ClaimResult::Pass,
+            },
+        ];
+        e.trusted = crate::reference_twin_trust();
+        e.trusted.push(crate::backend_buffer_trust("\"wgpu<wgsl>\""));
+        e.trusted.push(crate::GPU_HARDWARE_TRUST.to_string());
+        e.trusted.extend(crate::proved_bounds_trust("z3 4.16.0"));
+        e
+    }
+
+    fn recorded(entries: Vec<Entry>, lanes: &[&str]) -> Manifest {
+        let mut p = crate::Provenance::current();
+        p.vericl_ir = "0.1.0".into();
+        p.vericl_macros = "0.1.0".into();
+        p.z3 = Some("z3 4.16.0".into());
+        p.lanes = lanes.iter().map(|s| s.to_string()).collect();
+        p.device = Some("Metal".into());
+        Manifest::with_provenance(entries, p)
+    }
+
+    /// Apply `tamper` to the stored side of an otherwise-matching pair, after
+    /// pinning that the untampered pair verifies clean.
+    fn tampered(tamper: impl FnOnce(&mut Entry)) -> (Vec<String>, Vec<String>) {
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let clean = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        assert!(
+            verify(&clean, &current).is_empty(),
+            "NEGATIVE CONTROL BROKEN — the untampered pair must verify clean: {:?}",
+            verify(&clean, &current)
+        );
+        assert!(unrecorded_evidence(&clean, &current).is_empty());
+
+        let mut e = realistic_entry();
+        tamper(&mut e);
+        let stored = recorded(vec![e], &["\"wgpu<wgsl>\""]);
+        (verify(&stored, &current), unrecorded_evidence(&stored, &current))
+    }
+
+    fn only_problem(problems: &[String]) -> &str {
+        assert_eq!(problems.len(), 1, "expected exactly one problem: {problems:#?}");
+        &problems[0]
+    }
+
+    /// TAMPER CLASS 1 — a tested claim the file advertises that the build no
+    /// longer produces (a check removed from the suite, or a hand-written
+    /// claim). Before this change `verify` only checked *proved* claims for
+    /// this, so a deleted differential was invisible.
+    #[test]
+    fn tamper_tested_claim_no_longer_produced_is_caught() {
+        // Stored keeps the tested claim; current drops it.
+        let mut cur_entry = realistic_entry();
+        cur_entry.claims.retain(|c| c.kind != ClaimKind::Tested);
+        let current = recorded(vec![cur_entry], &["\"wgpu<wgsl>\""]);
+        let stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let p = verify(&stored, &current);
+        let msg = only_problem(&p);
+        assert!(msg.contains("tested `differential`"), "{msg}");
+        assert!(msg.contains("did not produce it"), "{msg}");
+    }
+
+    /// TAMPER CLASS 1b — the same claim deleted from the FILE while the build
+    /// still produces it. The recorded claim set is not this build's claim set,
+    /// so it is a problem too (and NOT an exempt lane, since the backend is one
+    /// the stored provenance records).
+    #[test]
+    fn tamper_tested_claim_deleted_from_the_file_is_caught() {
+        let (p, u) = tampered(|e| e.claims.retain(|c| c.kind != ClaimKind::Tested));
+        let msg = only_problem(&p);
+        assert!(msg.contains("tested `differential`"), "{msg}");
+        assert!(msg.contains("MISSING from the stored evidence"), "{msg}");
+        assert!(u.is_empty(), "{u:?}");
+    }
+
+    /// TAMPER CLASS 2 — the backend a tested claim was measured on is changed.
+    /// Reported as one field diff (not an unrelated removal + addition) because
+    /// the pairing falls back to `(kind, check)`.
+    #[test]
+    fn tamper_backend_changed_is_caught() {
+        let (p, _) = tampered(|e| e.claims[0].backend = Some("\"cuda\"".into()));
+        let msg = only_problem(&p);
+        assert!(msg.contains("backend changed"), "{msg}");
+        assert!(msg.contains("\"cuda\""), "{msg}");
+        assert!(msg.contains("wgpu<wgsl>"), "{msg}");
+    }
+
+    /// TAMPER CLASS 3 — the `sizes` the differential actually ran over are
+    /// altered (here: the two large cases dropped, so the file advertises
+    /// coverage the run never had). The diff names the field AND both values.
+    #[test]
+    fn tamper_sizes_altered_is_caught() {
+        let (p, _) = tampered(|e| e.claims[0].config = differential_config(&[1], 0xE901, 256));
+        let msg = only_problem(&p);
+        assert!(msg.contains("config.sizes"), "{msg}");
+        assert!(msg.contains("stored [1]"), "{msg}");
+        assert!(msg.contains("current [1,7,256]"), "{msg}");
+    }
+
+    /// TAMPER CLASS 3b — the other config fields the review named: seed,
+    /// cube_dim, solver, obligation count. All are structurally diffed, so each
+    /// is one named line rather than an opaque "config differs".
+    #[test]
+    fn tamper_seed_cube_dim_solver_and_obligations_are_each_named() {
+        let (p, _) = tampered(|e| e.claims[0].config = differential_config(&[1, 7, 256], 1, 256));
+        assert!(only_problem(&p).contains("config.seed"), "{p:?}");
+
+        let (p, _) = tampered(|e| e.claims[0].config = differential_config(&[1, 7, 256], 0xE901, 64));
+        assert!(only_problem(&p).contains("config.cube_dim"), "{p:?}");
+
+        let (p, _) = tampered(|e| e.claims[1].config = proved_config("z3 4.8.7", 3));
+        let msg = only_problem(&p);
+        assert!(msg.contains("config.solver"), "{msg}");
+        assert!(msg.contains("4.8.7"), "{msg}");
+
+        let (p, _) = tampered(|e| e.claims[1].config = proved_config("z3 4.16.0", 99));
+        let msg = only_problem(&p);
+        assert!(msg.contains("config.obligations"), "{msg}");
+        assert!(msg.contains("stored 99 -> current 3"), "{msg}");
+    }
+
+    /// TAMPER CLASS 4 — a trust dependency erased from the file. This is the
+    /// direction that makes evidence look STRONGER than it is (fewer components
+    /// taken on faith), so it is a problem even though the file now says
+    /// *less*.
+    #[test]
+    fn tamper_trust_dependency_erased_is_caught() {
+        let (p, u) = tampered(|e| e.trusted.retain(|t| !t.contains("solver binary")));
+        let msg = only_problem(&p);
+        assert!(msg.contains("MISSING from the stored evidence"), "{msg}");
+        assert!(msg.contains("solver binary"), "{msg}");
+        assert!(msg.contains("stronger"), "{msg}");
+        assert!(u.is_empty(), "{u:?}");
+
+        // The other direction — a trust entry in the file the build does not
+        // produce — is also reported, with its own wording.
+        let (p, _) = tampered(|e| e.trusted.push("a component nobody trusts".into()));
+        assert!(only_problem(&p).contains("does not produce"), "{p:?}");
+    }
+
+    /// TAMPER CLASS 5 — an arbitrary passing claim typed into the file. The
+    /// build never produced it, so the file claims more than the build
+    /// supports.
+    #[test]
+    fn tamper_arbitrary_passing_claim_added_is_caught() {
+        let (p, _) = tampered(|e| {
+            e.claims.push(Claim {
+                kind: ClaimKind::Tested,
+                check: "formally-verified-by-vibes".into(),
+                backend: Some("\"wgpu<wgsl>\"".into()),
+                config: serde_json::json!({"trust me": true}),
+                result: ClaimResult::Pass,
+            })
+        });
+        let msg = only_problem(&p);
+        assert!(msg.contains("formally-verified-by-vibes"), "{msg}");
+        assert!(msg.contains("did not produce it"), "{msg}");
+
+        // …including one that impersonates a PROVED claim, which keeps the
+        // downgrade wording (proved and "never claimed" are not interchangeable).
+        let (p, _) = tampered(|e| {
+            e.claims.push(Claim {
+                kind: ClaimKind::Proved,
+                check: "smt-race-freedom".into(),
+                backend: None,
+                config: proved_config("z3 4.16.0", 12),
+                result: ClaimResult::Pass,
+            })
+        });
+        let msg = only_problem(&p);
+        assert!(msg.contains("downgraded"), "{msg}");
+        assert!(msg.contains("smt-race-freedom"), "{msg}");
+    }
+
+    /// TAMPER CLASS 6 — a claim's recorded RESULT flipped (a `declared`
+    /// assumption relabelled as a `pass`, say). The status change is its own
+    /// named line.
+    #[test]
+    fn tamper_result_status_changed_is_caught() {
+        let mut cur_entry = realistic_entry();
+        cur_entry.claims.push(race_freedom_assumption_claim());
+        let current = recorded(vec![cur_entry.clone()], &["\"wgpu<wgsl>\""]);
+        assert!(verify(&recorded(vec![cur_entry.clone()], &["\"wgpu<wgsl>\""]), &current).is_empty());
+
+        let mut st_entry = cur_entry;
+        st_entry.claims.last_mut().unwrap().result = ClaimResult::Pass;
+        let stored = recorded(vec![st_entry], &["\"wgpu<wgsl>\""]);
+        let p = verify(&stored, &current);
+        let msg = only_problem(&p);
+        assert!(msg.contains("result changed"), "{msg}");
+        assert!(msg.contains("stored pass -> current declared"), "{msg}");
+    }
+
+    /// TAMPER CLASS 7 — the contract record. Order-sensitive on `assumes` (an
+    /// authored, hash-covered list), and every field named individually.
+    #[test]
+    fn tamper_contract_fields_are_each_named() {
+        let (p, _) = tampered(|e| e.contract.compare = "f32 max_ulp=4".into());
+        let msg = only_problem(&p);
+        assert!(msg.contains("contract field `compare`"), "{msg}");
+        assert!(msg.contains("max_ulp=4"), "{msg}");
+
+        let (p, _) = tampered(|e| e.contract.wrapping = true);
+        assert!(only_problem(&p).contains("contract field `wrapping`"), "{p:?}");
+
+        let (p, _) = tampered(|e| e.contract.assumes.clear());
+        assert!(only_problem(&p).contains("contract field `assumes`"), "{p:?}");
+
+        let (p, _) = tampered(|e| e.contract.uses = vec!["b".into(), "a".into()]);
+        assert!(only_problem(&p).contains("contract field `uses`"), "{p:?}");
+    }
+
+    /// TAMPER CLASS 8 — the IR hash, which `prove: false` evidence used to
+    /// leave `null`. Now that it is always populated, blanking it is caught by
+    /// the identity comparison and named as the `ir_hash` field.
+    #[test]
+    fn tamper_ir_hash_blanked_is_caught() {
+        let (p, _) = tampered(|e| e.identity.ir_hash = None);
+        let msg = only_problem(&p);
+        assert!(msg.contains("STALE"), "{msg}");
+        assert!(msg.contains("ir_hash <none> -> sha256:ir-aaa"), "{msg}");
+    }
+
+    /// A whole entry duplicated in the file: entries are keyed by kernel name,
+    /// so a second copy would never be looked at.
+    #[test]
+    fn duplicate_kernel_entries_are_refused() {
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let stored = recorded(vec![realistic_entry(), realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("more than one entry for kernel `axpy`")), "{p:#?}");
+    }
+
+    /// The vacuous manifest: nothing to quantify over, so every check is
+    /// trivially satisfied. Refused rather than reported OK.
+    #[test]
+    fn an_empty_manifest_does_not_verify_vacuously() {
+        let empty = recorded(vec![], &["\"wgpu<wgsl>\""]);
+        let p = verify(&empty, &empty);
+        assert!(p.iter().any(|m| m.contains("NO kernel entries")), "{p:#?}");
+        assert!(p.iter().any(|m| m.contains("nothing recorded to verify against")), "{p:#?}");
+
+        // NEGATIVE CONTROL: one real entry and the vacuity messages are gone.
+        let real = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        assert!(verify(&real, &real).is_empty());
+    }
+
+    // ---- provenance (the verification-environment fingerprint) ----
+
+    /// Evidence from another toolchain is STALE-class, and the message names
+    /// the field and both values.
+    #[test]
+    fn a_different_toolchain_is_stale_not_silently_accepted() {
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        for (label, tamper) in [
+            ("rustc", Box::new(|p: &mut crate::Provenance| p.rustc = "rustc 1.0.0 (old)".into())
+                as Box<dyn FnOnce(&mut crate::Provenance)>),
+            ("target", Box::new(|p: &mut crate::Provenance| p.target = "x86_64-unknown-linux-gnu".into())),
+            ("cubecl", Box::new(|p: &mut crate::Provenance| p.cubecl = "=0.9.0".into())),
+            ("vericl-ir", Box::new(|p: &mut crate::Provenance| p.vericl_ir = "0.0.9".into())),
+            ("vericl-macros", Box::new(|p: &mut crate::Provenance| p.vericl_macros = "0.0.9".into())),
+            ("z3", Box::new(|p: &mut crate::Provenance| p.z3 = Some("z3 4.8.7".into()))),
+            ("device", Box::new(|p: &mut crate::Provenance| p.device = Some("Vulkan".into()))),
+        ] {
+            let mut stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+            tamper(&mut stored.provenance);
+            let p = verify(&stored, &current);
+            let msg = only_problem(&p);
+            assert!(msg.contains("STALE"), "{label}: {msg}");
+            assert!(msg.contains("verification environment changed"), "{label}: {msg}");
+            assert!(msg.contains(label), "{label}: {msg}");
+        }
+    }
+
+    /// Evidence written before the fingerprint existed still LOADS (schema is
+    /// additive) but does not still VERIFY.
+    #[test]
+    fn evidence_without_a_provenance_record_is_refused_but_still_parses() {
+        let json = serde_json::json!({
+            "vericl_version": crate::VERSION,
+            "entries": [],
+        });
+        let legacy: Manifest = serde_json::from_value(json).expect("additive schema still loads");
+        assert!(!legacy.provenance.is_recorded());
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let p = verify(&legacy, &current);
+        assert!(p.iter().any(|m| m.contains("no verification-environment record")), "{p:#?}");
+    }
+
+    /// The ONE exemption: an execution lane the stored evidence does not
+    /// record contributes claims and trust entries that are notes, not
+    /// problems. This is `cargo test --features cpu` against a manifest
+    /// committed from a default run.
+    #[test]
+    fn an_extra_execution_lane_is_additional_evidence_not_a_mismatch() {
+        let stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+
+        let mut cur_entry = realistic_entry();
+        cur_entry.claims.push(Claim {
+            kind: ClaimKind::Tested,
+            check: "differential".into(),
+            backend: Some("\"cpu\"".into()),
+            config: differential_config(&[1, 7, 256], 0xE901, 256),
+            result: ClaimResult::Pass,
+        });
+        cur_entry.trusted.push(crate::shared_frontend_lane_trust("\"cpu\""));
+        let current = recorded(vec![cur_entry], &["\"wgpu<wgsl>\"", "\"cpu\""]);
+
+        let p = verify(&stored, &current);
+        assert!(p.is_empty(), "an added lane must not be a mismatch: {p:#?}");
+        let u = unrecorded_evidence(&stored, &current);
+        assert_eq!(u.len(), 3, "{u:#?}");
+        assert!(u.iter().any(|m| m.contains("execution lane(s) \"cpu\"")), "{u:#?}");
+        assert!(u.iter().any(|m| m.contains("tested `differential` (backend \"cpu\")")), "{u:#?}");
+        assert!(u.iter().any(|m| m.contains("trusted component contributed")), "{u:#?}");
+    }
+
+    /// ATTACK ON THE EXEMPTION ITSELF. The lane list is its only input, so it
+    /// is the thing to edit: every lane deleted from the stored file widens the
+    /// exempt set by one. Emptying it entirely would exempt every backend —
+    /// including an erased `"<primary>" buffer upload/readback integrity` trust
+    /// entry, which starts with the backend name and would match the
+    /// `starts_with` test. Refused, so the exemption cannot be opened up.
+    #[test]
+    fn emptying_the_stored_lane_list_does_not_widen_the_exemption() {
+        let mut st_entry = realistic_entry();
+        st_entry.trusted.retain(|t| !t.contains("buffer upload/readback"));
+        let mut stored = recorded(vec![st_entry], &[]);
+        assert!(stored.provenance.lanes.is_empty());
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("records no execution lane at all")), "{p:#?}");
+        // …and with the lane list restored, the erasure is still caught (i.e.
+        // the refusal above is not the only thing standing between the tamper
+        // and a green run).
+        stored.provenance.lanes = vec!["\"wgpu<wgsl>\"".into()];
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("buffer upload/readback")), "{p:#?}");
+        assert!(p.iter().any(|m| m.contains("stronger")), "{p:#?}");
+    }
+
+    /// The PRIMARY lane is never exempt, whatever the lane list says. The
+    /// exemption is for a `cfg`-enabled `extra_lane`; the lane a suite always
+    /// runs is not that.
+    #[test]
+    fn the_primary_lane_is_never_exempt() {
+        // Stored records only the cpu lane; this build's PRIMARY is wgpu. The
+        // wgpu claim is missing from the file and must not be excused.
+        let mut st_entry = realistic_entry();
+        st_entry.claims[0].backend = Some("\"cpu\"".into());
+        let stored = recorded(vec![st_entry], &["\"cpu\""]);
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("PRIMARY execution lane changed")), "{p:#?}");
+        assert!(unrecorded_evidence(&stored, &current).is_empty(), "the primary lane is not exempt");
+    }
+
+    /// ADVERSARIAL-REVIEW REGRESSION (round-13 pre-review, CRITICAL as filed).
+    /// The reviewer's exact counterexample, at struct level: delete a kernel's
+    /// tested claim from the file AND empty `provenance.lanes`, so the deleted
+    /// claim's backend lands in the exempt set and the removal reads as a note.
+    /// It verified GREEN against the pre-guard code.
+    #[test]
+    fn deleting_a_claim_and_its_lane_marker_together_is_still_refused() {
+        let mut st_entry = realistic_entry();
+        st_entry.claims.retain(|c| c.kind != ClaimKind::Tested);
+        let mut stored = recorded(vec![st_entry.clone()], &[]);
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("records no execution lane at all")), "{p:#?}");
+        assert!(
+            p.iter().any(|m| m.contains("tested `differential`")
+                && m.contains("MISSING from the stored evidence")),
+            "the deleted claim must still be reported, not exempted: {p:#?}"
+        );
+        assert!(unrecorded_evidence(&stored, &current).is_empty(), "nothing may be exempt here");
+
+        // The same attack with a PLAUSIBLE lane list rather than an empty one:
+        // name a lane that did not run, so the deleted claim's backend is still
+        // "unrecorded". Caught by the primary-lane rule.
+        stored.provenance.lanes = vec!["\"cpu\"".into()];
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("PRIMARY execution lane changed")), "{p:#?}");
+        assert!(
+            p.iter().any(|m| m.contains("MISSING from the stored evidence")),
+            "{p:#?}"
+        );
+    }
+
+    /// ADVERSARIAL-REVIEW REGRESSION (finding 5). Two lanes failing the same way
+    /// produce the same `detail`; a message keyed without the backend collapses
+    /// them into one line and under-reports how much is broken.
+    #[test]
+    fn two_lanes_failing_identically_are_two_reported_failures() {
+        let fail = |backend: &str| Claim {
+            kind: ClaimKind::Tested,
+            check: "differential".into(),
+            backend: Some(backend.into()),
+            config: differential_config(&[1, 7, 256], 0xE901, 256),
+            result: ClaimResult::Fail { detail: "n=256 `y`: 4/256 elements diverge".into() },
+        };
+        let mut e = entry("k", "aaa");
+        e.claims = vec![fail("\"wgpu<wgsl>\""), fail("\"cpu\"")];
+        let m = recorded(vec![e], &["\"wgpu<wgsl>\"", "\"cpu\""]);
+        let p = verify(&m, &m);
+        let failures: Vec<&String> = p.iter().filter(|s| s.contains("FAILED in this build")).collect();
+        assert_eq!(failures.len(), 2, "one line per failing lane: {p:#?}");
+        assert!(failures.iter().any(|s| s.contains("wgpu<wgsl>")), "{failures:#?}");
+        assert!(failures.iter().any(|s| s.contains("\"cpu\"")), "{failures:#?}");
+    }
+
+    /// ADVERSARIAL-REVIEW REGRESSION (finding 5, second half). A failure the
+    /// FILE records is not a failure this build produced, and must not be
+    /// phrased as one — `VERICL_UPDATE` refuses to write failing evidence, so a
+    /// stored `Fail` means the file was edited.
+    #[test]
+    fn a_failure_recorded_in_the_file_is_reported_as_the_files_failure() {
+        let mut st_entry = realistic_entry();
+        st_entry.claims[0].result = ClaimResult::Fail { detail: "invented".into() };
+        let stored = recorded(vec![st_entry], &["\"wgpu<wgsl>\""]);
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("the stored evidence records a FAILING")), "{p:#?}");
+        assert!(!p.iter().any(|m| m.contains("FAILED in this build")), "{p:#?}");
+    }
+
+    /// ADVERSARIAL-REVIEW REGRESSION (finding 3). Two long values agreeing on a
+    /// long prefix must not RENDER identically — `stored X -> current X` for a
+    /// real difference is a message that actively misleads. The window is
+    /// centred on the first divergence.
+    #[test]
+    fn a_diff_late_in_a_long_value_is_still_visible_in_the_message() {
+        let long = |tail: &str| {
+            serde_json::json!({ "statement": format!("{}{tail}", "context ".repeat(40)) })
+        };
+        let mut st_entry = realistic_entry();
+        st_entry.claims[0].config = long("AAA");
+        let stored = recorded(vec![st_entry], &["\"wgpu<wgsl>\""]);
+        let mut cur_entry = realistic_entry();
+        cur_entry.claims[0].config = long("BBB");
+        let current = recorded(vec![cur_entry], &["\"wgpu<wgsl>\""]);
+
+        let p = verify(&stored, &current);
+        let msg = only_problem(&p);
+        assert!(msg.contains("AAA"), "the stored side's difference must be visible: {msg}");
+        assert!(msg.contains("BBB"), "the current side's difference must be visible: {msg}");
+        // …and the two rendered sides are not the same string.
+        let (a, b) = msg.split_once(" -> current ").expect("a two-sided diff line");
+        assert_ne!(a.rsplit("stored ").next(), Some(b), "{msg}");
+    }
+
+    /// ADVERSARIAL-REVIEW REGRESSION (finding 2). When several claims share a
+    /// key, the content-equal pass must pair the unchanged ones first, so the
+    /// config diff is attributed to the claim that actually changed rather than
+    /// to whichever happened to come first in the array.
+    #[test]
+    fn a_config_diff_is_attributed_to_the_claim_that_changed() {
+        let claim = |backend: &str, seed: u64| Claim {
+            kind: ClaimKind::Tested,
+            check: "differential".into(),
+            backend: Some(backend.into()),
+            config: differential_config(&[1, 7, 256], seed, 256),
+            result: ClaimResult::Pass,
+        };
+        // Same key on both, different array order, and only the cpu one moved.
+        let mut st_entry = entry("k", "aaa");
+        st_entry.claims = vec![claim("\"cpu\"", 99), claim("\"wgpu<wgsl>\"", 1)];
+        let mut cur_entry = entry("k", "aaa");
+        cur_entry.claims = vec![claim("\"wgpu<wgsl>\"", 1), claim("\"cpu\"", 1)];
+        let stored = recorded(vec![st_entry], &["\"wgpu<wgsl>\"", "\"cpu\""]);
+        let current = recorded(vec![cur_entry], &["\"wgpu<wgsl>\"", "\"cpu\""]);
+
+        let p = verify(&stored, &current);
+        let msg = only_problem(&p);
+        assert!(msg.contains("config.seed"), "{msg}");
+        assert!(msg.contains("backend \"cpu\""), "blamed the wrong lane: {msg}");
+        assert!(!msg.contains("wgpu"), "the unchanged lane must not be blamed: {msg}");
+    }
+
+    /// The exemption is NOT a general "extra claims are fine" hole: the same
+    /// added claim on a lane the stored evidence DOES record is a problem.
+    /// (Negative control for the test above.)
+    #[test]
+    fn the_lane_exemption_does_not_excuse_an_added_claim_on_a_recorded_lane() {
+        let stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\"", "\"cpu\""]);
+        let mut cur_entry = realistic_entry();
+        cur_entry.claims.push(Claim {
+            kind: ClaimKind::Tested,
+            check: "differential".into(),
+            backend: Some("\"cpu\"".into()),
+            config: differential_config(&[1, 7, 256], 0xE901, 256),
+            result: ClaimResult::Pass,
+        });
+        let current = recorded(vec![cur_entry], &["\"wgpu<wgsl>\"", "\"cpu\""]);
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("MISSING from the stored evidence")), "{p:#?}");
+    }
+
+    /// A lane the stored evidence records that did NOT run is a loss, not an
+    /// exemption — the reverse direction of the test above.
+    #[test]
+    fn a_lane_that_stopped_running_is_refused() {
+        let mut st_entry = realistic_entry();
+        st_entry.claims.push(Claim {
+            kind: ClaimKind::Tested,
+            check: "differential".into(),
+            backend: Some("\"cpu\"".into()),
+            config: differential_config(&[1, 7, 256], 0xE901, 256),
+            result: ClaimResult::Pass,
+        });
+        let stored = recorded(vec![st_entry], &["\"wgpu<wgsl>\"", "\"cpu\""]);
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("execution lane \"cpu\"")), "{p:#?}");
+        assert!(p.iter().any(|m| m.contains("did not produce it")), "{p:#?}");
+    }
+
+    // ---- normalization: the deliberate order choices ----
+
+    /// Claim ORDER is meaningless (the pipeline pushes tested-then-proved, the
+    /// cooperative branch inserts at 0, an extra lane appends) and is ignored.
+    #[test]
+    fn claim_order_is_not_significant() {
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let mut st_entry = realistic_entry();
+        st_entry.claims.reverse();
+        let stored = recorded(vec![st_entry], &["\"wgpu<wgsl>\""]);
+        assert!(verify(&stored, &current).is_empty());
+    }
+
+    /// Entry ORDER is meaningless (it is the `kernels:` list order) and is
+    /// ignored; `trusted` ORDER and DUPLICATES are meaningless (it is a set of
+    /// components taken on faith) and are ignored.
+    #[test]
+    fn entry_order_and_trusted_order_and_duplicates_are_not_significant() {
+        let other = {
+            let mut e = realistic_entry();
+            e.kernel = "fir3".into();
+            e
+        };
+        let current = recorded(vec![realistic_entry(), other.clone()], &["\"wgpu<wgsl>\""]);
+
+        let mut shuffled = realistic_entry();
+        shuffled.trusted.reverse();
+        shuffled.trusted.push(shuffled.trusted[0].clone()); // a duplicate says nothing
+        let stored = recorded(vec![other, shuffled], &["\"wgpu<wgsl>\""]);
+        assert!(verify(&stored, &current).is_empty(), "{:#?}", verify(&stored, &current));
+    }
+
+    /// Config ARRAY order IS significant: `sizes: [7, 1]` is a different
+    /// declaration from `sizes: [1, 7]`. Sensitivity is the safe direction —
+    /// it can only ask for a regeneration, never let a real change through.
+    #[test]
+    fn config_array_order_is_significant() {
+        let (p, _) = tampered(|e| e.claims[0].config = differential_config(&[256, 7, 1], 0xE901, 256));
+        // Same length, so the diff is per-index — which is more useful than a
+        // whole-array dump: it names exactly which positions moved.
+        assert_eq!(p.len(), 2, "{p:#?}");
+        assert!(p[0].contains("config.sizes[0]: stored 256 -> current 1"), "{p:#?}");
+        assert!(p[1].contains("config.sizes[2]: stored 1 -> current 256"), "{p:#?}");
+    }
+
+    /// Config OBJECT key order is not significant — `serde_json`'s map is
+    /// key-ordered on load, and a JSON object is unordered by definition. The
+    /// same fields written in a different textual order must verify clean.
+    #[test]
+    fn config_object_key_order_is_not_significant() {
+        let current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let mut st_entry = realistic_entry();
+        // Byte-reversed key order in the source text, same content.
+        st_entry.claims[1].config = serde_json::from_str(
+            r#"{"obligations": 3, "logic": "QF_LIA", "solver": "z3 4.16.0"}"#,
+        )
+        .unwrap();
+        let stored = recorded(vec![st_entry], &["\"wgpu<wgsl>\""]);
+        assert!(verify(&stored, &current).is_empty(), "{:#?}", verify(&stored, &current));
+    }
+
+    /// A nested config object (the cooperative `depends_on` coupling) diffs to
+    /// a dotted path, so "the dependency was quietly relabelled discharged" is
+    /// one readable line.
+    #[test]
+    fn a_nested_config_field_diffs_to_a_dotted_path() {
+        let honest = cooperative_differential_config(
+            &[256],
+            1,
+            256,
+            "twin",
+            RaceDependency::Assumed,
+        );
+        let overclaimed = cooperative_differential_config(
+            &[256],
+            1,
+            256,
+            "twin",
+            RaceDependency::Discharged,
+        );
+        let mut cur_entry = realistic_entry();
+        cur_entry.claims[0].config = honest;
+        let current = recorded(vec![cur_entry], &["\"wgpu<wgsl>\""]);
+
+        let mut st_entry = realistic_entry();
+        st_entry.claims[0].config = overclaimed;
+        let stored = recorded(vec![st_entry], &["\"wgpu<wgsl>\""]);
+
+        let p = verify(&stored, &current);
+        assert!(p.iter().any(|m| m.contains("config.depends_on.status")), "{p:#?}");
+        assert!(p.iter().any(|m| m.contains("discharged-by-proof")), "{p:#?}");
+        assert!(p.iter().any(|m| m.contains("assumed-undischarged")), "{p:#?}");
+    }
+
+    /// An added / removed config KEY is named, in both directions, rather than
+    /// being an opaque whole-object diff.
+    #[test]
+    fn an_added_or_removed_config_key_is_named() {
+        let (p, _) = tampered(|e| {
+            e.claims[1].config = serde_json::json!({"solver": "z3 4.16.0", "obligations": 3})
+        });
+        assert!(only_problem(&p).contains("config.logic: stored <absent>"), "{p:?}");
+
+        let (p, _) = tampered(|e| {
+            let o = e.claims[1].config.as_object_mut().unwrap();
+            o.insert("nonsense".into(), serde_json::json!(true));
+        });
+        assert!(only_problem(&p).contains("config.nonsense: stored true -> current <absent>"), "{p:?}");
+    }
+
     #[test]
     fn case_outcome_pass_and_describe() {
-        let ok = CaseOutcome { case: "n=4".into(), reports: vec![], reference_panic: None };
+        let good_report =
+            CompareReport { pass: true, checked: 4, mismatches: 0, max_ulp: None, worst: None };
+        let ok = CaseOutcome {
+            case: "n=4".into(),
+            reports: vec![("y".to_string(), good_report)],
+            reference_panic: None,
+        };
         assert!(ok.pass());
         assert_eq!(describe_case_outcome(&ok), "n=4: pass");
 
@@ -812,6 +2095,65 @@ mod tests {
         let msg = describe_case_outcome(&o);
         assert!(msg.contains("GPU backends (WGSL robustness) would silently clamp this"), "{msg}");
         assert!(msg.contains("index out of bounds"), "{msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Vacuity backstops (external consumer review — the "zero outcomes,
+    // `all()` is true" shape, at the per-case level).
+    // -----------------------------------------------------------------------
+
+    /// A case with no compared parameter at all compares nothing, so it is not
+    /// a pass — and the description says so instead of printing "pass".
+    #[test]
+    fn a_case_that_compared_no_parameter_is_not_a_pass() {
+        let vacuous = CaseOutcome { case: "n=4".into(), reports: vec![], reference_panic: None };
+        assert!(!vacuous.pass(), "an empty report list is agreement over nothing");
+        let msg = describe_case_outcome(&vacuous);
+        assert!(msg.contains("NOTHING WAS COMPARED"), "{msg}");
+        assert!(!msg.contains(": pass"), "{msg}");
+    }
+
+    /// A zero-element comparison (`sizes: [0]`, or a `gen(len(y = 0))` pin
+    /// behind a const the macro cannot fold) reports `checked: 0, pass: true`
+    /// — "0/0 elements diverge" is agreement over nothing.
+    #[test]
+    fn a_case_that_compared_zero_elements_is_not_a_pass() {
+        let empty = CompareReport { pass: true, checked: 0, mismatches: 0, max_ulp: None, worst: None };
+        let vacuous = CaseOutcome {
+            case: "n=0".into(),
+            reports: vec![("y".to_string(), empty)],
+            reference_panic: None,
+        };
+        assert!(!vacuous.pass());
+        let msg = describe_case_outcome(&vacuous);
+        assert!(msg.contains("NOTHING WAS COMPARED"), "{msg}");
+        assert!(msg.contains("`y`"), "{msg}");
+
+        // NEGATIVE CONTROL: one real element compared is a real pass.
+        let one = CompareReport { pass: true, checked: 1, mismatches: 0, max_ulp: None, worst: None };
+        let real = CaseOutcome {
+            case: "n=1".into(),
+            reports: vec![("y".to_string(), one)],
+            reference_panic: None,
+        };
+        assert!(real.pass());
+        assert_eq!(describe_case_outcome(&real), "n=1: pass");
+    }
+
+    /// A mixed entry — one real parameter and one empty one — must not be
+    /// rescued by the real one. Every compared parameter has to have compared
+    /// something.
+    #[test]
+    fn one_empty_parameter_sinks_a_case_with_a_real_one() {
+        let good = CompareReport { pass: true, checked: 8, mismatches: 0, max_ulp: None, worst: None };
+        let empty = CompareReport { pass: true, checked: 0, mismatches: 0, max_ulp: None, worst: None };
+        let o = CaseOutcome {
+            case: "n=8".into(),
+            reports: vec![("y".to_string(), good), ("z".to_string(), empty)],
+            reference_panic: None,
+        };
+        assert!(!o.pass());
+        assert!(describe_case_outcome(&o).contains("`z`"));
     }
 
     /// A non-bounds panic (division by zero, the motivating `wrapping`-

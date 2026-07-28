@@ -1,5 +1,18 @@
 {
   "vericl_version": "0.1.0",
+  "provenance": {
+    "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "target": "aarch64-apple-darwin",
+    "vericl": "0.1.0",
+    "vericl_ir": "0.1.0",
+    "vericl_macros": "0.1.0",
+    "cubecl": "=0.10.0",
+    "z3": "z3 Z3 version 4.16.0 - 64 bit",
+    "lanes": [
+      "\"cpu\""
+    ],
+    "device": "()"
+  },
   "entries": [
     {
       "kernel": "axpy_f64",

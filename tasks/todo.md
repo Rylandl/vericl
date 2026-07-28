@@ -3651,3 +3651,406 @@ both carry an explicit open question above rather than an assumed answer:
 Standing requirement carried forward: `docs/coverage.md` is updated **in the same change** as any
 milestone that moves a row. A coverage page that lags the code is worse than no coverage page, because
 it is believed.
+
+---
+
+## Evidence-layer completeness arc — EXTERNAL CONSUMER REVIEW — DONE 2026-07-28
+
+**Credit where it belongs.** This arc exists because an **external consumer-side review** — someone
+evaluating VeriCL for production adoption, not one of our own adversarial rounds — audited the
+project and found the *evidence layer* under-verified relative to the kernel analysis it serves. Its
+verdict, quoted because it is the right framing and none of twelve internal rounds had said it:
+**trustworthy evidence is the product, making this a release blocker.** Every finding was spot-checked
+against the code and every one was real. Feature expansion was frozen for the duration.
+
+The uncomfortable part of the credit: rounds 1–12 attacked the *analysis* (twins, prover encodings,
+identity hashes) with real rigor and left the *check that reads the result* comparatively unexamined.
+`verify()` was 100 lines and compared three things out of a dozen. A reviewer looking at VeriCL from
+the outside saw that in one pass. The lesson is recorded at the end of this section.
+
+### The hole, measured
+
+`verify()` compared: kernel identity, the presence of stored **proved**-claim `check` names, and
+whether any claim's `result` was `Fail`. It did **not** compare the claim set, any claim's
+configuration, any claim's backend, the trusted list, the contract fields individually, or the
+environment. Consequence, measured on the committed `evidence/vericl.json` before the change — each of
+these was edited into the file and `cargo test` stayed **green**:
+
+| tamper class | before | after |
+|---|---|---|
+| a kernel's `tested`/`differential` claim deleted from the build | **PASS** (only proved claims were checked for presence) | `kernel `axpy`: tested `differential` (backend "wgpu<wgsl>") is recorded in the stored evidence but this build did not produce it` |
+| the same claim deleted from the file | **PASS** | `… was produced by this build but is MISSING from the stored evidence` |
+| `backend` rewritten `"wgpu<wgsl>"` → `"cuda<ptx>"` | **PASS** | `… backend changed: stored "cuda<ptx>" -> current "wgpu<wgsl>"` |
+| `sizes` truncated `[1,7,256,1000,1027,4096,65536]` → `[1,7]` | **PASS** | `… config.sizes: stored [1,7] -> current [1,7,256,1000,1027,4096,65536]` |
+| `seed`, `cube_dim`, `solver`, `obligations`, `logic`, 2-D `rank` / extents / `cube_dim[i]`, cooperative `depends_on.status` | **PASS** (all of them) | one named line each, dotted path + both values |
+| `"GPU hardware"` erased from `trusted` | **PASS** | `… trusted component `GPU hardware` … MISSING from the stored evidence — an omitted trust dependency makes the recorded claim look stronger than the one actually established` |
+| the solver trust line erased | **PASS** | same, naming `the solver binary (…)` |
+| an invented passing `tested` claim added to the file | **PASS** | `… tested `exhaustively-verified` … did not produce it` |
+| an invented passing `proved` claim added to the file | **PASS** | `evidence downgraded — … proved `smt-total-correctness` …` |
+| an `assumed`/`declared` claim relabelled `pass` | **PASS** | `… result changed: stored pass -> current declared` |
+| a whole entry duplicated | **PASS** (name-keyed `find` never reached the second) | `stored manifest has more than one entry for kernel `axpy`` |
+| `contract.compare` / `wrapping` / `assumes` / `instantiate` / `uses` | one generic `contract record drifted … (bug?)` | one named line per field, stored and current shown |
+| evidence from a different rustc / cubecl / z3 / target / device | **PASS** — nothing was recorded to compare | `STALE evidence — the verification environment changed (rustc `…` -> `…`)` |
+| `kernels: []` / `sizes: []` | **PASS**, printing `vericl evidence OK` | compile error at the field |
+
+Every row is a permanent regression: `crates/vericl/src/evidence.rs` (synthetic, 30 verification
+tests) and `crates/vericl-examples/tests/evidence_tamper.rs` (**against the real committed
+manifests**, 24 tests). Both harnesses assert the untampered pair verifies clean *before* each edit,
+so no case can pass by the comparison being broken.
+
+### Fix 1 — complete manifest verification, with a designed normalization
+
+`verify` now compares everything the manifest records. The normalization was decided field by field
+rather than falling out of the implementation, and each choice is documented where it lives:
+
+| part | compared as | order | why |
+|---|---|---|---|
+| `vericl_version` | exact | — | |
+| `provenance` | exact per field; `lanes` **subset**-checked | `lanes` preserved | see fix 4 |
+| entries | keyed by kernel name; **duplicates refused** | insensitive | entry order is the `kernels:` list order and says nothing; but name-keying makes a duplicate *lossy*, so it is refused |
+| `identity` | exact, per field, all mismatches reported | — | unchanged |
+| `contract` | exact, per field, each named | **sensitive** | `assumes`/`instantiate`/`uses` are authored lists already covered by `SOURCE_HASH` (and `combine_source_hash` for `uses`); being sensitive keeps the two checks from disagreeing about one fact |
+| claim set | multiset on `(kind, check, backend)`, then `(kind, check)` | insensitive | claim order is a pipeline artifact — tested is pushed first, the cooperative branch `insert(0, …)`s, an extra lane appends. The two-pass pairing is what makes a *changed* backend one field diff instead of an unrelated removal + addition |
+| claim `config` | structural JSON diff to a dotted path | objects insensitive, **arrays sensitive** | `serde_json`'s map is a `BTreeMap` here, so object key order is already canonical and carries nothing; an array (`sizes`, `cube_dim`) is a declared sequence. Sensitivity is the safe direction: it costs one regeneration after a cosmetic edit, it cannot let a real change through |
+| claim `result` | exact (a `Fail` on either side is reported once, with its detail) | — | |
+| `trusted` | a **set** — order- *and* duplicate-insensitive | insensitive | it is a list of components taken on faith; which order they were pushed in, or twice, says nothing |
+
+**The property, stated once:** *the stored claim set must be this build's claim set, field for field.*
+Both directions are refusals. `trusted` is where the asymmetry is worth naming: a component this build
+trusts that the file **omits** makes the recorded claim look *stronger* than the one established
+(fewer things taken on faith), so the missing direction is the problem there.
+
+**The one exemption, and why it is scoped by provenance rather than by shape.** `conformance.rs`
+declares `extra_lane: (cfg(feature = "cpu"), …)`, so `cargo test --features cpu` adds one claim and
+one trust entry per kernel that a manifest committed from a default run does not have. Refusing that
+would make one of the two configurations permanently red, and committing the cpu shape would make the
+other one red — one file cannot be complete for both. So a claim or trust entry contributed by an
+execution lane the stored `provenance.lanes` says **did not run** is exempt, and only that. It is
+reported by the new `vericl::unrecorded_evidence` and **printed on every verifying run**
+(`vericl note — N item(s) of evidence produced by this build are not recorded in …`), so a whole
+missing lane is a line on screen rather than a silence. Its narrowness is pinned by a negative
+control in both test files: declare the cpu lane in the stored provenance and the very same additions
+become problems again.
+
+**The exemption's own attack surface, found in self-review and closed.** The lane list is the
+exemption's only input, and the attacker edits the stored file — so *deleting* lanes from it widens
+the exempt set by one each. Emptying it entirely would exempt every backend this run used, and
+`trusted`'s exempt test is `starts_with(lane)`, so `"wgpu<wgsl>" buffer upload/readback integrity`
+(which begins with the backend name) could have been erased and downgraded to a note. Two guards:
+a stored manifest that records **no** lane while this run has lanes to exempt is refused outright,
+and the **primary** lane is never exempt whatever the list says (the exemption exists for a
+`cfg`-enabled `extra_lane`; the lane a suite always runs is not that). A changed primary lane is its
+own STALE problem. Both are regressions
+(`emptying_the_stored_lane_list_does_not_widen_the_exemption`, `the_primary_lane_is_never_exempt`),
+the first of which also asserts that with the lane list restored the erasure is *still* caught — so
+the refusal is not the only thing between that tamper and a green run.
+
+Rejected alternative, recorded because it is the more correct one and the cost is what decided it: a
+second committed manifest per feature configuration (`vericl.cpu.json`, ~90 KB, regenerated on every
+kernel change, only on a machine where the slow cpu backend runs). Strictly complete, no exemption —
+worth revisiting if the exemption ever has to widen.
+
+**Honest-diff UX.** Every problem names the field and shows `stored X -> current Y`, with a dotted
+path into the config (`config.depends_on.status`, `config.sizes[0][1]`, `config.cube_dim[0]`) and
+values truncated at 160 chars so one long `statement` string cannot bury the report.
+
+### Fix 2 — vacuous suites rejected at compile time, plus four siblings the audit found
+
+`kernels: []` and `sizes: []` are targeted compile errors at the offending field's own span (the
+bracket group's `DelimSpan`, since an empty list has no span of its own). The reviewer's
+zero-outcomes-`all()`-true shape is the regression.
+
+A dedicated sub-audit of *every* `.all(…)` / `.is_empty()` / `.any(…)` reachable from `suite!` or
+`#[vericl::kernel]` found **four more** of the same shape. Two are now compile errors, all four are
+recorded:
+
+1. **A kernel with no `&mut Array<T>` output** (`vericl-macros/src/lib.rs`). `conformance_case` builds
+   one `(param, CompareReport)` per mutable array and nothing else, so such a kernel yields
+   `reports: []` and `reports.iter().all(|r| r.pass)` is `true` — a recorded **passing `tested`
+   claim** for a kernel where nothing was compared, indistinguishable in the manifest from a real one
+   (`CompareReport` is only serialized on failure). The nearby f32/f64-output-mix check was itself
+   vacuously satisfied by the same empty list, which is how it stayed unnoticed. Now a compile error;
+   **no such kernel existed in the repo**, so nothing was mis-recorded.
+2. **A zero-element comparison** — `sizes: [0]`, or a `gen(len(y = 0))` pin, gives
+   `CompareReport { checked: 0, mismatches: 0, pass: true }` for any kernel guarded by
+   `pos < y.len()`. The `gen(...)` route is the worse one: `gen(...)` is not part of `ContractRecord`,
+   so the claim would advertise the suite's real `sizes` while having compared no elements at all.
+   Both literal spellings are now compile errors (1-D and per-axis).
+3. **Runtime backstop** for anything the macros cannot fold (a size behind a `const`, an arbitrary
+   expression): `CaseOutcome::pass()` now additionally requires `!reports.is_empty()` and
+   `checked > 0` on every report, and `describe_case_outcome` prints `NOTHING WAS COMPARED — …`
+   naming which of the two happened, instead of `n=0: pass`. Three regressions including the mixed
+   case where one real parameter must not rescue an empty one.
+4. **Recorded, not fixed — out of scope, for round 13.** Two prover-level vacuities of the same
+   family, neither reachable in the committed corpus but both unguarded:
+   `ProveResult::Proved { obligations: 0 }` for a kernel body with no array indexing records a
+   passing `smt-oob-freedom` claim and appends the solver trust line (`vericl-ir/src/prover.rs`
+   ~920), and `CooperativeProof::Proved` with `race() == 0` sets `RaceDependency::Discharged`, so a
+   cooperative differential can record `"status": "discharged-by-proof"` on the strength of zero
+   checked obligations (`suite.rs` cooperative arm) — and the extra lane re-derives `Discharged` from
+   that claim's presence without re-running anything. `obligation_count_changes` does not see either,
+   because it only fires on a *change*. Also noted: `reject_transposed_extents` skips its gate
+   entirely when an axis has no *bare-ident* guard (`w - 1`, `(w as u32)`, `cfg.width`), which is
+   already a documented residual but belongs on this list because the transposed-clause shape is
+   caught by no other lane.
+
+### Fix 3 — `ir_hash` computed unconditionally
+
+The assignment lived inside the two `if __vericl_prove` branches, coupling an **identity** fact to
+whether a **proof** ran. Extracting the expanded IR needs a `KernelDefinition`, not a solver.
+`docs/design-struct-comptime.md` M4 listed this and it was deferred; `Identity::ir_hash`'s own
+rustdoc already asserted "the harness sets it", which was false for `prove: false`. Now set on the
+line after `identity()`, before any branch — pinned structurally by a macro test that matches the two
+statements adjacently and asserts exactly one assignment per kernel, under both `prove: true` and
+`prove: false`.
+
+Re-hashed as expected: `evidence/cooperative_fallback.json`'s `block_sum_reduce` went
+`"ir_hash": null` → `sha256:5d2dd12d28e2f3ac…`, which is byte-identical to the same kernel's hash in
+`evidence/vericl.json` (produced under `prove: true`) — the two agree, which is the check that the
+change is a relocation and not a different computation. The doc sentences in `docs/guide.md` and
+`README.md` that said "populated under `prove: true`" are corrected, and the `ir_hash` rustdoc now
+says what it does.
+
+### Fix 4 — the verification-environment fingerprint
+
+New `vericl::provenance` module and a `Manifest.provenance` field (`#[serde(default)]`, so a
+pre-fingerprint file still *loads* for a programmatic consumer — pinned by a test — and does not still
+*verify*). Recorded: `rustc` (full `rustc -vV` first line), `target` triple, `vericl`, `vericl_ir`,
+`vericl_macros`, `cubecl` (the pinned string), `z3`, `lanes`, `device`.
+
+Mechanics worth recording, because each is a place a lazier answer would have been wrong:
+
+- **rustc and target come from a new `crates/vericl/build.rs`**, not from shelling out at test time.
+  Cargo sets `RUSTC` for a build script to the compiler actually building the crate; `PATH`'s `rustc`
+  is a different question and can differ. `TARGET` is the honest triple on a cross build.
+- **`cubecl` cannot be read** — `vericl` core is cubecl-free by design. It is a hand-written constant
+  mirroring the workspace pin, made non-droppable by a unit test that parses
+  `<workspace>/Cargo.toml` and fails the moment the two disagree.
+- **`vericl-macros` cannot export a constant** (proc-macro crate), so the macro emits its own
+  `CARGO_PKG_VERSION` as a literal at expansion time. `vericl-ir` gained a plain `pub const VERSION`.
+- **`device`** is CubeCL's generic `ComputeClient::info()` — for wgpu the *selected* graphics backend
+  (`Metal` here), which matters: Metal and Vulkan are two different code generators both reporting the
+  runtime name `wgpu<wgsl>`, so recording only the name would let evidence measured on one verify
+  against the other.
+- **`z3` is `None` when nothing was proved.** Recording an unused binary from `PATH` would manufacture
+  staleness out of an irrelevant fact. The per-claim `config.solver` stays where it is — the two are
+  not redundant: one is the environment fact, one is the claim-scoped one.
+- **`lanes` is subset-checked, not compared.** A recorded lane that did not run is a problem; an added
+  lane is the fix-1 exemption.
+
+**What it does not cover, stated plainly** (the round-10 caveat precedent, in the module rustdoc):
+`RUSTFLAGS` / `-C target-cpu` / cargo profile, transitive dependency versions, a `[patch]`ed
+dependency keeping its version string, and the GPU **driver** build. Two builds with identical
+fingerprints can still differ. The fingerprint refuses the differences it can see and claims nothing
+about the rest.
+
+### Fix 5 — `frontend_independent` is derived, not a free strong default
+
+It was an arbitrary `Expr` defaulting to **`true`** — so the *strong* claim ("a genuinely independent
+execution lane corroborated the derived twin", trusted list records `GPU hardware`) was what any
+suite got by saying nothing at all, on any runtime. That is backwards; the strong claim is the one
+that must be earned.
+
+Now: a literal `true`/`false` only (a claim selected by a runtime value cannot be checked when it is
+made), and normally **omitted** —
+
+- `WgpuRuntime` → independent; `CpuRuntime` → shared front end, by the runtime path's final segment;
+- `frontend_independent: true` on a recognized shared-front-end runtime is a **compile error**, naming
+  what the entry would have recorded;
+- an **unrecognized** runtime must declare which it is. This is a judgment call against the brief,
+  which said "weak claim as default": defaulting weak would record `host CPU execution hardware` for
+  what may well be a discrete CUDA GPU — wrong wording rather than an overclaim, but still VeriCL
+  asserting something it did not measure, which is the exact failure mode rounds 10 and 11 made a
+  standing rule about. Erroring is the only answer that cannot be accidentally wrong, and the weak
+  claim remains one word away.
+- explicit `false` on a recognized-independent runtime is always allowed — downgrading cannot
+  overstate.
+
+Recognition is syntactic on the final path segment, and deliberately narrow: only the two runtimes
+this repository actually exercises. A trait would have to live in a crate depending on `cubecl` with
+the wgpu **and** cpu features enabled, which is a heavier dependency than the decision is worth
+(`vericl` is cubecl-free, `vericl-ir` takes cubecl with `default-features = false`); anything
+unrecognized lands on the declaration error rather than on a guess.
+
+**Migration:** `conformance_f64.rs`'s hand-written `frontend_independent: false` is **removed** — the
+derivation produces it. Verified behaviour-preserving two ways: the macro test asserts the derived and
+the explicitly-declared expansions are token-identical, and the regenerated `vericl_f64.json` entry's
+`trusted` list is byte-unchanged (`host CPU execution hardware` + the shared-front-end caveat). The
+three wgpu suites never wrote the field and are unaffected.
+
+### Fix 6 — direct tests on `suite!` and its diagnostics
+
+`crates/vericl-macros/src/suite.rs` had **zero** tests. Its field parsing, its rejections, and the
+shape of what it generates were reachable only by compiling and running a real suite against real
+hardware, which meant they were not tested at all. 26 tests now run `expand()` on token streams — no
+GPU, no cubecl, no z3, no evidence file, ~10 ms:
+
+- **parsing** — all nine fields; order-independence asserted by comparing the two expansions
+  token-for-token; optional trailing comma; each required field named when missing; **each of the nine
+  fields** rejecting a duplicate; unknown field named with the valid set; both `extra_lane` shape
+  errors;
+- **rejections** — `kernels: []`, `sizes: []`, a zero size in both units, mixed scalar/tuple sizes,
+  wrong tuple arity, `cube_dim:` alongside tuple sizes — each with a negative control that the
+  neighbouring valid spelling still expands;
+- **lane independence** — `recognize_runtime` and `derive_frontend_independence` directly (including
+  a path with no `cubecl::` prefix and an unknown vendor runtime), the compile error, the non-literal
+  error, and that the derived bool is what the generated code branches on;
+- **generated shape** — both `VERICL_UPDATE` modes present; `ir_hash` unconditional (structurally);
+  every provenance field populated and carried into `Manifest::with_provenance`, and
+  `Manifest::new` *not* used; the lane list and its `cfg`-gated `push`; per-kernel block count; the
+  units choice made at expansion time (a dispatch suite emits no cooperative branch and no
+  `differential_config`); the rank check emitted per kernel in both directions; `kernel_salt`
+  determinism.
+
+**CI / pinned toolchain — RYLAND'S DECISION, OPEN.** The external review also asked for CI with a
+pinned toolchain. Not done, and deliberately not done unilaterally: "local only, no GitHub Actions"
+is Ryland's recorded standing preference, and the provenance fingerprint makes the toolchain question
+*visible* (evidence from another rustc is refused by name) without requiring a runner. If he wants CI,
+the fingerprint is the natural thing to pin a container against. No workflow files were added.
+
+### Evidence delta
+
+`VERICL_UPDATE` run last, per the standing gate. Four manifests, **+52 / -1 lines total**
+(`git diff --numstat`):
+
+| file | delta | content |
+|---|---|---|
+| `evidence/vericl.json` (31 entries) | +13 / -0 | the `provenance` block, nothing else |
+| `evidence/vericl_2d.json` (4 entries) | +13 / -0 | the `provenance` block, nothing else |
+| `evidence/vericl_f64.json` (1 entry) | +13 / -0 | the `provenance` block, nothing else |
+| `evidence/cooperative_fallback.json` (1 entry) | +13 / -1 | the `provenance` block **and** `"ir_hash": null` → `sha256:5d2dd12d28e2f3ac…` (fix 3) |
+
+Two provenance details visible in that diff and worth noting: the `prove: false` manifest records
+**no `z3` field at all** (`skip_serializing_if`, because nothing was proved — recording an unused
+binary from `PATH` would manufacture staleness), and its new `ir_hash` is byte-identical to the same
+kernel's hash in `evidence/vericl.json`, which was produced under `prove: true`.
+
+**Every pre-existing byte of claim content is unchanged** — all 37 entries' identities, contracts,
+claims, configs, results and trusted lists are byte-identical to `HEAD`, including the f64 entry whose
+lane-independence declaration moved from hand-written to derived. The two changes are exactly the two
+this arc predicted.
+
+### Gates
+
+- `cargo test --workspace`: **500 → 586**, 0 failed. **+86 tests**: 36 in `vericl` core (30
+  complete-verification / normalization / tamper-class / pre-review, 3 per-case vacuity, 3
+  provenance), 26 direct `suite!` macro tests, 24 evidence-tamper integration tests against the real
+  committed manifests. One pre-existing test (`case_outcome_pass_and_describe`) was rewritten,
+  because its fixture was the vacuous shape fix 2 now refuses.
+- `cargo test -p vericl-examples --features cpu`: **201 passed / 0 failed**, and it exercises the
+  additive-lane exemption end to end against default-shape evidence. Verbatim, from a `--nocapture`
+  run of that suite:
+
+  ```
+  vericl note — 63 item(s) of evidence produced by this build are not recorded in
+    …/evidence/vericl.json (an execution lane the file was not produced with); re-run with
+    VERICL_UPDATE=1 under the same features to record them:
+    execution lane(s) "cpu" ran but are not recorded in the stored evidence
+      (stored lanes: "wgpu<wgsl>") — their claims are additional evidence, not a mismatch
+    kernel `axpy`: tested `differential` (backend "cpu") was produced by an execution lane the
+      stored evidence does not record
+    kernel `axpy`: trusted component contributed by an unrecorded lane: `"cpu" runtime shares
+      CubeCL's front end …`
+    … (31 kernels × 2)
+  vericl evidence OK: 31 kernel entries verified complete — identity, contract, claim set,
+    configs, results and trust list all match, in a matching verification environment
+  ```
+- `cargo clippy --workspace --all-targets` and `-p vericl-examples --all-targets --features cpu`:
+  zero warnings.
+- `cargo run --bin conform`: exit 0, **7 defects caught, 0 missed**.
+- `VERICL_UPDATE` run last (default features, so the committed manifests are left in the default
+  non-cpu shape); md5 before and after the run are **identical** for all four files, so the update is
+  a no-op on top of what is committed.
+
+### Pre-review of this arc (one reviewer, run before hand-off) — 1 CRITICAL + 3 MODERATE, all closed
+
+Round 12's "novel mechanism ⇒ attack the novelty" rule was applied to this arc immediately rather
+than deferred to round 13. One independent reviewer was pointed at the new verification code with a
+single instruction: find where the completeness property fails. It did — on the mechanism's own
+novelty, exactly as the rule predicts.
+
+**CRITICAL — the lane exemption could be forged by editing the lane list.** The reviewer
+re-implemented `pair_claims` + `provenance_problems` + the `current_only` loop in Python, ran it
+against the **real** `evidence/vericl.json`, and produced a green pass from two edits: delete
+`axpy`'s `tested`/`differential` claim, and set `provenance.lanes` to `[]`. Every current lane then
+lands in the exempt set, so the deleted claim's removal is reported as an "additional evidence"
+*note*. The module's own docstring — "never able to mask a loss on the lanes the file does record" —
+was false, because `stored.lanes` is attacker-controlled and nothing validated it.
+
+This is the same hole I had found in self-review and closed while the review was running (the two
+guards recorded under fix 1), so the reviewer read the pre-guard file — but the finding is not
+therefore free. **Measured both ways on the real manifest**, by disabling the guards and restoring
+them:
+
+| | guards off | guards on |
+|---|---|---|
+| delete `axpy`'s tested claim + `lanes: []` | `verify` returns `[]` — **green** | `records no execution lane at all` **and** `tested differential … MISSING from the stored evidence` |
+| the same, with `lanes: ["cpu"]` (a plausible list naming a lane that did not run) | **green** | `PRIMARY execution lane changed` **and** the MISSING line |
+| erase `"wgpu<wgsl>" buffer upload/readback integrity` from `trusted` + `lanes: []` | **green** | the erasure is reported, with the "stronger than the one actually established" wording |
+
+Permanent regressions, at both levels: `deleting_a_claim_and_its_lane_marker_together_is_still_refused`
+(in `evidence.rs` on a synthetic entry, and in `evidence_tamper.rs` on the committed manifest, the
+latter covering both lane-list spellings) and
+`erasing_a_lane_scoped_trust_entry_with_its_lane_marker_is_still_refused`. The reviewer's sharpest
+observation is recorded because it generalises: *neither* test suite had ever tampered
+`stored.provenance.lanes` **independently of** `current.provenance.lanes` — both harnesses built the
+two sides with identical lane lists, so the exemption's only input had zero adversarial coverage.
+When a check has a scoping input, the scoping input is part of the attack surface.
+
+Three MODERATE findings, none of which could make a tampered file verify green, all fixed:
+
+1. **`render_json`'s truncation could make two different values render identically.** Each side was
+   truncated independently from the start, so values agreeing on their first 160 characters printed
+   as `stored X -> current X` for a difference that was really there — worst exactly where it
+   matters, the whole-array blob an unequal-length `sizes` diff produces. The window is now centred
+   on the **first divergence**. Regression:
+   `a_diff_late_in_a_long_value_is_still_visible_in_the_message`.
+2. **The failure-message dedup key omitted the backend.** Two lanes diverging the same way produce
+   the same `detail`, so the second line was deduped away and the reader saw one broken lane instead
+   of two. Failures are now labelled with the backend and reported per side — and the side matters
+   on its own: `VERICL_UPDATE` refuses to write failing evidence, so a `Fail` *in the file* means it
+   was hand-edited, which is a different sentence from "this build is failing" and used to be
+   phrased as the latter. Regressions: `two_lanes_failing_identically_are_two_reported_failures`,
+   `a_failure_recorded_in_the_file_is_reported_as_the_files_failure`.
+3. **`pair_claims` mis-attributed diffs under duplicate keys.** First-fit on the key could pair a
+   stored claim with a *different* current claim of the same key and blame the wrong lane for the
+   config change. (The reviewer verified by exhaustion that it could never drop a difference to
+   zero — pigeonhole — so this was attribution only.) A **content-equal pass** now runs first, so
+   unchanged claims pair with themselves and only genuinely-changed ones reach the looser passes.
+   Regression: `a_config_diff_is_attributed_to_the_claim_that_changed`.
+
+The reviewer also confirmed, by construction rather than assertion, four things this arc claimed:
+`null`-vs-absent and numeric-type changes are distinguished; no two different configs compare equal;
+every field of `Provenance`, `ContractRecord` and `Identity` is compared with no gaps; and no kernel
+in the repository is newly failed by `CaseOutcome::pass`'s non-vacuity clauses (every example kernel
+has exactly one `&mut Array` output and no example uses `gen(len(...))`).
+
+### Lesson (binding, added to the standing set)
+
+> **The check that reads the result is part of the product, and it was the least-attacked code in the
+> repository.** Twelve adversarial rounds went at twins, prover encodings and identity hashes;
+> `verify()` compared three of a dozen recorded fields and `suite.rs` had no tests at all. An outside
+> reviewer found that in one pass. When a component's job is to *refuse* things, its test suite must
+> enumerate the things it refuses — a green run against untampered inputs proves nothing about a
+> checker. Every future check of this kind ships with one regression per class it claims to catch,
+> each with the untampered pair as its own negative control.
+
+### Round 13
+
+Round 12's process note — *"novel mechanism ⇒ at least two independent reviews, one targeting the
+novelty"* — applies here directly. **Manifest normalization is a novel mechanism**: nothing in VeriCL
+previously decided what "the same evidence" means across order, duplication, and structural JSON
+shape, and the two-pass claim pairing plus the provenance-scoped lane exemption are the specific new
+things a reviewer should attack. **Round 13 double-reviews this arc before any further feature work**,
+with at least one reviewer aimed at:
+
+1. the pairing algorithm — can a crafted stored manifest make a real mutation pair as something else,
+   or make a removal read as a note?
+2. the lane exemption — can anything other than a genuinely additive lane land inside it? Does the
+   `starts_with(lane)` trust match have a false positive that matters?
+3. the normalization choices themselves — is any "order-insensitive" call hiding a difference that is
+   real, and is any "sensitive" one going to produce churn that trains people to regenerate without
+   reading?
+4. the provenance fingerprint's *absence* claims — the residual list is the thing to attack, not the
+   fields that are there.
+5. the four vacuity siblings recorded above under fix 2, item 4, which are open.

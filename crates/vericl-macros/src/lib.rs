@@ -4620,6 +4620,33 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             ),
         ));
     }
+    // VACUOUS-DIFFERENTIAL REJECTION (external consumer review, fix 2's
+    // sibling audit). `conformance_case` builds one `(param, CompareReport)`
+    // per `&mut Array` parameter and nothing else — so a kernel declaring NO
+    // mutable array output produces `reports: []`, and
+    // `reports.iter().all(|r| r.pass)` over an empty list is `true`. The suite
+    // then records a PASSING `tested` / `differential` claim for a kernel where
+    // literally nothing was compared, and the manifest cannot tell that entry
+    // apart from a real one (`CompareReport` is only serialized on failure).
+    //
+    // The nearby f32/f64-mix check above is itself vacuously satisfied by the
+    // empty list, which is how the shape stayed unnoticed. `CaseOutcome::pass`
+    // now refuses an empty report list as a runtime backstop; this is the
+    // compile-time gate that means no author ever reaches it.
+    if !params.iter().any(|p| matches!(p.kind, ParamKind::ArrayMut(_))) {
+        return Err(syn::Error::new(
+            func.sig.span(),
+            format!(
+                "kernel `{fn_name_str}` declares no `&mut Array<T>` output parameter, so there is \
+                 nothing for the differential to compare: every case would report zero compared \
+                 parameters, and `all()` over zero reports is `true` — a PASSING `tested` claim \
+                 that established nothing. A `#[cube(launch)]` kernel writes its results through \
+                 an `&mut Array<T>` parameter; add one, or drop the `#[vericl::kernel]` annotation \
+                 if this function is a device helper (`#[vericl::helper]`)"
+            ),
+        ));
+    }
+
     let is_f64_compare = out_float_kinds.contains(&NumKind::F64);
     let (compare, compare_desc): (TokenStream2, String) = if is_f64_compare {
         compare_tokens_f64(&spec.compare_mode)
@@ -6915,6 +6942,28 @@ fn resolve_gen_entries(
                         ));
                     }
                     _ => {}
+                }
+                // A pinned length of ZERO makes every case for that buffer
+                // compare nothing — `CompareReport { checked: 0, mismatches:
+                // 0, pass: true }`, agreement over an empty set — and unlike
+                // `sizes: [0]` it leaves NO trace in the manifest: `gen(...)`
+                // is not part of `ContractRecord`, so the claim would record
+                // the suite's real `sizes` while having compared zero
+                // elements. Refused where it is written (external consumer
+                // review, fix 2's sibling audit).
+                if matches!(&value, Expr::Lit(syn::ExprLit { lit: Lit::Int(i), .. })
+                    if i.base10_digits() == "0")
+                {
+                    return Err(syn::Error::new(
+                        value.span(),
+                        format!(
+                            "gen(...) pins `len({key}) = 0`, so every differential case compares \
+                             ZERO elements of `{key}` and reports agreement over nothing. Worse \
+                             than `sizes: [0]`: a `gen(...)` pin is not part of the recorded \
+                             contract, so the claim would advertise the suite's declared sizes \
+                             while having compared no elements at all. Use a positive length"
+                        ),
+                    ));
                 }
                 if lens.insert(key.clone(), value.clone()).is_some() {
                     return Err(syn::Error::new(

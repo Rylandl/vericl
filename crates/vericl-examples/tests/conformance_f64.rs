@@ -32,10 +32,16 @@ vericl::suite! {
     runtime: cubecl::cpu::CpuRuntime,
     kernels: [axpy_f64],
     evidence: "evidence/vericl_f64.json",
+    // No `frontend_independent:` field — it is DERIVED from `runtime:`.
     // cubecl-cpu is the ONLY honest f64 backend (WGSL has no f64), and it
-    // shares CubeCL's front end with the kernel under test — so this lane is
-    // not front-end-independent. The trusted list records that explicitly
-    // (HOST_HARDWARE_TRUST + the shared-front-end caveat) instead of implying
-    // a GPU/independent execution lane; only the derived twin is independent.
-    frontend_independent: false,
+    // shares CubeCL's front end with the kernel under test, so `CpuRuntime`
+    // resolves to the weak claim: the trusted list records HOST_HARDWARE_TRUST
+    // plus the explicit shared-front-end caveat instead of implying a
+    // GPU/independent execution lane. Only the derived twin is independent
+    // here.
+    //
+    // This used to be spelled `frontend_independent: false` by hand, next to a
+    // default of `true` that any suite got by saying nothing — the strong claim
+    // for free, on any runtime. Writing `frontend_independent: true` here is now
+    // a compile error rather than a bool somebody typed.
 }

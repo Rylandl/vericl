@@ -272,8 +272,8 @@ spot-validation does with `cubek-std`'s `TileSize`). And `const`-evaluable **doe
 source-determined**: a pin derived from `option_env!`/`cfg!` is const-evaluable and can still differ
 between two builds of identical source. VeriCL hashes the pin's *expression text* (it is inside the
 contract-attribute tokens), not the environment that resolved it, so such evidence is per-build
-deterministic rather than per-source reproducible — `ir_hash` under `prove: true` is what catches the
-drift. If cross-build reproducibility matters, write the value out.
+deterministic rather than per-source reproducible — `ir_hash`, which every run records whether or not
+it proves anything, is what catches the drift. If cross-build reproducibility matters, write the value out.
 
 **The residual, stated plainly.** Rust allows an inherent `impl` for a local type anywhere in the
 crate, so a second impl block written *outside* the `vericl::config!` invocation escapes both the
@@ -433,8 +433,9 @@ under test. So the macro-derived sequential twin is the **sole** independent leg
 independence *load-bearing* rather than a redundant cross-check. The f64 suite records this in the
 evidence trusted list explicitly — `host CPU execution hardware` (not the f32 lanes' "GPU hardware"),
 plus the standing shared-front-end caveat "this lane is NOT an independent reference; only the
-vericl-macros sequential twin is independent of CubeCL" — via a `frontend_independent: false` suite
-declaration. f64 kernels therefore get their own `suite!` invocation on `cubecl::cpu::CpuRuntime`
+vericl-macros sequential twin is independent of CubeCL". Which of the two wordings an entry gets is
+DERIVED from the suite's `runtime:` (`CpuRuntime` → shared front end), not a bool a caller defaults
+into; declaring the strong claim on a shared-front-end runtime is a compile error. f64 kernels therefore get their own `suite!` invocation on `cubecl::cpu::CpuRuntime`
 with its own evidence file (`crates/vericl-examples/tests/conformance_f64.rs` →
 `evidence/vericl_f64.json`), the same "one suite, one manifest" precedent as `conformance.rs` and
 `cooperative_fallback.rs`; it is `#[cfg(feature = "cpu")]`, so it is exercised under `cargo test
@@ -771,7 +772,16 @@ Expands to `#[test] fn vericl_conformance()`: builds the client, runs every list
 assembles the evidence manifest. With `VERICL_UPDATE` set (any value), it writes the manifest;
 otherwise it loads what's on disk, calls `vericl::verify`, and panics with the problem list on any
 mismatch — so `cargo test` is the whole CI story. The evidence path is relative to
-`CARGO_MANIFEST_DIR`. An optional `extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime)`
+`CARGO_MANIFEST_DIR`.
+
+`verify` is **complete**: the stored claim set has to be this build's claim set, field for field —
+identity, every contract field, the full claim set (additions, removals and mutations of backend,
+seed, sizes, solver, obligation count and result), the trusted list, and the
+verification-environment fingerprint (rustc, target, the pinned crate versions, z3, device). Each
+problem names the field and shows `stored X -> current Y`. Evidence carried to a different toolchain
+is stale-class, not silently accepted. Normalization is deliberate in both directions — claim order,
+entry order and trusted-list order are meaningless and ignored; a `sizes` array is a declared
+sequence and is not. See `docs/guide.md` §11 "What `verify` compares" for the table. An optional `extra_lane: (cfg(feature = "cpu"), cubecl::cpu::CpuRuntime)`
 folds an additional differential lane (sharing CubeCL's front end, so recorded as *not
 independent* — only the macro-derived sequential twin is) into the same test, appending claims to
 the same entries before the manifest is finalized, so one suite invocation always produces exactly

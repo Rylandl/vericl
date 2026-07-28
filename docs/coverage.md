@@ -382,9 +382,10 @@ gets re-examined.
 Consequences:
 
 - The only honest lane is `cubecl::cpu::CpuRuntime`, behind `--features cpu`.
-- cubecl-cpu shares CubeCL's front end with the kernel under test, so **the f64 suite is declared
-  `frontend_independent: false`** and the macro-derived twin is the sole independent leg. This is
-  recorded in the manifest, not assumed away.
+- cubecl-cpu shares CubeCL's front end with the kernel under test, so **the f64 suite records the
+  weak lane claim** — derived from its `runtime: cubecl::cpu::CpuRuntime`, not declared by hand — and
+  the macro-derived twin is the sole independent leg. This is recorded in the manifest, not assumed
+  away.
 - A kernel with both f32 and f64 `&mut Array` outputs is rejected — one `compare(...)` mode cannot
   honestly serve two float precisions.
 - Exactly one f64 example exists (`axpy_f64`). Treat f64 breadth as unexercised.
