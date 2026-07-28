@@ -830,7 +830,11 @@ fn provenance_problems(
     let exempt: Vec<String> = current
         .lanes
         .iter()
-        .filter(|l| Some(*l) != primary && !stored.lanes.contains(l))
+        // A blank/whitespace-only lane name can never scope an exemption — it
+        // would match everything. Real runtime names (Debug-formatted) are never
+        // blank; this is belt-and-suspenders should one ever be, so the
+        // exemption cannot degenerate into a wildcard (round 13).
+        .filter(|l| Some(*l) != primary && !stored.lanes.contains(l) && !l.trim().is_empty())
         .cloned()
         .collect();
     if !exempt.is_empty() {
@@ -1034,7 +1038,16 @@ fn compare_manifests(stored: &Manifest, current: &Manifest) -> Comparison {
         let st_trust: BTreeSet<&str> = st.trusted.iter().map(String::as_str).collect();
         let cur_trust: BTreeSet<&str> = cur.trusted.iter().map(String::as_str).collect();
         for missing in cur_trust.difference(&st_trust) {
-            if exempt_lanes.iter().any(|l| missing.starts_with(l.as_str())) {
+            // Lane-scoped like the claim path: a trusted string is `<backend> <rest>`,
+            // so exempt only on an exact match or a `<backend> `-delimited prefix — never a
+            // bare `starts_with`, which a zero-length or unbalanced lane name would turn into
+            // a wildcard. (`exempt_lanes` derives from the trusted current build and real
+            // runtime names are always balanced-quoted, so this is defense-in-depth; it makes
+            // the guard hold literally rather than by accident of Debug-quoting — round 13.)
+            if exempt_lanes
+                .iter()
+                .any(|l| !l.is_empty() && (*missing == l.as_str() || missing.starts_with(&format!("{l} "))))
+            {
                 unrecorded.push(format!(
                     "kernel `{}`: trusted component contributed by an unrecorded lane: `{missing}`",
                     cur.kernel
@@ -1566,6 +1579,73 @@ mod tests {
         // produce — is also reported, with its own wording.
         let (p, _) = tampered(|e| e.trusted.push("a component nobody trusts".into()));
         assert!(only_problem(&p).contains("does not produce"), "{p:?}");
+    }
+
+    /// ROUND 13 — the trusted-exemption must be lane-scoped exactly like the
+    /// claim path, not a bare `starts_with`. A zero-length or whitespace-only
+    /// current lane name must never turn the exemption into a wildcard that
+    /// excuses an erased primary-lane trust entry. (Reachable runtime names are
+    /// always balanced-quoted, so this is defense-in-depth; the guard must hold
+    /// literally, not by that accident.)
+    #[test]
+    fn a_blank_exempt_lane_cannot_wildcard_the_trust_exemption() {
+        // Stored file (attacker-controlled) erases the primary lane's trust
+        // entry and lists a blank extra lane to try to excuse it.
+        let mut current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\"", "   "]);
+        current.provenance.lanes = vec!["\"wgpu<wgsl>\"".into(), "   ".into()];
+        let mut stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        // stored records only the primary lane, and its trust list is missing
+        // the primary "buffer upload/readback integrity" entry.
+        stored.entries[0]
+            .trusted
+            .retain(|t| !t.contains("buffer upload/readback integrity"));
+        let problems = verify(&stored, &current);
+        assert!(
+            problems.iter().any(|p| p.contains("buffer upload/readback integrity")
+                && p.contains("MISSING from the stored evidence")),
+            "a blank exempt lane must NOT excuse the erased primary trust entry: {problems:?}"
+        );
+    }
+
+    /// ROUND 13 sibling — an exempt lane that is a bare PREFIX of a primary
+    /// trust string (not delimited by a space) must not exempt it. Only an
+    /// exact match or a `<lane> `-delimited prefix is a genuine lane scope.
+    #[test]
+    fn a_prefix_exempt_lane_does_not_exempt_a_primary_trust_entry() {
+        // Primary trust entry begins `"wgpu<wgsl>" buffer ...`; a malicious
+        // stored file adds an extra lane `"wgpu` (a prefix, no delimiter) and
+        // deletes that entry.
+        let mut current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        current.provenance.lanes = vec!["\"wgpu<wgsl>\"".into(), "\"wgpu".into()];
+        let mut stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        stored.provenance.lanes = vec!["\"wgpu<wgsl>\"".into()];
+        stored.entries[0]
+            .trusted
+            .retain(|t| !t.contains("buffer upload/readback integrity"));
+        let problems = verify(&stored, &current);
+        assert!(
+            problems.iter().any(|p| p.contains("buffer upload/readback integrity")
+                && p.contains("MISSING from the stored evidence")),
+            "a prefix (undelimited) exempt lane must NOT excuse the primary trust entry: {problems:?}"
+        );
+    }
+
+    /// ROUND 13 positive control — a GENUINE extra-lane trust entry (properly
+    /// `<lane> `-delimited) is still exempted, so the tightening did not break
+    /// the legitimate `extra_lane` case the exemption exists for.
+    #[test]
+    fn a_genuine_extra_lane_trust_entry_is_still_exempted() {
+        let mut current = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\"", "\"cpu\""]);
+        current.provenance.lanes = vec!["\"wgpu<wgsl>\"".into(), "\"cpu\"".into()];
+        current.entries[0]
+            .trusted
+            .push("\"cpu\" buffer upload/readback integrity".into());
+        let stored = recorded(vec![realistic_entry()], &["\"wgpu<wgsl>\""]);
+        let problems = verify(&stored, &current);
+        assert!(
+            problems.is_empty(),
+            "a properly lane-scoped extra-lane trust entry must be exempted, not a problem: {problems:?}"
+        );
     }
 
     /// TAMPER CLASS 5 — an arbitrary passing claim typed into the file. The
