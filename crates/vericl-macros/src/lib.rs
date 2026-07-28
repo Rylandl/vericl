@@ -309,12 +309,33 @@ fn kernel_uses_per_axis(body: &syn::Block) -> bool {
 /// to the kernel's `AddressType`, which vericl registers as `U32`
 /// (`cubecl-core-0.10.0/src/frontend/element/uint.rs:87-89`) — so a `usize`
 /// parameter occupies a `u32` slot and must be counted here. `#[comptime]`
-/// parameters never reach the builder and are skipped; a runtime
-/// `cube_struct!` parameter would flatten unknown fields into the same counter
-/// and is rejected outright by the `dispatch(...)` gate before this is called.
+/// parameters never reach the builder and are skipped.
 ///
-/// Returns `None` if `name` is not a `u32` runtime scalar parameter.
+/// **Fails closed on a runtime `cube_struct!` parameter (round-12 critical).**
+/// CubeCL flattens a runtime struct's own `u32` fields into the *same*
+/// per-`StorageType` counter these slots are numbered by, and this macro never
+/// parsed the struct's field types (they live in a `cube_struct!` block it does
+/// not see) — so every scalar declared *after* a struct parameter is shifted by
+/// an unknowable amount. This function therefore returns `None` for **every**
+/// name once any `ParamKind::Struct` parameter is present, rather than guessing
+/// a shifted id. The recognizer then recognizes no positional-id assume (a
+/// missing constraint is sound — it can only make an obligation harder to
+/// prove), and the companion gate in `derive_kernel` upgrades that to a loud,
+/// actionable error. The `dispatch(...)` lane also rejects a struct parameter
+/// outright (D4'), but the product-assume recognizer runs in the NON-dispatch
+/// lane too, so this must fail closed on its own: the earlier claim that the
+/// dispatch gate alone protected this was FALSE and produced a measured false
+/// `Proved` (a `cube_struct!` param before `w, h` mis-mapped
+/// `out.len() == (w as usize) * (h as usize)` to `cfg.a * w`).
+///
+/// Returns `None` if `name` is not a `u32` runtime scalar parameter, or if any
+/// runtime struct parameter makes the positional numbering unknowable.
 fn u32_scalar_slot(params: &[Param], name: &Ident) -> Option<u32> {
+    // Fail closed: a runtime struct parameter flattens unknown `u32` fields into
+    // the scalar counter, so NO positional id computed here is trustworthy.
+    if params.iter().any(|p| matches!(p.kind, ParamKind::Struct(_))) {
+        return None;
+    }
     let mut slot = 0u32;
     for p in params {
         let ParamKind::Scalar(ty) = &p.kind else { continue };
@@ -4224,6 +4245,11 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 ));
             }
         }
+        // §13 risk 6: the `extents` clause's axis order must agree with the
+        // body's per-axis guards, or a transposition slides through BOTH lanes
+        // (the differential shares the clause's grid derivation; bounds only ever
+        // under-covers). Caught here, at compile time, since neither lane can.
+        reject_transposed_extents(&func.block, &d.extents, &fn_name_str)?;
     }
 
     // --- derive the reference twin body: ABSOLUTE_POS rewrite (ordinary twin
@@ -4633,13 +4659,62 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             _ => None,
         })
         .collect();
+    // SOUNDNESS — round-12 critical (docs/design-2d-dispatch.md §4.6, §9).
+    // `Assume::LenEqProduct` is the FIRST assume that names its operands by
+    // POSITIONAL IR `GlobalScalar` id (via `u32_scalar_slot`) rather than by
+    // buffer name. A runtime `vericl::cube_struct!` parameter flattens its own
+    // `u32` fields into the *same* per-`StorageType` scalar counter the extents
+    // are numbered by, and this macro never parsed the struct's field types — so
+    // any scalar declared after the struct is mis-numbered and the recognized
+    // product would name the WRONG operands. Measured false `Proved`: a kernel
+    // with `cfg: &Cfg{a:u32}` before `w, h` and
+    // `assumes(out.len() == (w as usize) * (h as usize))` recognized
+    // `len_out == scalar0 * scalar1` = `cfg.a * w`, and a body guarded by
+    // `ABSOLUTE_POS < cfg.a * w` then proved a write that runs out of bounds
+    // whenever `cfg.a > h`. The `dispatch(...)` lane already fails closed on
+    // this (D4'), but the product recognizer runs in the NON-dispatch lane too,
+    // so it must fail closed independently. `u32_scalar_slot` returns `None` for
+    // every name when a struct is present (so nothing mis-maps); here we turn
+    // that into a loud, actionable error rather than a silently-dropped clause,
+    // exactly as D4' does — the round-4 discipline that a recognized form must
+    // IMPLY the model, made a compile error.
+    if let Some(sp) = params.iter().find(|p| matches!(p.kind, ParamKind::Struct(_))) {
+        let ParamKind::Struct(sty) = &sp.kind else { unreachable!() };
+        let scalar_u32_names: Vec<String> = params
+            .iter()
+            .filter(|p| matches!(&p.kind, ParamKind::Scalar(t) if NumKind::of(t) == Some(NumKind::U32)))
+            .map(|p| p.name.to_string())
+            .collect();
+        if let Some(bad) = spec
+            .assumes
+            .iter()
+            .find(|e| length_product_assume_span(e, &array_param_names, &scalar_u32_names).is_some())
+        {
+            return Err(syn::Error::new(
+                bad.span(),
+                format!(
+                    "a length-product `assumes(...)` clause is outside the vericl subset for a \
+                     kernel with a runtime `vericl::cube_struct!` parameter (`{}: {}`). The clause \
+                     names its two factors by POSITION among the runtime `u32` scalars, but CubeCL \
+                     flattens the struct's own `u32` fields into that same registration counter and \
+                     this macro cannot see the declared field types — so every scalar after the \
+                     struct is shifted by an unknowable amount and the modeled product would name \
+                     the WRONG operands (a measured false `Proved`). Move the extents and every \
+                     other runtime value the clause references ahead of the struct parameter, or \
+                     pass them as loose `u32` parameters instead of struct fields \
+                     (docs/design-2d-dispatch.md §4.6, §9)",
+                    sp.name,
+                    sty.to_token_stream()
+                ),
+            ));
+        }
+    }
     // Runtime `u32` scalar parameters and their IR `GlobalScalar` ids — the
     // operands `Assume::LenEqProduct` names (docs/design-2d-dispatch.md §4.6).
-    // Empty of dispatch relevance for every other kernel: a kernel with no
-    // product assume never reaches the recognizer, and one with a runtime
-    // `cube_struct!` parameter cannot declare `dispatch(...)` at all (the id
-    // would be unknowable), so this map is only ever consulted where it is
-    // exact.
+    // The map is EMPTY when a runtime `cube_struct!` parameter is present
+    // (`u32_scalar_slot` fails closed there), which is why the gate above must
+    // run first: it is the only place that can name the real problem. For a
+    // struct-free kernel the ids are exact.
     let u32_scalar_slots: HashMap<String, u32> = params
         .iter()
         .filter(|p| matches!(&p.kind, ParamKind::Scalar(t) if NumKind::of(t) == Some(NumKind::U32)))
@@ -6085,6 +6160,15 @@ fn cast_u32_scalar_to_usize(e: &Expr, u32_scalars: &HashMap<String, u32>) -> Opt
 /// satisfies the host predicate while the model believes the length is
 /// 4 294 967 298 — and an index of 2 then proves in bounds against a buffer
 /// that does not have it.
+///
+/// **32-bit-host caveat (honest limitation).** The widen-then-multiply spelling
+/// is exact only where `usize` is at least 64-bit: the generated `check_assumes`
+/// evaluates `(x as usize) * (y as usize)` in native `usize`, so on a 32-bit
+/// host that product itself wraps at `2^32` — the very wrap R6 rejects the other
+/// spelling for — and the host predicate would then test the wrapped product
+/// while the prover asserts the mathematical one. vericl's proof and evidence
+/// hosts are 64-bit, where the two agree at every input; a 32-bit *proof host*
+/// is out of the supported set for this clause.
 fn recognize_product_assume(
     expr: &Expr,
     array_params: &[String],
@@ -6105,6 +6189,195 @@ fn recognize_product_assume(
     let (x, x_scalar) = cast_u32_scalar_to_usize(pl, u32_scalars)?;
     let (y, y_scalar) = cast_u32_scalar_to_usize(pr, u32_scalars)?;
     Some(RecognizedAssume::LenEqProduct { a: len_side, x, y, x_scalar, y_scalar })
+}
+
+/// Detect a length-*product* assume of EITHER spelling — the widen-then-multiply
+/// `A.len() == (x as usize) * (y as usize)` that [`recognize_product_assume`]
+/// accepts, or the wrapping `A.len() == (x * y) as usize` that
+/// [`reject_wrapping_product_assume`] rejects — where both factors are declared
+/// runtime `u32` scalar parameters by NAME. Returns the clause's span if so.
+///
+/// Keyed on names, NOT on the positional `GlobalScalar`-id map, so it is safe to
+/// call *before* those ids are computed. That ordering is the point: the
+/// round-12 struct gate must decide "is there a length-product assume here?"
+/// while a runtime `cube_struct!` parameter has already made every positional id
+/// unknowable — so it cannot lean on the (now deliberately empty) slot map.
+/// Recognition proper stays stricter than this (widen-then-multiply only); this
+/// is only the reject-side detector for the whole product class.
+fn length_product_assume_span(
+    expr: &Expr,
+    array_params: &[String],
+    scalar_u32_names: &[String],
+) -> Option<proc_macro2::Span> {
+    let Expr::Binary(ExprBinary { left, op: BinOp::Eq(_), right, .. }) = expr else {
+        return None;
+    };
+    let prod_side = match len_call_target(left, array_params) {
+        Some(_) => right.as_ref(),
+        None => {
+            len_call_target(right, array_params)?;
+            left.as_ref()
+        }
+    };
+    let is_scalar_name = |e: &Expr| -> bool {
+        matches!(peel_paren(e), Expr::Path(p)
+            if p.path.get_ident().is_some_and(|i| scalar_u32_names.contains(&i.to_string())))
+    };
+    let is_scalar_cast_usize = |e: &Expr| -> bool {
+        let Expr::Cast(c) = peel_paren(e) else { return false };
+        let Type::Path(tp) = c.ty.as_ref() else { return false };
+        tp.qself.is_none() && tp.path.is_ident("usize") && is_scalar_name(&c.expr)
+    };
+    match peel_paren(prod_side) {
+        // widen-then-multiply: `(x as usize) * (y as usize)`
+        Expr::Binary(ExprBinary { left: pl, op: BinOp::Mul(_), right: pr, .. })
+            if is_scalar_cast_usize(pl) && is_scalar_cast_usize(pr) =>
+        {
+            Some(expr.span())
+        }
+        // wrapping: `(x * y) as usize`
+        Expr::Cast(c)
+            if matches!(c.ty.as_ref(), Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("usize")) =>
+        {
+            match peel_paren(&c.expr) {
+                Expr::Binary(ExprBinary { left: pl, op: BinOp::Mul(_), right: pr, .. })
+                    if is_scalar_name(pl) && is_scalar_name(pr) =>
+                {
+                    Some(expr.span())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The axis (0 = X, 1 = Y, 2 = Z) named by a per-axis absolute-position builtin.
+fn absolute_pos_axis(name: &str) -> Option<usize> {
+    match name {
+        "ABSOLUTE_POS_X" => Some(0),
+        "ABSOLUTE_POS_Y" => Some(1),
+        "ABSOLUTE_POS_Z" => Some(2),
+        _ => None,
+    }
+}
+
+/// Scans a dispatch kernel body for its per-axis guards: which runtime scalar
+/// each `ABSOLUTE_POS_a` (directly, or through a `let x = ABSOLUTE_POS_X;`
+/// alias — transitively, since aliases are recorded in source order before the
+/// guards that use them) is compared `<` against. Feeds the risk-6 consistency
+/// gate ([`reject_transposed_extents`]).
+#[derive(Default)]
+struct AxisGuardScan {
+    /// alias local name -> axis it resolves to
+    aliases: HashMap<String, usize>,
+    /// axis -> the scalar idents `ABSOLUTE_POS_axis` is guarded `<` against
+    guards: [Vec<String>; 3],
+}
+
+impl AxisGuardScan {
+    /// The axis a body expression denotes (a per-axis builtin or an alias), if
+    /// any.
+    fn axis_of(&self, e: &Expr) -> Option<usize> {
+        let Expr::Path(p) = peel_paren(e) else { return None };
+        let id = p.path.get_ident()?.to_string();
+        absolute_pos_axis(&id).or_else(|| self.aliases.get(&id).copied())
+    }
+
+    /// A bare identifier expression, if `e` is exactly one.
+    fn bare_ident(e: &Expr) -> Option<String> {
+        let Expr::Path(p) = peel_paren(e) else { return None };
+        Some(p.path.get_ident()?.to_string())
+    }
+
+    /// Record `pos_side < scalar_side` as "axis(pos_side) is guarded against the
+    /// bare scalar" — but only when the scalar side is not itself a position
+    /// (guards `pos < pos` bind nothing).
+    fn record_lt(&mut self, pos_side: &Expr, scalar_side: &Expr) {
+        if let (Some(axis), Some(scalar)) = (self.axis_of(pos_side), Self::bare_ident(scalar_side)) {
+            if self.axis_of(scalar_side).is_none() {
+                self.guards[axis].push(scalar);
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for AxisGuardScan {
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        // `let <ident> = <expr resolving to an axis>;` records an alias.
+        if let (syn::Pat::Ident(pi), Some(init)) = (&local.pat, &local.init) {
+            if init.diverge.is_none() {
+                if let Some(axis) = self.axis_of(&init.expr) {
+                    self.aliases.insert(pi.ident.to_string(), axis);
+                }
+            }
+        }
+        syn::visit::visit_local(self, local);
+    }
+
+    fn visit_expr_binary(&mut self, b: &'ast ExprBinary) {
+        match b.op {
+            BinOp::Lt(_) => self.record_lt(&b.left, &b.right),
+            BinOp::Gt(_) => self.record_lt(&b.right, &b.left), // `scalar > pos` == `pos < scalar`
+            _ => {}
+        }
+        syn::visit::visit_expr_binary(self, b);
+    }
+}
+
+/// §13 risk 6: reject a `dispatch(extents = ...)` clause whose axis order
+/// contradicts the body's own per-axis guards.
+///
+/// A transposed clause — `extents = (h, w)` where the body guards
+/// `ABSOLUTE_POS_X < w` and `ABSOLUTE_POS_Y < h` — is **not** caught by the
+/// differential lane, and this is structural, not a coverage gap: the twin's
+/// grid triple and the launch's `CubeCount` are BOTH derived from the same
+/// `extents`/`cube_dim` clause tokens (the "deeper fix" that makes padding
+/// threads inert), so a swap transposes the GPU launch and the reference
+/// together and the differential compares two identically-transposed runs — it
+/// passes over an image that is silently under-covered (measured: a swapped
+/// `(19, 37)` case leaves 95/703 cells unwritten yet the differential passes,
+/// bounds proves, and the evidence `case` label is unchanged). Bounds-freedom
+/// cannot see it either: writing *fewer* cells is still in bounds.
+///
+/// The clause and the body are two independent statements of the axis→extent
+/// map; when they DEFINITELY disagree, the kernel is rejected here at compile
+/// time. **Conservative:** it fires only on a definite mismatch (axis a is
+/// guarded `< S` in the body but the clause names a different scalar for a). An
+/// axis with no recognizable `ABSOLUTE_POS_a < scalar` guard, or a guard whose
+/// bound is a non-bare expression (`w - 1`, a `min`, …), is left unchecked — a
+/// documented residual (see coverage.md / the guide's "what VeriCL does not
+/// do"); the canonical dispatch idiom every shipped kernel uses is checked.
+fn reject_transposed_extents(
+    body: &syn::Block,
+    extents: &[Ident],
+    fn_name_str: &str,
+) -> syn::Result<()> {
+    let mut scan = AxisGuardScan::default();
+    scan.visit_block(body);
+    for (axis, extent) in extents.iter().enumerate() {
+        let expected = extent.to_string();
+        let guarded = &scan.guards[axis];
+        if !guarded.is_empty() && !guarded.contains(&expected) {
+            let a = ["X", "Y", "Z"][axis];
+            let actual = guarded.join("`, `");
+            return Err(syn::Error::new(
+                extent.span(),
+                format!(
+                    "`dispatch(extents = ...)` names `{expected}` as the axis-{axis} (`{a}`) extent \
+                     of kernel `{fn_name_str}`, but the body guards `ABSOLUTE_POS_{a}` against \
+                     `{actual}`, not `{expected}` — the clause's axis order contradicts the body's. \
+                     A transposed `extents` clause is NOT caught by the differential lane (the twin \
+                     grid and the launch cube count derive from the SAME clause tokens, so a swap \
+                     moves both together and the check passes over a silently under-covered image), \
+                     nor by bounds-freedom (writing fewer cells is still in bounds). Order \
+                     `extents` to match the body: axis `{a}` is the one `ABSOLUTE_POS_{a}` is \
+                     bounded by (docs/design-2d-dispatch.md §13 risk 6)"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// R6 — reject the **wrapping** product-assume spelling `A.len() == (x * y) as
@@ -8178,6 +8451,174 @@ mod tests {
         assert_eq!(k("isize"), Some(IntKind { signed: true, width: 32 }));
         assert_eq!(k("f32"), None);
         assert_eq!(k("bool"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Round-12 CRITICAL: the LenEqProduct positional-scalar-id shift.
+    //
+    // `Assume::LenEqProduct` is the first assume that names its operands by
+    // POSITION among the runtime `u32` scalars (via `u32_scalar_slot`). A
+    // runtime `cube_struct!` parameter flattens its own `u32` fields into that
+    // same per-`StorageType` GlobalScalar counter, and this macro never parsed
+    // the struct's field types — so every scalar after the struct is shifted and
+    // a product assume names the WRONG operands. Measured false `Proved`: a
+    // `cfg: &Cfg{a:u32}` before `w, h` mis-mapped `out.len() == w*h` to
+    // `cfg.a * w`, and a body guarded by `ABSOLUTE_POS < cfg.a * w` proved a
+    // write out of bounds whenever `cfg.a > h`. The fix fails closed
+    // (`u32_scalar_slot` -> None under any struct param, so the recognizer
+    // recognizes nothing) and `derive_kernel` rejects loudly. This is the
+    // suite-wired half of that regression (the loud compile error is pinned by
+    // the reviewer's probe, which no longer compiles). White-box over the three
+    // load-bearing functions.
+    // -----------------------------------------------------------------
+
+    fn params_of(src: &str) -> Vec<Param> {
+        use syn::parse::Parser;
+        let inputs = Punctuated::<FnArg, Token![,]>::parse_terminated
+            .parse_str(src)
+            .expect("valid params");
+        inputs.iter().map(|a| classify_param(a).expect("classified")).collect()
+    }
+
+    fn product_slots(params: &[Param]) -> HashMap<String, u32> {
+        params
+            .iter()
+            .filter(|p| matches!(&p.kind, ParamKind::Scalar(t) if NumKind::of(t) == Some(NumKind::U32)))
+            .filter_map(|p| u32_scalar_slot(params, &p.name).map(|s| (p.name.to_string(), s)))
+            .collect()
+    }
+
+    /// The soundness floor: with a runtime struct parameter present,
+    /// `u32_scalar_slot` returns `None` for EVERY scalar (the positional ids are
+    /// unknowable), while without it the numbering is exact and positional.
+    #[test]
+    fn u32_scalar_slot_fails_closed_under_a_runtime_struct_param() {
+        // Control — no struct: `w` is slot 0, `h` is slot 1.
+        let flat = params_of("out: &mut Array<u32>, w: u32, h: u32");
+        assert_eq!(u32_scalar_slot(&flat, &format_ident!("w")), Some(0));
+        assert_eq!(u32_scalar_slot(&flat, &format_ident!("h")), Some(1));
+
+        // A `cube_struct!` param before the extents shifts the ids by the
+        // struct's own (here unknowable) u32-field count. Fail closed: no name
+        // resolves to a slot, so nothing can mis-map.
+        let shifted = params_of("cfg: &Cfg, out: &mut Array<u32>, w: u32, h: u32");
+        assert_eq!(u32_scalar_slot(&shifted, &format_ident!("w")), None);
+        assert_eq!(u32_scalar_slot(&shifted, &format_ident!("h")), None);
+    }
+
+    /// End of the chain: the product recognizer yields NO `LenEqProduct` behind
+    /// a struct param (rather than a mis-mapped one). This is the exact clause of
+    /// the reviewer's false-`Proved` kernel; the struct-free control still
+    /// recognizes the true `(0, 1)` mapping, so the gate is not over-broad.
+    #[test]
+    fn a_product_assume_does_not_recognize_when_ids_are_unknowable() {
+        let arrays = ["out".to_string()];
+        let e: Expr = syn::parse_str("out.len() == (w as usize) * (h as usize)").unwrap();
+
+        let flat = product_slots(&params_of("out: &mut Array<u32>, w: u32, h: u32"));
+        assert!(
+            matches!(
+                recognize_product_assume(&e, &arrays, &flat),
+                Some(RecognizedAssume::LenEqProduct { x_scalar: 0, y_scalar: 1, .. })
+            ),
+            "the struct-free control must recognize `out.len() == w*h` as scalars (0, 1)"
+        );
+
+        let shifted = product_slots(&params_of("cfg: &Cfg, out: &mut Array<u32>, w: u32, h: u32"));
+        assert!(shifted.is_empty(), "the slot map must be empty under a struct param");
+        assert!(
+            recognize_product_assume(&e, &arrays, &shifted).is_none(),
+            "a product assume must NOT recognize behind a runtime struct param — the ids are \
+             unknowable, and a mis-mapped `LenEqProduct` is a measured false `Proved`"
+        );
+    }
+
+    /// The loud gate's shape detector flags a length-product assume of EITHER
+    /// spelling by name, independent of the (failed-closed) id map — which is
+    /// what lets `derive_kernel` reject with a specific message before the ids
+    /// are computed. Both directions asserted so it is discriminating.
+    #[test]
+    fn length_product_assume_span_detects_both_spellings_only() {
+        let arrays = ["out".to_string()];
+        let scalars = ["w".to_string(), "h".to_string()];
+        let hit = |src: &str| {
+            let e: Expr = syn::parse_str(src).unwrap();
+            length_product_assume_span(&e, &arrays, &scalars).is_some()
+        };
+        // Positives: both product spellings, either side of `==`.
+        assert!(hit("out.len() == (w as usize) * (h as usize)"));
+        assert!(hit("(w as usize) * (h as usize) == out.len()"));
+        assert!(hit("out.len() == (w * h) as usize"));
+        // Negatives: not a product, an operand that is not a declared scalar,
+        // and no `.len()` side at all.
+        assert!(!hit("out.len() == w"));
+        assert!(!hit("out.len() == (w as usize) * (q as usize)"));
+        assert!(!hit("n == (w as usize) * (h as usize)"));
+        assert!(!hit("out.len() <= inp.len()"));
+    }
+
+    // -----------------------------------------------------------------
+    // Round-12 BLOCKING (docs): the risk-6 transposition gate. A swapped
+    // `dispatch(extents = ...)` clause is invisible to BOTH lanes (the twin
+    // grid and the launch cube count derive from the same clause tokens, so a
+    // swap moves both together; bounds only under-covers). `reject_transposed_
+    // extents` cross-checks the clause against the body's per-axis guards and
+    // rejects a definite mismatch at compile time. White-box over that fn.
+    // -----------------------------------------------------------------
+
+    fn extents(names: &[&str]) -> Vec<Ident> {
+        names.iter().map(|n| format_ident!("{n}")).collect()
+    }
+
+    /// The canonical guarded idiom every shipped dispatch kernel uses: a swapped
+    /// clause is rejected, the matched clause is accepted (positive control).
+    #[test]
+    fn transposed_extents_are_rejected_and_the_matched_clause_is_accepted() {
+        let body: syn::Block = syn::parse_str(
+            "{ let x = ABSOLUTE_POS_X; let y = ABSOLUTE_POS_Y; if x < w && y < h { let _ = out; } }",
+        )
+        .unwrap();
+        // Matched `extents = (w, h)` agrees with `x < w`, `y < h`.
+        assert!(
+            reject_transposed_extents(&body, &extents(&["w", "h"]), "k").is_ok(),
+            "a clause matching the body's guards must be accepted"
+        );
+        // Swapped `extents = (h, w)` — the reviewer's transposition — is rejected.
+        let err = reject_transposed_extents(&body, &extents(&["h", "w"]), "k")
+            .expect_err("a swapped extents clause must be rejected");
+        assert!(err.to_string().contains("axis order contradicts"), "{err}");
+    }
+
+    /// Rank-3, the direct-builtin form (no `let` alias), and the reversed
+    /// comparison `w > x` all bind correctly; a body with no per-axis guard is
+    /// the conservative residual — left unchecked, never falsely rejected.
+    #[test]
+    fn extent_axis_gate_handles_rank3_direct_reversed_and_the_unguarded_residual() {
+        // Rank-3 with aliases; a swap of the Z extent is caught.
+        let body3: syn::Block = syn::parse_str(
+            "{ let x = ABSOLUTE_POS_X; let y = ABSOLUTE_POS_Y; let z = ABSOLUTE_POS_Z; \
+             if x < w && y < h && z < d { } }",
+        )
+        .unwrap();
+        assert!(reject_transposed_extents(&body3, &extents(&["w", "h", "d"]), "k").is_ok());
+        assert!(reject_transposed_extents(&body3, &extents(&["w", "d", "h"]), "k").is_err());
+
+        // Direct builtin (no alias) and reversed comparison `w > ABSOLUTE_POS_X`.
+        let direct: syn::Block = syn::parse_str(
+            "{ if ABSOLUTE_POS_X < w && h > ABSOLUTE_POS_Y { } }",
+        )
+        .unwrap();
+        assert!(reject_transposed_extents(&direct, &extents(&["w", "h"]), "k").is_ok());
+        assert!(reject_transposed_extents(&direct, &extents(&["h", "w"]), "k").is_err());
+
+        // Residual: no recognizable per-axis guard -> not cross-checked (a
+        // conservative pass, never a false rejection).
+        let unguarded: syn::Block = syn::parse_str("{ let _ = out[0]; }").unwrap();
+        assert!(reject_transposed_extents(&unguarded, &extents(&["h", "w"]), "k").is_ok());
+        // A non-bare bound (`w - 1`) is also not cross-checked (documented residual).
+        let compound: syn::Block =
+            syn::parse_str("{ let x = ABSOLUTE_POS_X; if x < w - 1 { } }").unwrap();
+        assert!(reject_transposed_extents(&compound, &extents(&["h", "w"]), "k").is_ok());
     }
 
     // -----------------------------------------------------------------

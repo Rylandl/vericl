@@ -811,7 +811,16 @@ contract lie.
 `ABSOLUTE_POS_X` moves along a row; a row-major image of width `w` is indexed
 `inp[(y * w + x) as usize]`. Writing `inp[(x * h + y) as usize]` is *in bounds* and *transposed* —
 **VeriCL's proof will not catch it**, because a transposed image is a functional bug, not a
-memory-safety one. The differential lane will.
+memory-safety one, and the auto-derived reference twin mirrors the *same* index math, so the
+differential does not see it either unless you supply an independent `reference = fn`.
+
+A **different** mistake — transposing the *clause*, `dispatch(extents = (h, w))`, against a body
+that still guards `ABSOLUTE_POS_X < w` and `ABSOLUTE_POS_Y < h` — IS rejected, at compile time, by
+the clause/body consistency gate (design §13 risk 6): the differential cannot catch it because the
+twin's grid and the GPU launch derive from the same clause, so a swap moves both together. That
+gate is **conservative** — it only cross-checks axes the body guards with the canonical
+`ABSOLUTE_POS_a < <extent>` form; an axis with no such guard, or one whose bound is a non-bare
+expression (`w - 1`, a `min`), is not checked (see §13).
 
 This is not a convention VeriCL chose. `CubeCount::Static(x, y, z)` reaches
 `dispatch_workgroups(x, y, z)` reaches `workgroup_id.x/.y/.z` with no transposition at any layer,
@@ -1170,6 +1179,17 @@ depends on you knowing the boundary.
   differential test checks the kernel against a twin *derived from the same source*, so a bug present
   in both is invisible to it. (An independent IR interpreter cross-check shrinks *model*-fidelity risk
   empirically, but it, too, is a `tested` observation, not a proof.)
+- **Image transposition is only partly caught.** Two distinct mistakes: (1) transposing the
+  `dispatch(extents = ...)` *clause* relative to the body's per-axis guards — `extents = (h, w)`
+  with a body guarding `ABSOLUTE_POS_X < w`, `ABSOLUTE_POS_Y < h` — is **rejected at compile time**
+  by the clause/body consistency gate (design §13 risk 6); neither the differential nor the bounds
+  proof can see it, because the twin grid and the GPU launch share the clause and a swap moves both
+  together. That gate is *conservative*: it cross-checks only axes the body guards with the
+  canonical `ABSOLUTE_POS_a < <extent>` form, so an axis with no such guard, or one bounded by a
+  non-bare expression (`w - 1`, a `min(...)`), is **not** checked. (2) Transposing the *index math*
+  itself — `inp[(x * h + y)]` where the clause and guards agree — is a functional bug the bounds
+  proof does not target, and the auto-derived twin mirrors the same math, so the differential does
+  not catch it either unless you supply an independent `reference = fn`.
 - **It does not guarantee bit-identical floats across backends.** Float equivalence is claimed only
   within your declared per-kernel tolerance, and recorded as an assumption.
 - **It does not verify arbitrary Rust, or anything that isn't a CubeCL kernel.**

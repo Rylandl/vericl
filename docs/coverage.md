@@ -235,7 +235,14 @@ the same biconditional `cooperative(...)` has.
 
 **X is the fastest-varying axis.** `inp[(y * w + x) as usize]` is a row-major image;
 `inp[(x * h + y) as usize]` is *in bounds* and *transposed*, and the proof will not catch it — a
-transposed image is a functional bug, not a memory-safety one. The differential lane will.
+transposed image is a functional bug, not a memory-safety one, and the auto-derived twin mirrors
+the same index math, so the differential does not catch it either unless you supply an independent
+`reference = fn`. A *different* transposition — swapping the `dispatch(extents = ...)` clause
+(`extents = (h, w)`) against a body that guards `ABSOLUTE_POS_X < w`, `ABSOLUTE_POS_Y < h` — **is**
+rejected at compile time by the clause/body consistency gate (design §13 risk 6); neither lane can
+see it, because the twin grid and the launch derive from the same clause. That gate is conservative:
+it checks only axes guarded with the canonical `ABSOLUTE_POS_a < <extent>` form, so an unguarded
+axis (or one bounded by `w - 1`, a `min`, …) is a documented residual.
 
 Four things are narrower than "2-D works" would suggest, and each is a measurement:
 

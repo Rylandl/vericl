@@ -3210,6 +3210,133 @@ manifest it wrote is byte-identical to `HEAD`).
 
 ---
 
+## Round-12 adversarial review (2026-07-27) — TWO reviewers: MERGE-READY (WRONG) then 1 CRITICAL + 1 blocking-doc + 5 hardening — ALL CLOSED
+
+Verdict on entry: **not clean, and the process nearly said it was.** The 2-D/3-D dispatch milestone
+(M-A) drew **two independent adversarial reviews**. The first returned **MERGE-READY** — no
+false-`Proved`, no wrong-twin, no identity-hole — and it was **wrong**. A second reviewer, run because
+this milestone introduced a genuinely novel mechanism, found a **confirmed critical false-`Proved`**,
+reproduced on this tree. Both reviews were competent; the first simply did not probe the one thing the
+milestone made new.
+
+**Process note (binding).** `Assume::LenEqProduct` is the first assume that names its IR operands by
+**positional `GlobalScalar` id** rather than by buffer name. That positional scheme is the milestone's
+novel mechanism, and it is exactly where the hole was. **A lone clean review is not sufficient sign-off
+for a milestone that introduces a new mechanism** — the novelty must be attacked on its own terms, by a
+second reviewer if the first did not. Recorded so rounds 13+ treat "novel mechanism ⇒ ≥2 independent
+reviews, one targeting the novelty" as standing policy. (The first review's genuine findings — the
+independent rectangular-transpose GPU confirmation, the three round-5 cross-axis refutations, all nine
+pre-registered risks examined — stand; it missed one thing, and one was enough.)
+
+Every probe below flips (defect injected → red; fix → green), each with a negative control, and each
+left a permanent regression.
+
+### CRITICAL — `LenEqProduct` positional-scalar-id shift behind a runtime `cube_struct!` param (false `Proved`)
+
+`u32_scalar_slot` (macros) numbers the runtime `u32` scalars **positionally**, skipping
+`ParamKind::Struct` params — but CubeCL flattens a runtime struct's own `u32` fields into that **same**
+per-`StorageType` `GlobalScalar` counter, and the macro never parsed the struct's field types. So any
+scalar declared *after* a `cube_struct!` param is shifted, and a product assume names the WRONG
+operands. The `dispatch(...)` lane failed closed on this (D4'); **`recognize_product_assume` is not
+gated on dispatch**, so the hole was live in the 1-D lane.
+
+| probe | measured before | now |
+|---|---|---|
+| `shifted(cfg: &Cfg{a:u32}, out, w, h)`, `assumes(out.len() == (w as usize)*(h as usize))`, body `if ABSOLUTE_POS < cfg.a*w { out[ABSOLUTE_POS]=1 }` | `structured_assumes = LenEqProduct{x_scalar:0, y_scalar:1}` = `cfg.a*w` (IR truth: `cfg.a`=0, `w`=1, `h`=2) → model `len==cfg.a*w` equals the guard → **`Proved{1}`** while writing `out[4],out[5]` on a len-4 array at gen-drawn `cfg.a=3` | **compile error** at the `assumes(...)` clause, naming the struct param and the fix (`rv12_falseproved.rs` no longer compiles) |
+| control `flat_control(a:u32, out, w, h)` (same shape, loose `u32`) | `x_scalar:1, y_scalar:2` = `w*h` (correct) → honest `OutOfSubset` | unchanged — the gate is not over-broad |
+
+Fixed in the **sound direction** (round-4 discipline: a recognized form must IMPLY the model). Two
+layers: (1) `u32_scalar_slot` **fails closed** — returns `None` for *every* name once any struct param
+is present, so nothing mis-maps and the recognizer silently yields no `LenEqProduct`; (2) a **loud
+compile-time gate** (mirroring D4') rejects a `cube_struct!` param coexisting with any length-product
+assume (`length_product_assume_span`, both spellings), pointing at the clause with the fix. The false
+comment claiming the dispatch gate alone protected this, and `u32_scalar_slot`'s docstring, are
+corrected. White-box regressions: `u32_scalar_slot_fails_closed_under_a_runtime_struct_param`,
+`a_product_assume_does_not_recognize_when_ids_are_unknowable` (with a struct-free positive control),
+`length_product_assume_span_detects_both_spellings_only`.
+
+### BLOCKING (docs + gate) — risk-6 transposition was caught by NO lane; the design + a test rustdoc said it was
+
+The "deeper fix" (twin grid derived from the **same** clause tokens as the launch) **structurally**
+removes the differential's ability to see a swapped `extents = (h, w)`: a swap transposes the GPU
+launch and the reference together, so the differential compares two identically-transposed runs.
+Measured: a swapped `(19, 37)` case leaves **95/703 image cells unwritten**, yet the differential
+passes, bounds proves, and the evidence `case` label is byte-identical to the good run. Bounds-freedom
+cannot see it either (fewer writes is still in bounds). The design §13 risk-6 sentence and the
+ground-truth rustdoc (`dispatch2d_gpu_ground_truth.rs`) both claimed the differential catches it —
+**false**.
+
+Fixed with the **preferred gate**, not just docs: `reject_transposed_extents` (macros) cross-checks the
+`extents` clause against the body's per-axis guards — the extent named for axis *a* must be the scalar
+`ABSOLUTE_POS_a` (directly or via a `let x = ABSOLUTE_POS_X;` alias, transitively) is guarded `<`
+against — and rejects a **definite** mismatch at compile time. It is **conservative** (an axis with no
+`ABSOLUTE_POS_a < <extent>` guard, or a non-bare bound like `w - 1`, is left unchecked — a documented
+residual), which is why it also touches **no evidence field** (no `VERICL_UPDATE`): correct kernels are
+untouched. `rv12_risk6.rs`'s `swapped` now fails to compile; `good` compiles; all shipped dispatch
+kernels re-expand clean. The false design + rustdoc sentences are corrected to say the gate catches it
+and the differential structurally cannot; the residual is recorded in `docs/coverage.md` and the
+guide's "What VeriCL does not do". Regressions: `transposed_extents_are_rejected_and_the_matched_clause_is_accepted`,
+`extent_axis_gate_handles_rank3_direct_reversed_and_the_unguarded_residual`.
+
+### SHOULD-LAND (5) — all closed
+
+- **Z-axis wrap witness.** `dispatch_per_axis_wrap_witness_refutes_on_every_axis` iterated only x, y; a
+  diverged **Z** recomposition (a Z-only `- wrap*2^32` drop) passed all tests. Added the **z arm**
+  (rank-3 build at `(16,16,16)`). Injection proof: a Z-only wrap drop in `abs_pos_axis_sym` now
+  reports "**FALSE PROOF … axis z**" — caught by the z arm specifically, which the x/y arms and the
+  counting test do not see.
+- **Risk-1 counting test — literal-match → structural.** `the_position_recomposition_has_exactly_one_
+  construction_site` matched the literal `let rhs = self.smt.sub(sum, wraps);`, defeated by renaming.
+  Replaced with `count_wrap_multiple_subtractions`, which traces `let` bindings to count any
+  `self.smt.sub(_, W)` whose subtrahend is a `times`-of-a-`wrap_modulus` multiple — rename-proof, and
+  distinguished from `wrap_to_range` (which subtracts the modulus itself, not a multiple). The test now
+  **self-validates**: it injects a fully-renamed second recomposition and asserts the count rises to 2
+  (the reviewer's exact rename-injection is now a regression it must catch). Docstring corrected to
+  state precisely what it guards and its residual (a copy inlining the literal `4294967296`, or a
+  no-`times` wrap term). The true guarantee remains the one-`recompose_pos`-fn + single-field
+  `TopologyMode`; this is the backstop.
+- **Risk-5 nonlinear-`unknown` branch — was untested.** `contradictory_product_assumes_…` is
+  contradictory *linearly*, so the pre-existing `Unsat` arm caught it; `has_product_assume && Unknown
+  → OutOfSubset` was dead to tests (injecting `false &&` left the suite green). Extracted
+  `feasibility_from_response` and unit-tested all four cases (the `false &&` mutation now flips
+  `feasibility_routing_rejects_a_nonlinear_unknown_only_with_a_product_assume`), and added an
+  end-to-end hard-instance test (below). The existing test's docstring is corrected to say it exercises
+  the `Unsat` arm.
+- **z3 per-check timeout (liveness, not soundness).** The solver ran with no time bound, so a
+  pathological QF_NIA kernel **hangs** instead of returning `unknown`. Every context now installs
+  `(set-option :timeout `[`Z3_CHECK_TIMEOUT_MS`]` = 10_000)` (measured worst-case single check ~0.20 s,
+  so ~50x headroom; verified z3 4.16.0 returns `unknown` at 10.01 s on the reviewer's factoring trap).
+  `unknown` routes to the existing sound branches (`check_obligation`/`check_race` → `SolverError`;
+  Mul `try_discharge` / feasibility probe → tainted / `OutOfSubset`) — never `Proved`, so shrinking it
+  only moves `Proved → OutOfSubset`. Documented in the module doc as a liveness bound. Regression
+  `a_hard_nonlinear_feasibility_check_returns_within_the_bound_not_a_hang` (the one deliberately-slow
+  test, ~10 s) proves the hard instance returns `OutOfSubset(unknown)` within the bound rather than
+  hanging.
+- **MINOR — 32-bit-host `usize` wrap.** `check_assumes` evaluates `(w as usize) * (h as usize)` in
+  native `usize`, which wraps at `2^32` on a 32-bit *proof host* — the very wrap R6 rejects the other
+  spelling for. One honest sentence added at `recognize_product_assume`: the widen-then-multiply
+  spelling is exact only where `usize` ≥ 64-bit; vericl's proof/evidence hosts are 64-bit.
+
+### Verification
+
+- **Every probe flips, negative per positive.** Critical: false-`Proved` → compile error, loose-`u32`
+  control still honest. Risk-6: `swapped` → compile error, `good` compiles. Z-wrap: Z-only drop →
+  "FALSE PROOF axis z". Counting test: renamed injection → count 2. Risk-5: `false &&` mutation → red.
+  Timeout: hard instance returns in ~10 s (unbounded > 30 s).
+- **Zero regressions.** vericl-ir lib **137 → 139**; vericl-macros **140 → 145**; all shipped dispatch
+  kernels re-expand clean under the risk-6 gate; the corrected ground-truth GPU test (5/5) and the
+  rectangular-transpose confirmation pass unchanged.
+- **Evidence byte-identical** — the critical fix and the risk-6 gate are prover-internal / macro-reject
+  / test changes that touch **no obligation count and no evidence field**; no `VERICL_UPDATE` needed
+  (`git diff crates/vericl-examples/evidence/` empty).
+
+**Gates:** full workspace test green **493 → 500**, 0 failures (my 7 new regressions: 2 in
+vericl-ir, 5 in vericl-macros); clippy clean on both feature sets (`--workspace --all-targets`, and
+`-p vericl-examples --all-targets --features cpu`), zero warnings; demo-defects exit 0 with every
+defect caught; the 20k deterministic fuzz corpus still finds nothing critical.
+
+---
+
 ## 2-D / 3-D dispatch (M-A) — CAPABILITY + SOUNDNESS milestone — DONE 2026-07-27 (round 12)
 
 Design: `docs/design-2d-dispatch.md` (measured against pinned `cubecl =0.10.0`, wgpu 29 / Metal on an

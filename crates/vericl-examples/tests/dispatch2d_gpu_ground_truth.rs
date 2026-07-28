@@ -144,10 +144,19 @@ fn uses_composition_works_under_a_dispatch_clause() {
 /// * **The grid is load-bearing.** A grid derived from *swapped* extents,
 ///   `(32, 48)`, produces a DIFFERENT output: `grid.0 = 32 < w = 37`, so image
 ///   columns 32..36 are never visited. This is the discriminator for both
-///   properties at once — it can only differ if the twin's bounds are the grid
-///   — and it is exactly risk 6's attack (`dispatch(extents = (h, w))` with the
-///   names swapped relative to the body's use), shown to change the twin's
-///   answer rather than sliding through in bounds.
+///   properties at once — the twin's loop bounds ARE the grid.
+///
+/// **What this does NOT show (corrected, round 12).** This test feeds two
+/// *different* grids to `reference` by hand. It does NOT show that the
+/// differential lane catches risk 6's transposition — and it cannot, because it
+/// does not: in the real lane the GPU launch grid and the twin's reference grid
+/// are BOTH derived from the same `extents`/`cube_dim` clause tokens, so a
+/// swapped `dispatch(extents = (h, w))` transposes *both* together and the
+/// differential compares two identically-transposed runs (measured: a swapped
+/// `(19, 37)` case leaves 95/703 cells unwritten yet the differential passes,
+/// bounds proves, and the evidence `case` label is byte-identical). Transposition
+/// is instead rejected at COMPILE TIME by the clause/body consistency gate
+/// (`reject_transposed_extents` in `vericl-macros`); see design §13 risk 6.
 #[test]
 fn twin_iterates_the_grid_and_a_swapped_extent_changes_which_threads_are_padding() {
     let (w, h) = (37u32, 19u32);
@@ -170,8 +179,11 @@ fn twin_iterates_the_grid_and_a_swapped_extent_changes_which_threads_are_padding
     assert_ne!(
         exact_grid, swapped_grid,
         "the twin's loop bounds must be the GRID: with grid.0 = 32 < w = 37, image columns \
-         32..36 are never visited, so a swapped `extents = (h, w)` clause must produce a \
-         different reference — this is what makes the differential lane catch risk 6"
+         32..36 are never visited, so feeding a swapped grid to `reference` produces a different \
+         image. (This proves the twin loops over the grid — NOT that the differential catches a \
+         transposition: in the real lane both the GPU and the twin share the clause-derived grid, \
+         so a swap moves both together. Transposition is caught at compile time by \
+         `reject_transposed_extents`; see design §13 risk 6.)"
     );
     let untouched = (32..37)
         .filter(|x| swapped_grid[*x as usize] == 0.0) // row 0, so the index IS x

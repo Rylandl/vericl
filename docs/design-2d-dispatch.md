@@ -1438,10 +1438,23 @@ exercised by kernels that run.
    agree on *which* one, and a kernel with two `u32` parameters of similar name is an easy
    transposition. **Attack surface**: `dispatch(extents = (h, w))` — the names swapped relative to
    the body's use — which launches a transposed grid, still indexes in bounds, and produces a
-   wrong image. *Mitigation*: the differential lane catches it (measured: the §6 twin iterates the
-   *grid*, so a swapped extent changes which threads are padding), and a test must assert exactly
-   that; the deeper fix is that the twin's `grid` triple is derived from the same clause tokens the
-   launch uses, which M4/M6 must share rather than re-derive.
+   wrong image. *Mitigation (CORRECTED, round 12 — the pre-registered mitigation was wrong).* The
+   differential lane does **not** catch a transposition, and this is structural, not a test gap:
+   the deeper fix that makes padding threads inert — deriving the twin's `grid` triple from the
+   **same** clause tokens the launch uses — transposes the GPU launch and the reference *together*,
+   so the differential compares two identically-transposed runs and passes over a silently
+   under-covered image (measured: a swapped `(19, 37)` case leaves 95/703 cells unwritten, yet the
+   differential passes, bounds proves, and the evidence `case` label is byte-identical to the good
+   run). Bounds-freedom cannot see it either — writing *fewer* cells is still in bounds. The actual
+   mitigation is a **compile-time consistency gate** (`reject_transposed_extents`,
+   `crates/vericl-macros/src/lib.rs`): the `extents` clause and the body's per-axis guards are two
+   independent statements of the axis→extent map, and a *definite* disagreement — `ABSOLUTE_POS_X`
+   guarded by `w` while the clause names `h` for axis X — is rejected before any proof or launch.
+   Conservative by design: an axis with no recognizable `ABSOLUTE_POS_a < scalar` guard (or a guard
+   whose bound is a non-bare expression) is left unchecked, a residual recorded in
+   `docs/coverage.md` and the guide's "What VeriCL does not do". The §6 twin-iterates-the-grid test
+   remains valid — it proves the twin loops over the grid — but it does *not* prove the differential
+   catches risk 6, and its wording was corrected to say so.
 
 7. **A 2-tuple clause silently makes the Z builtins out-of-rank, and "out of rank" is a new
    rejection category (medium).** `ABSOLUTE_POS_Z` under `cube_dim = (16,16)` is *always zero* on

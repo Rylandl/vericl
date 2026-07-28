@@ -28,6 +28,19 @@
 //!   shrinks the solver's `sat` verdict out of the trusted base for refutations:
 //!   what remains trusted for a `Refuted` is the small, auditable Rust
 //!   interpreter, not the solver.
+//! - **Per-`check-sat` liveness timeout (a bound, not a soundness lever).**
+//!   Every z3 context is built with `(set-option :timeout `[`Z3_CHECK_TIMEOUT_MS`]`)`,
+//!   so a single pathological QF_NIA instance returns `unknown` after that
+//!   wall-clock bound instead of hanging the process forever. This is purely a
+//!   *liveness* guarantee: z3 answers `unknown` on a trip, and every `check()`
+//!   site already routes `unknown` to a sound outcome — `check_obligation` and
+//!   `check_race` to [`Stop::SolverError`] (fail closed), the Mul no-overflow
+//!   side-obligation (`try_discharge`) and the nonlinear feasibility probe to
+//!   *tainted* / `OutOfSubset`. So shrinking the bound can only ever move a
+//!   `Proved` to `OutOfSubset`/`SolverError`, never the reverse — it cannot
+//!   manufacture a `Proved`. The value (10 s) is ~50x the measured worst-case
+//!   single check in the suite (0.20 s), generous enough never to trip on a real
+//!   kernel while still bounding a hang. See [`Z3_CHECK_TIMEOUT_MS`].
 //! - Values are modeled as *terms*, not fresh symbols: `value_of` builds a
 //!   substituted expression tree rather than declaring an SMT constant per
 //!   IR variable. Only genuine leaves get a declared constant: `AbsolutePos`,
@@ -814,19 +827,47 @@ pub fn prove_cooperative(
     prove_race_freedom_detailed(def, buffers, assumes, cube_dim, Some(expected_barriers))
 }
 
+/// Per-`check-sat` wall-clock bound handed to z3 as `(set-option :timeout N)`,
+/// in milliseconds.
+///
+/// **Liveness, not soundness.** QF_NIA (the nonlinear fragment a `LenEqProduct`
+/// row-stride obligation lives in) is undecidable, so a pathological instance
+/// could make a single `check-sat` run unboundedly. Without a bound the process
+/// would HANG rather than return a verdict; with it, z3 returns `unknown` on a
+/// trip, and every `check()` site routes `unknown` to a sound branch
+/// (`check_obligation`/`check_race` → [`Stop::SolverError`]; the Mul
+/// no-overflow `try_discharge` and the nonlinear feasibility probe → tainted /
+/// `OutOfSubset`). Shrinking this can therefore only turn a `Proved` into an
+/// `OutOfSubset`/`SolverError`, never the reverse — it is not a lever on
+/// soundness. 10 s is ~50x the measured worst-case single check in the suite
+/// (~0.20 s), so it never trips on a real kernel while still bounding a hang.
+const Z3_CHECK_TIMEOUT_MS: u64 = 10_000;
+
+/// Start the z3 context vericl proves against, with the per-`check-sat` liveness
+/// timeout ([`Z3_CHECK_TIMEOUT_MS`]) installed before any obligation is checked.
+/// The option is persistent, so it bounds every subsequent `check-sat` on this
+/// context. Returns the `SolverError` detail string on failure to start or
+/// configure z3 (the caller wraps it in its own result type).
+fn start_z3_context() -> Result<Context, String> {
+    let mut smt = ContextBuilder::new()
+        .solver("z3")
+        .solver_args(["-smt2", "-in"])
+        .build()
+        .map_err(|e| format!("failed to start z3: {e}"))?;
+    let ms = smt.numeral(Z3_CHECK_TIMEOUT_MS);
+    smt.set_option(":timeout", ms).map_err(|e| format!("failed to set z3 :timeout: {e}"))?;
+    Ok(smt)
+}
+
 fn prove_bounds_freedom_impl(
     def: &KernelDefinition,
     buffers: &[BufferParam],
     assumes: &[Assume],
     topology: TopologyMode,
 ) -> ProveResult {
-    let mut smt = match ContextBuilder::new().solver("z3").solver_args(["-smt2", "-in"]).build() {
+    let mut smt = match start_z3_context() {
         Ok(ctx) => ctx,
-        Err(e) => {
-            return ProveResult::SolverError {
-                detail: format!("failed to start z3: {e}"),
-            };
-        }
+        Err(detail) => return ProveResult::SolverError { detail },
     };
 
     let mut prover = Prover {
@@ -912,11 +953,9 @@ fn prove_race_freedom_detailed(
             };
         }
     }
-    let mut smt = match ContextBuilder::new().solver("z3").solver_args(["-smt2", "-in"]).build() {
+    let mut smt = match start_z3_context() {
         Ok(ctx) => ctx,
-        Err(e) => {
-            return CooperativeProof::SolverError { detail: format!("failed to start z3: {e}") };
-        }
+        Err(detail) => return CooperativeProof::SolverError { detail },
     };
 
     // Static thread-varying taint (§5.4): a pure pass over the IR, used to
@@ -1075,6 +1114,56 @@ impl Stop {
 
 fn smt_err(e: std::io::Error) -> Stop {
     Stop::SolverError(format!("z3 I/O error: {e}"))
+}
+
+/// The feasibility verdict for the global length facts, given the solver's
+/// `check-sat` `response` and whether any `LenEqProduct` put a nonlinear fact in
+/// force. Factored out of [`Prover::assert_structured_assumes`] so the exact
+/// risk-5 routing — `has_product_assume && Unknown => OutOfSubset`
+/// (docs/design-2d-dispatch.md §13 risk 5) — is unit-testable without a solver.
+///
+/// - `Unsat`: the contract is contradictory; every obligation would discharge
+///   vacuously, so reject `OutOfSubset` rather than yield a false `Proved`.
+/// - `Unknown` **with** a product assume: an undecided *nonlinear* context could
+///   be contradictory and would then vacuously discharge everything, so it is
+///   rejected. This is the branch a per-check timeout (see [`Z3_CHECK_TIMEOUT_MS`])
+///   can now actually reach — a hang would previously have prevented the solver
+///   from ever returning `unknown` here.
+/// - `Unknown` **without** a product assume, or `Sat`: allowed through. The
+///   linear length facts are decidable, so z3 does not answer `unknown` on them
+///   in practice; treating an `unknown` conservatively as "not provably
+///   contradictory" cannot cause a false `Proved` because each obligation is
+///   still discharged independently.
+fn feasibility_from_response(response: Response, has_product_assume: bool) -> Result<(), Stop> {
+    if response == Response::Unsat {
+        return Err(Stop::OutOfSubset(
+            "the declared assumptions are mutually contradictory (their conjunction is \
+             unsatisfiable) — a contradictory contract would vacuously discharge every bounds \
+             obligation, so it is rejected rather than yielding a false `Proved`"
+                .into(),
+        ));
+    }
+    if has_product_assume && response == Response::Unknown {
+        return Err(Stop::OutOfSubset(
+            "the solver returned `unknown` for the feasibility of this kernel's assumptions, \
+             which include a nonlinear `A.len() == (x as usize) * (y as usize)` product. \
+             Unlike the linear length facts — where `unknown` is treated as \"not provably \
+             contradictory\" and allowed through — an undecided nonlinear context could be \
+             contradictory and would then vacuously discharge every bounds obligation, so it \
+             is rejected (docs/design-2d-dispatch.md §13 risk 5)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Run the length-fact feasibility `check-sat` on `smt` and apply
+/// [`feasibility_from_response`]. The `check-sat` is bounded by the per-context
+/// `:timeout` ([`Z3_CHECK_TIMEOUT_MS`]), so a pathological nonlinear instance
+/// returns `unknown` here rather than hanging.
+fn length_feasibility_verdict(smt: &mut Context, has_product_assume: bool) -> Result<(), Stop> {
+    let response = smt.check().map_err(smt_err)?;
+    feasibility_from_response(response, has_product_assume)
 }
 
 /// An indexable array operand: a global input/output buffer (bounded by a
@@ -1593,26 +1682,7 @@ impl<'a, 'b> Prover<'a, 'b> {
         //     contract is contradictory" while the walk went on to discharge
         //     everything vacuously against it. When a product assume is present,
         //     `unknown` is therefore `OutOfSubset` rather than allowed through.
-        let feasibility = self.smt.check().map_err(smt_err)?;
-        if feasibility == Response::Unsat {
-            return Err(Stop::OutOfSubset(
-                "the declared assumptions are mutually contradictory (their conjunction is \
-                 unsatisfiable) — a contradictory contract would vacuously discharge every bounds \
-                 obligation, so it is rejected rather than yielding a false `Proved`"
-                    .into(),
-            ));
-        }
-        if has_product_assume && feasibility == Response::Unknown {
-            return Err(Stop::OutOfSubset(
-                "the solver returned `unknown` for the feasibility of this kernel's assumptions, \
-                 which include a nonlinear `A.len() == (x as usize) * (y as usize)` product. \
-                 Unlike the linear length facts — where `unknown` is treated as \"not provably \
-                 contradictory\" and allowed through — an undecided nonlinear context could be \
-                 contradictory and would then vacuously discharge every bounds obligation, so it \
-                 is rejected (docs/design-2d-dispatch.md §13 risk 5)"
-                    .into(),
-            ));
-        }
+        length_feasibility_verdict(self.smt, has_product_assume)?;
         // (2) ELEMENT-RANGE BOUNDS. An element bound asserts nothing global — it
         //     is consulted only at a read of `arr`, where `model_element_read`
         //     models the read value `v` as a fresh element of `arr`'s type
@@ -8989,6 +9059,20 @@ mod tests {
         }
     }
 
+    /// The same, on the **Z axis** — round 12 found the wrap witness iterated
+    /// only x and y, so a diverged Z recomposition (a Z-only `- wrap*2^32` drop)
+    /// passed every test while flipping a rank-3 Z-guarded / Z-indexed kernel to
+    /// a false `Proved`. A rank-3 dispatch (`d` is the third extent) is required
+    /// so the Z axis is enabled and `abs_z` can wrap.
+    #[cube(launch)]
+    fn prover_test_dispatch_absz_guard_cubez_index(out: &mut Array<f32>, w: u32, h: u32, d: u32) {
+        let _ = w + h + d;
+        let n = out.len() as u32;
+        if ABSOLUTE_POS_Z < n {
+            out[CUBE_POS_Z as usize] = 1.0f32;
+        }
+    }
+
     /// One `&mut Array<f32>` output plus the two `u32` extents `w`, `h`, built
     /// at the pinned `(16, 16)` cube dim — the shape every 2-D prover test here
     /// uses. A macro rather than a function taking a closure: the `expand`
@@ -9010,14 +9094,47 @@ mod tests {
         }};
     }
 
+    /// The rank-3 sibling of `build_dispatch_out_w_h!`: `out`, three `u32`
+    /// extents `w, h, d`, pinned at the `(16, 16, 16)` cube so the Z axis is
+    /// enabled and `abs_z` can wrap.
+    macro_rules! build_dispatch_out_w_h_d {
+        ($k:path) => {{
+            let mut b = KernelBuilder::default();
+            b.runtime_properties(Default::default());
+            cubecl::ir::AddressType::U32.register(&mut b.scope);
+            let out = <Array<f32> as LaunchArg>::expand_output(
+                &ArrayCompilationArg { inplace: None },
+                &mut b,
+            );
+            let w = <u32 as LaunchArg>::expand(&Default::default(), &mut b);
+            let h = <u32 as LaunchArg>::expand(&Default::default(), &mut b);
+            let d = <u32 as LaunchArg>::expand(&Default::default(), &mut b);
+            $k(&mut b.scope, out, w, h, d);
+            b.build(KernelSettings::default().cube_dim(CubeDim::new_3d(16, 16, 16)))
+        }};
+    }
+
     #[test]
     fn dispatch_per_axis_wrap_witness_refutes_on_every_axis() {
-        for (axis, def) in [
-            ("x", build_dispatch_out_w_h!(prover_test_dispatch_absx_guard_cubex_index::expand)),
-            ("y", build_dispatch_out_w_h!(prover_test_dispatch_absy_guard_cubey_index::expand)),
+        for (axis, def, dims) in [
+            (
+                "x",
+                build_dispatch_out_w_h!(prover_test_dispatch_absx_guard_cubex_index::expand),
+                [16u32, 16, 1],
+            ),
+            (
+                "y",
+                build_dispatch_out_w_h!(prover_test_dispatch_absy_guard_cubey_index::expand),
+                [16, 16, 1],
+            ),
+            (
+                "z",
+                build_dispatch_out_w_h_d!(prover_test_dispatch_absz_guard_cubez_index::expand),
+                [16, 16, 16],
+            ),
         ] {
             let buffers = [BufferParam { name: "out", is_output: true }];
-            match prove_bounds_freedom_dispatch(&def, &buffers, &[], [16, 16, 1]) {
+            match prove_bounds_freedom_dispatch(&def, &buffers, &[], dims) {
                 ProveResult::Refuted { obligation, counterexample } => {
                     assert!(
                         obligation.contains("out"),
@@ -9289,17 +9406,17 @@ mod tests {
         }
     }
 
-    /// §13 risk 5: a **contradictory** pair of product assumes must be rejected,
-    /// not vacuously discharged. `a.len() == w*h` with `a.len() == 7` and
-    /// `w == h`-free is satisfiable; forcing the product to be simultaneously
-    /// two different constants is not.
+    /// §13 risk 5, the **`Unsat` arm**: a contradictory contract must be
+    /// rejected, not vacuously discharged. This fixture is contradictory
+    /// *linearly* — `out.len() == 6` and `out.len() == 7` — so z3 decides it
+    /// `Unsat` (the product fact `len == w*h` is present but not what makes it
+    /// contradictory). The companion test below covers the harder, previously
+    /// untested branch: a nonlinear context the solver cannot decide (`Unknown`)
+    /// with a product assume in force.
     #[test]
     fn contradictory_product_assumes_are_rejected_not_vacuously_proved() {
         let def = build_dispatch_out_w_h!(prover_test_dispatch_ew2d::expand);
         let buffers = [BufferParam { name: "out", is_output: true }];
-        // `len = w*y` for TWO different scalar pairs where one pair is (0,0) and
-        // the other is (0,1), plus `len = 0` and a nonzero scalar bound, is
-        // contradictory only via the nonlinear facts.
         let assumes = [
             Assume::LenEqProduct { a: "out", x_scalar: 0, y_scalar: 1 },
             Assume::LenEqConst { a: "out", value: 6 },
@@ -9317,12 +9434,155 @@ mod tests {
         }
     }
 
+    /// §13 risk 5, the **routing** — unit-tested without a solver so it is exact
+    /// and instant. `feasibility_from_response` is the whole verdict logic the
+    /// feasibility probe applies; the load-bearing line is that a nonlinear
+    /// `Unknown` (product assume present) is rejected while a linear `Unknown`
+    /// (no product) is allowed through. The reviewer's mutation — deleting the
+    /// `has_product_assume &&` conjunct, or replacing it with `false &&` — flips
+    /// exactly the second assertion here, which the shipped end-to-end fixtures
+    /// (all linearly decidable) could not see.
+    #[test]
+    fn feasibility_routing_rejects_a_nonlinear_unknown_only_with_a_product_assume() {
+        use super::Response::*;
+        // Unsat is always a rejection, product or not.
+        assert!(matches!(feasibility_from_response(Unsat, true), Err(Stop::OutOfSubset(_))));
+        assert!(matches!(feasibility_from_response(Unsat, false), Err(Stop::OutOfSubset(_))));
+        // Unknown WITH a product assume: rejected (the nonlinear branch).
+        match feasibility_from_response(Unknown, true) {
+            Err(Stop::OutOfSubset(r)) => assert!(r.contains("unknown") && r.contains("nonlinear")),
+            _ => panic!("a nonlinear unknown (product assume present) must be OutOfSubset"),
+        }
+        // Unknown WITHOUT a product assume: allowed through (linear facts are
+        // decidable; a conservative unknown cannot cause a false Proved here).
+        assert!(feasibility_from_response(Unknown, false).is_ok(), "linear unknown must pass");
+        // Sat: feasible, allowed through.
+        assert!(feasibility_from_response(Sat, true).is_ok());
+        assert!(feasibility_from_response(Sat, false).is_ok());
+    }
+
+    /// §13 risk 5 + the per-check liveness timeout, END TO END: a genuinely hard
+    /// QF_NIA feasibility instance must return a verdict (here `unknown`, routed
+    /// to `OutOfSubset`) **within the bound**, not hang forever. Built on the
+    /// real [`start_z3_context`] so the shipped [`Z3_CHECK_TIMEOUT_MS`] is what
+    /// bounds it. The instance is the reviewer's factoring trap
+    /// `x*y*(y*z) == P` (prime), `x, y, z > 1`, all `u32`-range — z3 could not
+    /// close it in over 30 s unbounded; under the timeout it answers `unknown`.
+    /// Since a product fact is in force, that routes to `OutOfSubset` (never a
+    /// false `Proved`, never a hang). Naturally slow (~timeout); it is the one
+    /// test that proves the bound exists.
+    #[test]
+    fn a_hard_nonlinear_feasibility_check_returns_within_the_bound_not_a_hang() {
+        use std::time::Instant;
+        let mut smt = start_z3_context().expect("z3 must start");
+        let int = smt.int_sort();
+        let cap = smt.numeral(4_294_967_296u64); // 2^32
+        let one = smt.numeral(1u64);
+        let leaf = |smt: &mut Context, n: &str| {
+            let v = smt.declare_const(n, int).expect("declare");
+            let gt1 = smt.gt(v, one);
+            smt.assert(gt1).expect("assert >1"); // x, y, z > 1 (blocks the trivial 1-factor)
+            let lt = smt.lt(v, cap);
+            smt.assert(lt).expect("assert <2^32"); // u32 range
+            v
+        };
+        let x = leaf(&mut smt, "hx");
+        let y = leaf(&mut smt, "hy");
+        let z = leaf(&mut smt, "hz");
+        let xy = smt.times(x, y);
+        let yz = smt.times(y, z);
+        let prod = smt.times(xy, yz); // x*y^2*z
+        let prime = smt.numeral(3_221_225_473u64); // prime near 3*2^30
+        let eq = smt.eq(prod, prime);
+        smt.assert(eq).expect("assert product == prime");
+
+        let start = Instant::now();
+        let verdict = length_feasibility_verdict(&mut smt, /* has_product_assume */ true);
+        let elapsed = start.elapsed();
+
+        match verdict {
+            Err(Stop::OutOfSubset(reason)) => assert!(
+                reason.contains("unknown"),
+                "a timed-out nonlinear feasibility check must route through the unknown branch: \
+                 {reason}"
+            ),
+            Ok(()) => panic!(
+                "expected OutOfSubset(unknown) from the bounded hard instance; got Ok — the check \
+                 returned feasible instead of routing through the timeout/unknown branch"
+            ),
+            Err(Stop::SolverError(detail)) => {
+                panic!("expected OutOfSubset(unknown), got SolverError: {detail}")
+            }
+            Err(Stop::Refuted { .. }) => panic!("expected OutOfSubset(unknown), got Refuted"),
+        }
+        // The whole point: it RETURNED. A missing timeout would hang here. Allow
+        // generous slack over the 10 s bound for a loaded machine, but far below
+        // the 30 s+ the instance needs unbounded.
+        assert!(
+            elapsed.as_secs() < 25,
+            "the per-check timeout must bound the hang; took {elapsed:?}"
+        );
+    }
+
     /// This module's own source, with `mod tests` removed — so a source-level
     /// assertion below cannot be satisfied by its own string literal (which
     /// would make it vacuous rather than discriminating).
     fn non_test_source() -> &'static str {
         let src = include_str!("prover.rs");
         src.split("#[cfg(test)]\nmod tests {").next().expect("split always yields a first part")
+    }
+
+    /// `let <name> = <rhs>` split, tolerant of `let mut`.
+    fn split_let(line: &str) -> Option<(&str, &str)> {
+        let rest = line.trim().strip_prefix("let ")?;
+        let eq = rest.find(" = ")?;
+        let name = rest[..eq].trim().rsplit(' ').next()?;
+        Some((name, &rest[eq + 3..]))
+    }
+
+    /// The comma-separated argument idents of the FIRST `<needle>(...)` call in
+    /// `hay`. Assumes ident args (no nested parens) — true for every
+    /// position-recomposition arithmetic line this backstops.
+    fn call_args<'a>(hay: &'a str, needle: &str) -> Option<Vec<&'a str>> {
+        let start = hay.find(needle)? + needle.len();
+        let tail = &hay[start..];
+        let close = tail.find(')')?;
+        Some(tail[..close].split(',').map(str::trim).collect())
+    }
+
+    /// Count, by SHAPE, the sites that build the round-5 modular recomposition
+    /// `pos = cube*dim + unit - wrap*2^32`: a `self.smt.sub(_, W)` whose
+    /// subtrahend `W` was bound by `self.smt.times(_, M)` for an `M` bound from
+    /// `wrap_modulus(..)`. Traces `let` bindings, so it is immune to local
+    /// renaming; distinguishes the recomposition (subtracts a *multiple* of the
+    /// modulus) from `wrap_to_range` (subtracts the modulus itself). See the
+    /// caller for the documented residual.
+    fn count_wrap_multiple_subtractions(src: &str) -> usize {
+        // Names bound from `wrap_modulus(..)`.
+        let modulus_names: Vec<&str> = src
+            .lines()
+            .filter_map(|l| {
+                let (name, rhs) = split_let(l)?;
+                rhs.contains("wrap_modulus").then_some(name)
+            })
+            .collect();
+        // Names bound by `self.smt.times(a, b)` with `a` or `b` a modulus name —
+        // i.e. a multiple of the wrap modulus.
+        let wrap_multiple_names: Vec<&str> = src
+            .lines()
+            .filter_map(|l| {
+                let (name, rhs) = split_let(l)?;
+                let args = call_args(rhs, "self.smt.times(")?;
+                args.iter().any(|a| modulus_names.contains(a)).then_some(name)
+            })
+            .collect();
+        // `self.smt.sub(_, W)` whose subtrahend `W` is a wrap-multiple name.
+        src.lines()
+            .filter(|l| {
+                call_args(l, "self.smt.sub(")
+                    .is_some_and(|args| args.len() == 2 && wrap_multiple_names.contains(&args[1]))
+            })
+            .count()
     }
 
     /// The **risk-1 structural** property, asserted as a property of the code
@@ -9332,29 +9592,62 @@ mod tests {
     /// through it.
     ///
     /// A source-level test is the honest form here — the risk is that a *future*
-    /// edit adds a fourth copy, and no runtime verdict can see that. It reads
-    /// this file and counts the sites that assert the equation's shape.
+    /// edit adds a second copy, and no runtime verdict can see that. It reads
+    /// this file and counts, **by shape not by name**, the sites that build the
+    /// equation.
+    ///
+    /// What this guards, exactly: the recomposition ends in a
+    /// `self.smt.sub(sum, wraps)` whose subtrahend is a `self.smt.times(_, M)`
+    /// of a *multiple* of the wrap modulus (`M` bound from `wrap_modulus(..)`).
+    /// Subtracting a multiple of the wrap modulus is unique to this equation —
+    /// `wrap_to_range` subtracts the modulus itself, not a `times` of it, so it
+    /// is correctly not a site. [`count_wrap_multiple_subtractions`] traces the
+    /// `let` bindings, so renaming `sum`/`wraps`/`rhs` (the reviewer's defeat of
+    /// the previous literal-string match) cannot hide a second construction.
+    /// **Residual:** a hand-rolled copy that inlines the literal `4294967296`
+    /// instead of calling `wrap_modulus`, or forms the wrap term without a
+    /// `times` (e.g. a `plus` loop), or writes the whole equation on one line
+    /// with no intermediate `let`, is not counted — but the natural way to write
+    /// the recomposition uses `wrap_modulus` and `times`, and the true structural
+    /// guarantee remains the one-`recompose_pos`-fn + single-field `TopologyMode`
+    /// this test only backstops.
     #[test]
     fn the_position_recomposition_has_exactly_one_construction_site() {
         let src = non_test_source();
-        // The equation is `pos = cube*dim + unit - wrap*2^32`; its distinctive
-        // token is subtracting the wrap term from the recomposed sum.
-        let sites = src.matches("let rhs = self.smt.sub(sum, wraps);").count();
+        let sites = count_wrap_multiple_subtractions(src);
         assert_eq!(
             sites, 1,
             "docs/design-2d-dispatch.md §13 risk 1: the round-5 recomposition equation must have \
-             exactly ONE construction (`recompose_pos`). Found {sites}. Four copies kept apart \
-             only by a clause gate is precisely the failure mode the risk pre-registered — route \
-             the new caller through `recompose_pos` instead."
+             exactly ONE construction (`recompose_pos`). Found {sites} `sub`-of-a-wrap-multiple \
+             sites. A second copy kept apart only by a clause gate is precisely the failure mode \
+             the risk pre-registered — route the new caller through `recompose_pos` instead."
         );
-        // ...and both position builders must call it.
-        assert!(
-            src.contains("self.recompose_pos(\"abs_pos\", \"abs_wrap\", cube, unit, cube_dim)"),
-            "abs_pos_sym must build its recomposition through the shared implementation"
+        // Non-vacuous AND rename-proof: injecting a semantically-equivalent
+        // second construction with EVERY local renamed (exactly the reviewer's
+        // defeat of the old literal match) must push the count to 2.
+        let injected = format!(
+            "{src}\n        let m2 = self.smt.numeral(wrap_modulus(&address_type()));\n        \
+             let wterm = self.smt.times(kk, m2);\n        \
+             let recomposed = self.smt.sub(raw_sum, wterm);\n"
+        );
+        assert_eq!(
+            count_wrap_multiple_subtractions(&injected),
+            2,
+            "the structural detector must catch a renamed second recomposition — otherwise it is \
+             no stronger than the literal match it replaced"
+        );
+        // The one site lives in `recompose_pos`, which is defined once and has
+        // (at least) the two intended callers: `abs_pos_sym` and
+        // `abs_pos_axis_sym`. All name-robust: a rename of the locals cannot
+        // change these.
+        assert_eq!(
+            src.matches("fn recompose_pos(").count(),
+            1,
+            "`recompose_pos` must be the single definition the equation lives in"
         );
         assert!(
-            src.contains("let abs = self.recompose_pos("),
-            "abs_pos_axis_sym must build its recomposition through the shared implementation"
+            src.matches("self.recompose_pos(").count() >= 2,
+            "both position builders (`abs_pos_sym`, `abs_pos_axis_sym`) must route through it"
         );
     }
 
