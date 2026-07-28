@@ -179,6 +179,12 @@ pub fn differential_config(sizes: &[usize], seed: u64, cube_dim: u32) -> serde_j
         "sizes": sizes,
         "seed": seed,
         "cube_dim": cube_dim,
+        // The launch shape this evidence was produced under (§10.4 correction
+        // 2). A 1-D suite dispatches `CubeCount::Static(n, 1, 1)`; recording the
+        // rank is what lets a reader tell this claim apart from a
+        // `differential_dispatch_config` one instead of inferring it from the
+        // absence of a field.
+        "rank": 1,
         "reference": "vericl-macros sequential twin",
     })
 }
@@ -207,14 +213,66 @@ pub fn differential_vector_config(
     })
 }
 
-/// `config` JSON for a `Proved`/`smt-oob-freedom` claim.
+/// `config` JSON for a *multi-axis* (2-D/3-D) differential (`Tested`) claim
+/// (docs/design-2d-dispatch.md §4.8, §10.4 correction 2). The
+/// [`differential_vector_config`] precedent, for the same reason it exists:
+/// this claim's `sizes` are **extents** tuples, not thread counts, and saying
+/// so is what keeps two units from being read as one.
+///
+/// It also closes the recordable half of the D1 hole (§3.3): the 1-D
+/// [`differential_config`] records a *scalar* `cube_dim` and no cube count at
+/// all, so evidence could not distinguish the launch shape it was produced
+/// under. Here the full pinned `cube_dim` triple and the `rank` are recorded,
+/// and `differential_config` gains `"rank": 1` so old and new evidence are
+/// comparable.
 #[doc(hidden)] // generated-code plumbing (suite! claim config builder)
-pub fn proved_config(solver: &str, obligations: usize) -> serde_json::Value {
+pub fn differential_dispatch_config(
+    sizes: &[[usize; 3]],
+    seed: u64,
+    cube_dim: [u32; 3],
+    rank: u8,
+) -> serde_json::Value {
+    // Report each case at the clause's own arity — a rank-2 suite's sizes are
+    // (w, h) pairs, and padding them to triples in the record would invent a
+    // third extent the contract never mentions.
+    let sizes: Vec<Vec<usize>> =
+        sizes.iter().map(|e| e[..rank as usize].to_vec()).collect();
+    serde_json::json!({
+        "sizes": sizes,
+        "sizes_unit": "extents",
+        "seed": seed,
+        "cube_dim": cube_dim[..rank as usize].to_vec(),
+        "rank": rank,
+        "reference": "vericl-macros sequential multi-axis grid twin",
+    })
+}
+
+/// `config` JSON for a `Proved`/`smt-oob-freedom` claim.
+///
+/// `logic` is the logic actually in force for this kernel, not a constant
+/// (§10.4 correction 3): a `LenEqProduct` assume puts a genuinely nonlinear
+/// `len = x*y` in the global assertion context, so `QF_LIA` would be wrong
+/// there. (`checked_mul` already emitted variable×variable products under a
+/// `push`/`pop`, so the hardcoded label was a slight over-claim before this
+/// milestone too — this makes it honest rather than introducing the problem.)
+#[doc(hidden)] // generated-code plumbing (suite! claim config builder)
+pub fn proved_config_with_logic(
+    solver: &str,
+    obligations: usize,
+    logic: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "solver": solver,
-        "logic": "QF_LIA",
+        "logic": logic,
         "obligations": obligations,
     })
+}
+
+/// `config` JSON for a `Proved`/`smt-oob-freedom` claim in the linear-integer
+/// case — [`proved_config_with_logic`] at `QF_LIA`.
+#[doc(hidden)] // generated-code plumbing (suite! claim config builder)
+pub fn proved_config(solver: &str, obligations: usize) -> serde_json::Value {
+    proved_config_with_logic(solver, obligations, "QF_LIA")
 }
 
 /// The `check` string of the injected assumption a cooperative differential

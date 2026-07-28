@@ -669,6 +669,9 @@ fn build_interp_inputs(k: &Kernel, inp: &RefInputs) -> Inputs {
         scalars: vec![ScalarBinding::u32(0, inp.s[0]), ScalarBinding::u32(1, inp.s[1])],
         cube_dim: 64,
         num_threads: inp.num_threads,
+        // The fuzz corpus is 1-D by construction (it never emits a per-axis
+        // builtin), so the multi-axis launch is absent — see `Inputs::dispatch`.
+        dispatch: None,
     }
 }
 

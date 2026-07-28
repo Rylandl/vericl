@@ -284,7 +284,32 @@ one mechanical fix carried through (and proven to compile). `interp.rs` and
 8. **Adopt `TypeHash` as a standing tripwire** (once the upstream recursion
    overflow is fixed, or scoped to flat leaf kinds until then): pin the IR type
    hashes so the *next* schema drift trips a unit test, not a build wall.
-9. **Schedule a dedicated review round** for the upgrade itself — treat the
+9. **Re-verify the multi-axis topology mapping before trusting a single 2-D
+   claim** (added with the 2-D/3-D dispatch milestone, `docs/design-2d-dispatch.md`
+   §13 risk 8). Three properties of `cubecl-{wgpu,cpp,spirv,cpu}-0.10.0` are
+   *assumed by construction* in the per-axis twin, launch and prover, and every
+   one of them is a codegen detail upstream is free to change:
+   - **The flatten coefficients.** `ABSOLUTE_POS = x + y*Gx + z*Gx*Gy` with X
+     fastest, row-major, identically across WGSL, CUDA/HIP, SPIR-V and the CPU
+     runtime. A 0.11 that reorders them silently transposes every image kernel.
+   - **The per-axis identity** `ABSOLUTE_POS_a == (CUBE_POS_a * CUBE_DIM_a +
+     UNIT_POS_a) mod 2^32`, which is what `recompose_pos` encodes. This is the
+     one the prover's soundness rests on.
+   - **The axis mapping at the launch boundary** — `CubeCount::Static(x, y, z)`
+     reaching `workgroup_id.x/.y/.z` with no transposition.
+
+   The design's `axis_order` and `identity_sweep` probes check exactly these and
+   are cheap (1 212 threads over 6 shapes; 722 launch shapes with a closed-form
+   predicate agreeing 722/722). Re-run both against the new pin before porting
+   anything else in `interp.rs`/`prover.rs`. Separately, watch
+   `cubecl-opt`'s `analyses/integer_range.rs` — at 0.10 it asserts
+   `Builtin::CubeCountX` is the **constant** `opt.cube_dim.x`, which is simply
+   the wrong quantity. It is currently dead (nothing consumes `Ranges` outside
+   that file) and therefore harmless, but the moment it is wired into a
+   bounds-check-elimination pass every `CUBE_COUNT_*`-reading kernel is a
+   miscompile risk — and VeriCL's `Proved` claim is conditional on trusted
+   codegen, so it would not catch it.
+10. **Schedule a dedicated review round** for the upgrade itself — treat the
    prover re-anchoring as a soundness-critical change, not a mechanical bump.
 
 ## Files / tests run in the drill

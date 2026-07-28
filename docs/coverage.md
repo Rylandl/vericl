@@ -4,7 +4,7 @@
 
 This page exists to stop you wasting an afternoon. VeriCL's supported subset is narrow and
 deliberately so — every construct outside it is a compile error rather than a silent approximation
-(see [the rejection reference](guide.md#11-reading-rejections)). But "narrow" is not useful
+(see [the rejection reference](guide.md#12-reading-rejections)). But "narrow" is not useful
 guidance. What you want to know is whether *your* kernel is the kind of kernel this tool has
 anything to say about.
 
@@ -20,7 +20,14 @@ weaker than it looks, the caveat is on the row, not in a footnote.
 **Bring it if it is a 1-D elementwise, gather, stencil, RNG/hash, or shared-memory tree-reduction
 kernel over `Array<T>`.** Those are supported, exercised, and carry committed evidence.
 
-**Do not bring it yet if it needs 2-D/3-D dispatch, atomics, `plane_*` subgroup ops, or
+**Image-space 2-D/3-D kernels are supported as of the dispatch milestone** — elementwise,
+transpose and *branch-free clamped* stencils, opted in with
+`dispatch(cube_dim = (16, 16), extents = (w, h))`. Read the row and
+[its section](#image-space-2-d--3-d-dispatch) before you assume that covers your image kernel: 2-D
+shared-memory tiles are still rejected, and the enabling length assume is binary, so a
+`w x h x d` volume index is differential-only.
+
+**Do not bring it yet if it needs 2-D shared-memory tiles, atomics, `plane_*` subgroup ops, or
 `Tensor`/`View`/`cmma` tiling.** The first three are on the gap-closure plan below; the fourth is
 deliberately out.
 
@@ -44,8 +51,8 @@ project is against.
 - **Status** — supported / partial / planned / out.
 
 Scope of the whole table: **CubeCL 0.10 pinned** (`cubecl = "=0.10.0"`), backend `wgpu<wgsl>` with an
-opt-in `cubecl-cpu` second lane (`--features cpu`). Committed evidence today is **33 entries across
-three manifests, 117 machine-checked obligations, 22 of them race obligations**.
+opt-in `cubecl-cpu` second lane (`--features cpu`). Committed evidence today is **37 entries across
+four manifests, 132 machine-checked obligations, 22 of them race obligations**.
 
 ---
 
@@ -60,7 +67,10 @@ three manifests, 117 machine-checked obligations, 22 of them race obligations**.
 | **Tree / grid-stride reduction** (shared memory) | yes — `block_sum_reduce`, `emitter_reduce` (evidence); `grid_stride_reduce`, `comptime_window_reduce`, `composed_sq_reduce` (test only) | yes (8 obligations each) | **yes** (11 obligations each) | **supported** — opt-in `cooperative(cube_dim = N)`; **1-D only**; power-of-two `cube_dim`; one recognized tree-loop shape |
 | **RNG / hash / bit-mixing** | yes — `xorshift_step`, `mix_u32`, `lcg_map`, `counter_split_map`, `unit_interval_map`, `mul_hi_map`, `uniform_value_map` | yes | not checked | **supported** — integer overflow requires the `wrapping` clause |
 | **Scatter-add / histogram** (atomics) | no | no | no | **PLANNED** — [M-B](#the-gap-closure-plan). `Atomic*` rejected at compile time today |
-| **Image-space 2-D / 3-D dispatch** | no | no | no | **PLANNED** — [M-A](#the-gap-closure-plan), design in flight. All `*_X/_Y/_Z` position builtins rejected today |
+| **Image-space 2-D dispatch — elementwise / transpose** | yes — `elementwise2d_scale`, `transpose2d`, `topology_report2d` (evidence, six image shapes) | yes | not checked | **supported** — opt-in `dispatch(cube_dim = (Wx, Wy), extents = (w, h))`; needs an `A.len() == (w as usize) * (h as usize)` assume; flat `ABSOLUTE_POS`/`CUBE_POS`/`CUBE_COUNT` rejected inside the clause |
+| **Image-space 2-D stencil / blur** (branch-free clamp) | yes — `box_blur3x3` (evidence, six image shapes, bit-exact) | yes (10 obligations) | not checked | **supported** — the clamp must be `u32::min`/`u32::max`, **not** an `if`; an `if`-based clamp is tainted by branch write-taint and is `OutOfSubset` |
+| **3-D dispatch** (`cube_dim` 3-tuple) | yes — `elementwise3d_scale` (test only, six volume shapes) | **no** | not checked | **partial** — the launch, twin and per-axis leaves are all rank-3; but a `w*h*d` length fact is not expressible (the product assume is binary), so a volume index is `OutOfSubset` |
+| **2-D shared-memory tiles** (tiled matmul, separable filters with a tile) | no | no | no | **PLANNED** — `dispatch(...)` and `cooperative(...)` are mutually exclusive in v1, with a targeted error. Measured: the intra-cube half is cheap, the inter-cube write-disjointness half times out in z3 at 180 s and needs a new pattern recognizer ([design §8](design-2d-dispatch.md)) |
 | **Subgroup / warp reductions** (`plane_*`) | no | no | no | **PLANNED** — [M-C](#the-gap-closure-plan). `plane_*` rejected at compile time today |
 | **Tiled matmul / conv / attention** (`Tensor`/`View`/`cmma`) | no | no | no | **out of scope**, with rationale below. `View`/`Layout` and `Tensor` params rejected with targeted errors; **`cmma` is not** — it fails downstream instead |
 | **Framework-generic trait kernels** | element-type generics only — `axpy`, `fir3`, `gain_kernel`, `vec_add` | same | not checked | **partial** — `<F: Float>` pinned by `instantiate(...)` works; a user-defined `#[cube] trait` does not, and is not rejected with a targeted error |
@@ -203,14 +213,60 @@ bit-exact-associative accumulations do not have this problem. A design that quie
 order and calls the agreement a pass would be exactly the kind of claim this project exists to
 prevent.
 
-### Image-space 2-D / 3-D dispatch — PLANNED
+### Image-space 2-D / 3-D dispatch
 
-Rejected today, always, including under `cooperative(...)`: `ABSOLUTE_POS_X/Y/Z`, `UNIT_POS_X/Y/Z`,
-`CUBE_POS_X/Y/Z`, `CUBE_DIM_X/Y/Z`, `CUBE_COUNT_X/Y/Z`. They produce the generic out-of-subset error
-rather than a "add a clause" hint, because there is no clause that admits them.
+Opt in with a `dispatch(...)` clause and index with the per-axis builtins:
 
-This is [M-A](#the-gap-closure-plan) and the design is in flight —
-[docs/design-2d-dispatch.md](design-2d-dispatch.md).
+```rust
+#[vericl::kernel(
+    dispatch(cube_dim = (16, 16), extents = (w, h)),
+    assumes(inp.len() == out.len(), inp.len() == (w as usize) * (h as usize)),
+    compare(max_ulp = 0),
+    gen(inp in -100.0..=100.0, out in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn box_blur3x3(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32) { … }
+```
+
+The clause un-bans `ABSOLUTE_POS_X/Y/Z`, `UNIT_POS_X/Y/Z`, `CUBE_POS_X/Y/Z`, `CUBE_DIM_X/Y/Z` and
+`CUBE_COUNT_X/Y/Z` for the axes its `cube_dim` arity enables, and keeps flat `CUBE_DIM` and
+`UNIT_POS`. It is required exactly when the body uses one of them, and rejected when it does not —
+the same biconditional `cooperative(...)` has.
+
+**X is the fastest-varying axis.** `inp[(y * w + x) as usize]` is a row-major image;
+`inp[(x * h + y) as usize]` is *in bounds* and *transposed*, and the proof will not catch it — a
+transposed image is a functional bug, not a memory-safety one. The differential lane will.
+
+Four things are narrower than "2-D works" would suggest, and each is a measurement:
+
+- **Flat `ABSOLUTE_POS`, `CUBE_POS` and `CUBE_COUNT` are rejected inside the clause.** In a
+  multi-axis dispatch `ABSOLUTE_POS` is *not* `CUBE_POS * CUBE_DIM + UNIT_POS`: it linearizes the
+  global thread grid, the other linearizes cube-major-then-unit. Swept on hardware over 722 launch
+  shapes the identity held in 189 and broke in 533 — 912 of 960 threads violate it at the image-like
+  `CubeCount(5,3,1) x CubeDim(8,8,1)`. Index with the per-axis builtins, or drop the clause and use
+  the flat 1-D form throughout.
+- **The clamp must be branch-free.** `let mut x2 = x; if x + 1 < w { x2 = x + 1; }` writes a mutable
+  local inside a branch arm, which branch write-taint correctly taints, so the neighbour index is
+  unmodelable. Write `let x2 = u32::min(x + 1, w - 1);` and `let x0 = u32::max(x, 1) - 1;` — both
+  lower to arithmetic the prover models exactly.
+- **The length assume is the enabling fact, and it is binary.** `abs_y * w` has no Euclidean parent
+  the way a flat kernel's `row * w` does, so without `A.len() == (w as usize) * (h as usize)` its
+  no-overflow side-obligation is unprovable and *every* 2-D kernel that indexes an array is
+  `OutOfSubset`. It must be written widen-then-multiply: `A.len() == (w * h) as usize` multiplies in
+  `u32` and then widens, so the executable predicate tests the wrapped product while the model
+  asserts the mathematical one — a false `Proved` at `w = 2, h = 2147483649`, rejected by name. And
+  because it is binary, a rank-3 volume index (`len == w*h*d`) has no expressible fact and stays
+  differential-only.
+- **`dispatch(...)` excludes `cooperative(...)`, `Vector<P, W>`, and a runtime `cube_struct!`
+  parameter**, each with a targeted error naming the reason.
+
+**Honest reach.** Of the 464 surveyed ecosystem device items, 39 name 2-D topology and **1** is
+sole-blocked by it; of the 22 private dogfood kernels, 2 are blocked and **0** solely. This is a
+capability-and-soundness milestone, not a coverage one — it is the shape external users most expect
+to work, and it is one of the two remaining walls in the private corpus, but a page of green image
+kernels is more persuasive than the number deserves.
+
+Design and measurements: [docs/design-2d-dispatch.md](design-2d-dispatch.md).
 
 ### Subgroup / warp reductions (`plane_*`) — PLANNED
 
@@ -358,10 +414,11 @@ controls, committed evidence, and an adversarial review.
 
 | | Milestone | State |
 |---|---|---|
-| **M-A** | **2-D / 3-D dispatch** — image-space kernels, the `_X`/`_Y`/`_Z` position builtins | design in flight, [docs/design-2d-dispatch.md](design-2d-dispatch.md) |
+| **M-A** | **2-D / 3-D dispatch** — image-space kernels, the `_X`/`_Y`/`_Z` position builtins | **landed** — [docs/design-2d-dispatch.md](design-2d-dispatch.md); the deferred half (2-D shared-memory tiles) is M-E below |
 | **M-B** | **Atomics** — scatter-add and histogram | queued; must resolve float-atomic-add ordering honesty first |
 | **M-C** | **`plane_*` subgroup reductions** | queued; must resolve the device-decided-width question first |
 | **M-D** | Loop `break` semantics on the twin side, and struct buffer fields | queued |
+| **M-E** | **2-D cooperative tiles** — `dispatch(...)` x `cooperative(...)`, i.e. tiled matmul's shape | queued with its cost already measured: the intra-cube race obligation discharges in <10 ms, the inter-cube one times out at 180 s and needs a 2-D write-pattern recognizer ([design §8](design-2d-dispatch.md)) |
 
 ### Explicitly out
 
@@ -375,8 +432,8 @@ controls, committed evidence, and an adversarial review.
 
 Two things are true at once: the subset is narrow, and the rejection is the product. A construct
 VeriCL cannot model faithfully produces a compile error naming the construct and pointing at
-[the rejection reference](guide.md#11-reading-rejections) — not a twin that quietly approximates it
+[the rejection reference](guide.md#12-reading-rejections) — not a twin that quietly approximates it
 and a green test run.
 
-Read [What VeriCL does not do](guide.md#12-what-vericl-does-not-do) before you rely on a green run,
+Read [What VeriCL does not do](guide.md#13-what-vericl-does-not-do) before you rely on a green run,
 whatever row you are in.

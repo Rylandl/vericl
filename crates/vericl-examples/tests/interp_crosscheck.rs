@@ -16,7 +16,7 @@
 //! additionally checked three-way against a real wgpu launch below.
 
 use vericl_examples::*;
-use vericl_ir::{Buffer, Inputs, Outcome, ScalarBinding, interpret_dispatch};
+use vericl_ir::{Buffer, Dispatch3, Inputs, Outcome, ScalarBinding, interpret_dispatch};
 
 // ---- a tiny deterministic RNG (no external dep) ----------------------------
 
@@ -87,6 +87,7 @@ fn interp_axpy_matches_twin() {
                     scalars: vec![ScalarBinding::f32(0, alpha)],
                     cube_dim: 256,
                     num_threads: n as u32,
+                    dispatch: None,
                 },
             );
             assert_f32_bits(&out[1].as_f32(), &y_ref, &format!("axpy n={n}"));
@@ -109,6 +110,7 @@ fn interp_xorshift_step_matches_twin() {
                 scalars: vec![],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_eq!(out[1].as_u32(), y_ref, "xorshift n={n}");
@@ -130,6 +132,7 @@ fn interp_mix_u32_matches_twin() {
                 scalars: vec![],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_eq!(out[1].as_u32(), y_ref, "mix_u32 n={n}");
@@ -154,6 +157,7 @@ fn interp_flatten_decode_scale_matches_twin() {
                     scalars: vec![ScalarBinding::u32(0, width), ScalarBinding::f32(0, scale)],
                     cube_dim: 256,
                     num_threads: n as u32,
+                    dispatch: None,
                 },
             );
             assert_f32_bits(&out[1].as_f32(), &y_ref, &format!("flatten n={n} w={width}"));
@@ -182,6 +186,7 @@ fn interp_gather_copy_matches_twin() {
                 scalars: vec![],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_f32_bits(&out[2].as_f32(), &y_ref, &format!("gather n={n}"));
@@ -204,6 +209,7 @@ fn interp_select_mode_matches_twin() {
                     scalars: vec![ScalarBinding::u32(0, mode)],
                     cube_dim: 256,
                     num_threads: n as u32,
+                    dispatch: None,
                 },
             );
             assert_f32_bits(&out[1].as_f32(), &y_ref, &format!("select_mode n={n} mode={mode}"));
@@ -227,6 +233,7 @@ fn interp_offset_window_matches_twin() {
                 scalars: vec![],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_f32_bits(&out[1].as_f32(), &y_ref, &format!("offset_window n={n}"));
@@ -250,6 +257,7 @@ fn interp_fir3_matches_twin() {
                 scalars: vec![],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_f32_bits(&out[1].as_f32(), &y_ref, &format!("fir3 n={n}"));
@@ -272,6 +280,7 @@ fn interp_gain_kernel_matches_twin() {
                 scalars: vec![ScalarBinding::f32(0, gain)],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_f32_bits(&out[1].as_f32(), &y_ref, &format!("gain_kernel n={n}"));
@@ -293,6 +302,7 @@ fn interp_lcg_map_matches_twin() {
                 scalars: vec![],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_eq!(out[1].as_u32(), y_ref, "lcg_map n={n}");
@@ -314,6 +324,7 @@ fn interp_comptime_shift_matches_twin() {
                 scalars: vec![],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_eq!(out[1].as_u32(), y_ref, "comptime_shift n={n}");
@@ -340,6 +351,7 @@ fn interp_mul_hi_map_matches_twin() {
                 scalars: vec![],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_eq!(out[2].as_u32(), y_ref, "mul_hi_map n={n}");
@@ -362,6 +374,7 @@ fn interp_unit_interval_map_matches_twin() {
                 scalars: vec![],
                 cube_dim: 256,
                 num_threads: n as u32,
+                dispatch: None,
             },
         );
         assert_f32_bits(&out[1].as_f32(), &y_ref, &format!("unit_interval_map n={n}"));
@@ -395,6 +408,7 @@ fn interp_vs_twin_vs_gpu_xorshift() {
             scalars: vec![],
             cube_dim: 256,
             num_threads: n as u32,
+            dispatch: None,
         },
     );
     let y_interp = out[1].as_u32();
@@ -439,7 +453,144 @@ fn interp_respects_guard_when_threads_exceed_length() {
             scalars: vec![ScalarBinding::f32(0, alpha)],
             cube_dim: 256,
             num_threads: 256,
+            dispatch: None,
         },
     );
     assert_f32_bits(&out[1].as_f32(), &y_ref, "axpy guard n=5 threads=256");
+}
+
+// ---------------------------------------------------------------------------
+// 2-D / 3-D dispatch (docs/design-2d-dispatch.md §12 M5).
+//
+// The interpreter's topology answers used to be pinned to a 1-D launch
+// (`AbsolutePosY => 0`, `CubeDimY => 1`) — correct then, and a round-11-style
+// *classification split* the moment a multi-axis launch exists. These two tests
+// pin both halves: with the launch supplied the interpreter agrees with the twin
+// thread-for-thread; without it, a multi-axis kernel is `Unsupported` rather
+// than silently mis-placed.
+// ---------------------------------------------------------------------------
+
+/// The grid a `dispatch(cube_dim = (Wx, Wy))` kernel is launched at for image
+/// extents `(w, h)` — the same derivation `conformance_case` and the twin share.
+fn grid_for(cube_dim: [u32; 3], e: [u32; 3]) -> Dispatch3 {
+    let g = [
+        e[0].div_ceil(cube_dim[0]).max(1) * cube_dim[0],
+        e[1].div_ceil(cube_dim[1]).max(1) * cube_dim[1],
+        e[2].div_ceil(cube_dim[2]).max(1) * cube_dim[2],
+    ];
+    Dispatch3 { cube_dim, grid: g }
+}
+
+/// The §6 clamped blur, interpreted over a real 2-D grid, must match the
+/// generated twin bit-for-bit — the third independent semantics implementation
+/// agreeing with the first two on the milestone's headline kernel.
+///
+/// NEGATIVE CONTROL, and the reason this test discriminates: reverting
+/// `builtin` to the old pinned `AbsolutePosY => 0` answers makes every thread
+/// read row 0, so the interpreted image is a vertical smear of the first row and
+/// this comparison fails at once for any `h > 1`. Two of the four shapes here
+/// have `h > 1` on purpose.
+#[test]
+fn interp_box_blur3x3_matches_twin_over_a_2d_grid() {
+    let def = box_blur3x3_vericl::kernel_definition();
+    let cube_dim = box_blur3x3_vericl::DISPATCH_CUBE_DIM.expect("a dispatch kernel");
+    let mut rng = Rng::new(0x2D);
+    for [w, h] in [[37u32, 19u32], [8, 8], [1, 1], [3, 33]] {
+        let n = (w * h) as usize;
+        let inp: Vec<f32> = (0..n).map(|_| rng.f32(-100.0, 100.0)).collect();
+        let out0 = vec![0f32; n];
+
+        let d = grid_for(cube_dim, [w, h, 1]);
+        let mut twin = out0.clone();
+        box_blur3x3_vericl::reference(&inp, &mut twin, w, h, (d.grid[0], d.grid[1], d.grid[2]));
+
+        let got = interp(
+            &def,
+            Inputs {
+                buffers: vec![
+                    Buffer::f32("inp", &inp, false),
+                    Buffer::f32("out", &out0, true),
+                ],
+                scalars: vec![ScalarBinding::u32(0, w), ScalarBinding::u32(1, h)],
+                cube_dim: cube_dim[0] * cube_dim[1] * cube_dim[2],
+                num_threads: d.grid[0] * d.grid[1] * d.grid[2],
+                dispatch: Some(d),
+            },
+        );
+        assert_f32_bits(&got[1].as_f32(), &twin, &format!("box_blur3x3 {w}x{h}"));
+    }
+}
+
+/// The rank-3 kernel, same check — three loops, three axis leaf sets.
+#[test]
+fn interp_elementwise3d_matches_twin_over_a_3d_grid() {
+    let def = elementwise3d_scale_vericl::kernel_definition();
+    let cube_dim = elementwise3d_scale_vericl::DISPATCH_CUBE_DIM.expect("a dispatch kernel");
+    let mut rng = Rng::new(0x3D);
+    for [w, h, dd] in [[7u32, 5u32, 3u32], [8, 8, 4], [1, 1, 1], [3, 3, 9]] {
+        let n = (w * h * dd) as usize;
+        let inp: Vec<f32> = (0..n).map(|_| rng.f32(-100.0, 100.0)).collect();
+        let out0 = vec![0f32; n];
+
+        let d = grid_for(cube_dim, [w, h, dd]);
+        let mut twin = out0.clone();
+        elementwise3d_scale_vericl::reference(
+            &inp,
+            &mut twin,
+            w,
+            h,
+            dd,
+            (d.grid[0], d.grid[1], d.grid[2]),
+        );
+
+        let got = interp(
+            &def,
+            Inputs {
+                buffers: vec![
+                    Buffer::f32("inp", &inp, false),
+                    Buffer::f32("out", &out0, true),
+                ],
+                scalars: vec![
+                    ScalarBinding::u32(0, w),
+                    ScalarBinding::u32(1, h),
+                    ScalarBinding::u32(2, dd),
+                ],
+                cube_dim: cube_dim[0] * cube_dim[1] * cube_dim[2],
+                num_threads: d.grid[0] * d.grid[1] * d.grid[2],
+                dispatch: Some(d),
+            },
+        );
+        assert_f32_bits(&got[1].as_f32(), &twin, &format!("elementwise3d {w}x{h}x{dd}"));
+    }
+}
+
+/// A multi-axis kernel presented with **1-D `Inputs`** must report
+/// `Unsupported`, never a guessed axis value. This is the fail-closed half of
+/// M5: the interpreter would otherwise answer `ABSOLUTE_POS_Y => 0` for every
+/// thread and produce a plausible, wrong image.
+#[test]
+fn interp_rejects_a_multi_axis_kernel_without_a_launch() {
+    let def = box_blur3x3_vericl::kernel_definition();
+    let n = 64usize;
+    let inp = vec![1.0f32; n];
+    let out0 = vec![0f32; n];
+    match interpret_dispatch(
+        &def,
+        &Inputs {
+            buffers: vec![Buffer::f32("inp", &inp, false), Buffer::f32("out", &out0, true)],
+            scalars: vec![ScalarBinding::u32(0, 8), ScalarBinding::u32(1, 8)],
+            cube_dim: 64,
+            num_threads: 64,
+            dispatch: None,
+        },
+    ) {
+        Outcome::Unsupported { reason } => assert!(
+            reason.contains("per-axis topology builtin"),
+            "the rejection must name the cause: {reason}"
+        ),
+        other => panic!(
+            "a multi-axis kernel with a 1-D launch must be Unsupported, not silently placed at \
+             y = z = 0: {other:?}"
+        ),
+    }
 }

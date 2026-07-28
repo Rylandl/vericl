@@ -1,0 +1,344 @@
+{
+  "vericl_version": "0.1.0",
+  "entries": [
+    {
+      "kernel": "elementwise2d_scale",
+      "identity": {
+        "source_hash": "sha256:ee442536becc51e36e7cd3afb0f62a9931cd84684c11c5b8bba5c40e449d24db",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:2dc77eeca0f4e6e932564d2d55a139df13760d130a5036b0f7ca49c7bb9fd5c5"
+      },
+      "contract": {
+        "assumes": [
+          "inp.len() == out.len()",
+          "out.len() ==(w as usize) *(h as usize)"
+        ],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": [
+              16,
+              16
+            ],
+            "rank": 2,
+            "reference": "vericl-macros sequential multi-axis grid twin",
+            "seed": 59649,
+            "sizes": [
+              [
+                37,
+                19
+              ],
+              [
+                64,
+                64
+              ],
+              [
+                1,
+                1
+              ],
+              [
+                3,
+                129
+              ],
+              [
+                129,
+                3
+              ],
+              [
+                255,
+                257
+              ]
+            ],
+            "sizes_unit": "extents"
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_NIA",
+            "obligations": 2,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    },
+    {
+      "kernel": "transpose2d",
+      "identity": {
+        "source_hash": "sha256:80e4855d9d2408526312b99ef01d59b2999d8bc70d38812a560667d5ad242475",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:f9548d7e939db0da4434638686d6847e622d445b7aaf734fd85bef8478b0c4ae"
+      },
+      "contract": {
+        "assumes": [
+          "inp.len() == out.len()",
+          "inp.len() ==(w as usize) *(h as usize)"
+        ],
+        "compare": "exact",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": [
+              16,
+              16
+            ],
+            "rank": 2,
+            "reference": "vericl-macros sequential multi-axis grid twin",
+            "seed": 59649,
+            "sizes": [
+              [
+                37,
+                19
+              ],
+              [
+                64,
+                64
+              ],
+              [
+                1,
+                1
+              ],
+              [
+                3,
+                129
+              ],
+              [
+                129,
+                3
+              ],
+              [
+                255,
+                257
+              ]
+            ],
+            "sizes_unit": "extents"
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_NIA",
+            "obligations": 2,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    },
+    {
+      "kernel": "box_blur3x3",
+      "identity": {
+        "source_hash": "sha256:84008bc3478e18ef5c30cb38b5c022abea3eba8b2146f3278197efa98ac09883",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:ed7bcc5218d0bda1c25ae661729becd7a12cff06fc126d6ef59b5318d45113c2"
+      },
+      "contract": {
+        "assumes": [
+          "inp.len() == out.len()",
+          "inp.len() ==(w as usize) *(h as usize)"
+        ],
+        "compare": "f32 max_ulp=0",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": [
+              16,
+              16
+            ],
+            "rank": 2,
+            "reference": "vericl-macros sequential multi-axis grid twin",
+            "seed": 59649,
+            "sizes": [
+              [
+                37,
+                19
+              ],
+              [
+                64,
+                64
+              ],
+              [
+                1,
+                1
+              ],
+              [
+                3,
+                129
+              ],
+              [
+                129,
+                3
+              ],
+              [
+                255,
+                257
+              ]
+            ],
+            "sizes_unit": "extents"
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_NIA",
+            "obligations": 10,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    },
+    {
+      "kernel": "topology_report2d",
+      "identity": {
+        "source_hash": "sha256:59d4dce02865128c0ee64fa477c686728b8a72fac2b7773dfafceb2bd24da03c",
+        "vericl_version": "0.1.0",
+        "ir_hash": "sha256:c96deac5f173de64cb2c6ffc4a46a69abff1d7e859cb4330ccdcd89d1f018020"
+      },
+      "contract": {
+        "assumes": [
+          "out.len() ==(w as usize) *(h as usize)"
+        ],
+        "compare": "exact",
+        "wrapping": false,
+        "instantiate": [],
+        "uses": []
+      },
+      "claims": [
+        {
+          "kind": "tested",
+          "check": "differential",
+          "backend": "\"wgpu<wgsl>\"",
+          "config": {
+            "cube_dim": [
+              16,
+              16
+            ],
+            "rank": 2,
+            "reference": "vericl-macros sequential multi-axis grid twin",
+            "seed": 59649,
+            "sizes": [
+              [
+                37,
+                19
+              ],
+              [
+                64,
+                64
+              ],
+              [
+                1,
+                1
+              ],
+              [
+                3,
+                129
+              ],
+              [
+                129,
+                3
+              ],
+              [
+                255,
+                257
+              ]
+            ],
+            "sizes_unit": "extents"
+          },
+          "result": {
+            "status": "pass"
+          }
+        },
+        {
+          "kind": "proved",
+          "check": "smt-oob-freedom",
+          "config": {
+            "logic": "QF_NIA",
+            "obligations": 1,
+            "solver": "z3 Z3 version 4.16.0 - 64 bit"
+          },
+          "result": {
+            "status": "pass"
+          }
+        }
+      ],
+      "trusted": [
+        "rustc codegen of the reference twin",
+        "vericl-macros source-to-reference derivation",
+        "\"wgpu<wgsl>\" buffer upload/readback integrity",
+        "GPU hardware",
+        "the solver binary (z3 Z3 version 4.16.0 - 64 bit) discharging the SMT bounds obligations",
+        "vericl-ir's obligation encoding (0 <= index < Length(array) in QF_LIA over the CubeCL IR)",
+        "cubecl front-end expansion (the proof is about the IR; codegen below the IR remains covered only by the tested differential claims)"
+      ]
+    }
+  ]
+}

@@ -29,6 +29,7 @@
           "backend": "\"cpu\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [

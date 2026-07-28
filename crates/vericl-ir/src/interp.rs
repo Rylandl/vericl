@@ -191,6 +191,29 @@ pub struct Inputs {
     /// Total dispatched threads — `AbsolutePos` ranges over `0..num_threads`,
     /// matching the twin's `for ABSOLUTE_POS in 0..n` loop.
     pub num_threads: u32,
+    /// The multi-axis launch, for a `dispatch(cube_dim = (…))` kernel
+    /// (docs/design-2d-dispatch.md §12 M5). `None` is the ordinary 1-D dispatch
+    /// described by `cube_dim`/`num_threads` above.
+    ///
+    /// **Why this cannot be inferred, and why its absence is a rejection.**
+    /// Before this milestone `builtin` answered `AbsolutePosY => 0` and
+    /// `CubeDimY => 1` — correct for a 1-D launch, and unreachable in practice
+    /// because the macro banned the per-axis idents. The moment a 2-D launch
+    /// exists those answers are a *classification split*: vericl's view of the
+    /// topology and the device's diverge, silently. So a kernel that names any
+    /// Y/Z per-axis builtin with `dispatch: None` is `Unsupported` — the
+    /// interpreter never guesses an axis value it cannot place.
+    pub dispatch: Option<Dispatch3>,
+}
+
+/// A multi-axis launch, as [`Inputs::dispatch`] carries it.
+#[derive(Clone, Copy, Debug)]
+pub struct Dispatch3 {
+    /// The clause's pinned per-axis cube dims (`Z = 1` for a rank-2 clause).
+    pub cube_dim: [u32; 3],
+    /// The thread grid, `ceil(e_a / W_a) * W_a` per axis — the same triple the
+    /// twin iterates, so the two run the identical thread set including padding.
+    pub grid: [u32; 3],
 }
 
 /// An out-of-bounds access the interpreter caught (rather than panicking).
@@ -347,6 +370,21 @@ pub fn interpret_dispatch(def: &KernelDefinition, inputs: &Inputs) -> Outcome {
         return Outcome::Unsupported { reason };
     }
 
+    if inputs.dispatch.is_none() {
+        if let Some(b) = multi_axis_builtin(&def.body) {
+            return Outcome::Unsupported {
+                reason: format!(
+                    "kernel reads the per-axis topology builtin `{b:?}`, which only has a \
+                     well-defined value under a multi-axis launch — supply `Inputs::dispatch` \
+                     with the clause's cube dims and grid. Answering 0/1 for the Y and Z axes is \
+                     correct only for a 1-D dispatch, and guessing it here would make the \
+                     interpreter's view of the topology diverge from the device's \
+                     (docs/design-2d-dispatch.md §12 M5)"
+                ),
+            };
+        }
+    }
+
     let const_arrays = collect_const_arrays(&def.body);
     let scalars: HashMap<(ElemType, Id), Val> =
         inputs.scalars.iter().map(|s| ((s.elem, s.id), s.val)).collect();
@@ -362,19 +400,40 @@ pub fn interpret_dispatch(def: &KernelDefinition, inputs: &Inputs) -> Outcome {
         budget: 0,
     };
 
-    for pos in 0..inputs.num_threads {
+    // The thread set, in the SAME order the corresponding twin runs it: flat
+    // `0..num_threads` for a 1-D dispatch, and Z outer -> Y -> X inner over the
+    // GRID for a multi-axis one (docs/design-2d-dispatch.md §4.7 property 1 —
+    // that order is the row-major flatten, so an aliasing-write kernel's final
+    // state matches the twin's).
+    let ctxs: Vec<ThreadCtx> = match inputs.dispatch {
+        None => (0..inputs.num_threads)
+            .map(|pos| ThreadCtx::new_1d(pos, interp.cube_dim, interp.num_threads))
+            .collect(),
+        Some(d) => {
+            let mut v = Vec::new();
+            for z in 0..d.grid[2] {
+                for y in 0..d.grid[1] {
+                    for x in 0..d.grid[0] {
+                        v.push(ThreadCtx::new_multi_axis(d, [x, y, z]));
+                    }
+                }
+            }
+            v
+        }
+    };
+
+    for (seq, ctx) in ctxs.iter().enumerate() {
         interp.env.clear();
         interp.local_arrays.clear();
         interp.budget = 0;
-        let ctx = ThreadCtx::new(pos, interp.cube_dim, interp.num_threads);
-        match interp.exec_scope(&def.body, &ctx) {
+        match interp.exec_scope(&def.body, ctx) {
             Ok(_) => {}
             Err(Halt::Oob(mut o)) => {
-                o.thread = pos;
+                o.thread = seq as u32;
                 return Outcome::OutOfBounds(o);
             }
             Err(Halt::DivByZero { detail }) => {
-                return Outcome::DivByZero { detail, thread: pos };
+                return Outcome::DivByZero { detail, thread: seq as u32 };
             }
             Err(Halt::Unsupported(reason)) => return Outcome::Unsupported { reason },
         }
@@ -383,24 +442,138 @@ pub fn interpret_dispatch(def: &KernelDefinition, inputs: &Inputs) -> Outcome {
     Outcome::Completed { buffers: interp.buffers }
 }
 
-/// Per-thread topology, reconstructed from a 1-D dispatch.
+/// The Y/Z per-axis topology builtins, whose value is only well defined once the
+/// launch shape is known. The X-axis ones are deliberately absent: under a 1-D
+/// dispatch `ABSOLUTE_POS_X == ABSOLUTE_POS`, `CUBE_DIM_X == CUBE_DIM` and so
+/// on, all exactly true, so a 1-D kernel reading them is placeable.
+fn multi_axis_builtin(scope: &Scope) -> Option<Builtin> {
+    fn is_multi_axis(b: Builtin) -> bool {
+        matches!(
+            b,
+            Builtin::AbsolutePosY
+                | Builtin::AbsolutePosZ
+                | Builtin::UnitPosY
+                | Builtin::UnitPosZ
+                | Builtin::CubePosY
+                | Builtin::CubePosZ
+                | Builtin::CubeDimY
+                | Builtin::CubeDimZ
+                | Builtin::CubeCountY
+                | Builtin::CubeCountZ
+        )
+    }
+    fn in_var(v: &Variable) -> Option<Builtin> {
+        match v.kind {
+            VariableKind::Builtin(b) if is_multi_axis(b) => Some(b),
+            _ => None,
+        }
+    }
+    use cubecl::ir::OperationReflect;
+    for inst in &scope.instructions {
+        if let Some(args) = inst.operation.args() {
+            if let Some(b) = args.iter().find_map(in_var) {
+                return Some(b);
+            }
+        }
+        if let Operation::Branch(br) = &inst.operation {
+            let found = match br {
+                Branch::If(i) => in_var(&i.cond).or_else(|| multi_axis_builtin(&i.scope)),
+                Branch::IfElse(i) => in_var(&i.cond)
+                    .or_else(|| multi_axis_builtin(&i.scope_if))
+                    .or_else(|| multi_axis_builtin(&i.scope_else)),
+                Branch::RangeLoop(r) => in_var(&r.start)
+                    .or_else(|| in_var(&r.end))
+                    .or_else(|| multi_axis_builtin(&r.scope)),
+                Branch::Loop(l) => multi_axis_builtin(&l.scope),
+                Branch::Switch(sw) => in_var(&sw.value)
+                    .or_else(|| multi_axis_builtin(&sw.scope_default))
+                    .or_else(|| sw.cases.iter().find_map(|(_, sc)| multi_axis_builtin(sc))),
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+    }
+    None
+}
+
+/// Per-thread topology. Every field is the value the *device* would report for
+/// that thread — the 1-D constructor reconstructs it from a flat position, the
+/// multi-axis one from a `(x, y, z)` grid coordinate using the per-axis
+/// relations, each of which is exact on hardware (measured 0 violations /
+/// 1 212 threads across 6 launch shapes, docs/design-2d-dispatch.md §1.3).
 struct ThreadCtx {
     abs_pos: u32,
     unit_pos: u32,
     cube_pos: u32,
     cube_dim: u32,
     cube_count: u32,
+    /// `[x, y, z]` per-axis values. For a 1-D dispatch these are
+    /// `[abs_pos, 0, 0]` / `[unit_pos, 0, 0]` / `[cube_pos, 0, 0]` /
+    /// `[cube_dim, 1, 1]` / `[cube_count, 1, 1]`, which is exactly what a 1-D
+    /// launch reports.
+    abs: [u32; 3],
+    unit: [u32; 3],
+    cube: [u32; 3],
+    dim: [u32; 3],
+    count: [u32; 3],
 }
 
 impl ThreadCtx {
-    fn new(abs_pos: u32, cube_dim: u32, num_threads: u32) -> Self {
-        let cube_count = num_threads.div_ceil(cube_dim.max(1));
+    fn new_1d(abs_pos: u32, cube_dim: u32, num_threads: u32) -> Self {
+        let cd = cube_dim.max(1);
+        let cube_count = num_threads.div_ceil(cd);
         ThreadCtx {
             abs_pos,
-            unit_pos: abs_pos % cube_dim.max(1),
-            cube_pos: abs_pos / cube_dim.max(1),
+            unit_pos: abs_pos % cd,
+            cube_pos: abs_pos / cd,
             cube_dim,
             cube_count,
+            abs: [abs_pos, 0, 0],
+            unit: [abs_pos % cd, 0, 0],
+            cube: [abs_pos / cd, 0, 0],
+            dim: [cube_dim, 1, 1],
+            count: [cube_count, 1, 1],
+        }
+    }
+
+    fn new_multi_axis(d: Dispatch3, abs: [u32; 3]) -> Self {
+        let w = [d.cube_dim[0].max(1), d.cube_dim[1].max(1), d.cube_dim[2].max(1)];
+        let unit = [abs[0] % w[0], abs[1] % w[1], abs[2] % w[2]];
+        let cube = [abs[0] / w[0], abs[1] / w[1], abs[2] / w[2]];
+        let count = [d.grid[0] / w[0], d.grid[1] / w[1], d.grid[2] / w[2]];
+        // The FLAT builtins, computed concretely from the same coordinates —
+        // the row-major flattens of §1.3, `mod 2^32` exactly as the emitted
+        // WGSL/CUDA/SPIR-V arithmetic wraps. The prover deliberately leaves
+        // these unmodeled in dispatch mode (the symbolic stride is a runtime
+        // product) and the macro rejects them (R1), but the interpreter has the
+        // concrete values in hand, so computing them is exact rather than a
+        // guess — and it keeps this file from being the one place that answers
+        // a topology question wrongly.
+        let gx = d.grid[0] as u64;
+        let gy = d.grid[1] as u64;
+        let abs_pos = ((abs[0] as u64)
+            .wrapping_add((abs[1] as u64).wrapping_mul(gx))
+            .wrapping_add((abs[2] as u64).wrapping_mul(gx).wrapping_mul(gy))
+            & 0xFFFF_FFFF) as u32;
+        let cube_pos = ((cube[0] as u64)
+            .wrapping_add((cube[1] as u64).wrapping_mul(count[0] as u64))
+            .wrapping_add(
+                (cube[2] as u64).wrapping_mul(count[0] as u64).wrapping_mul(count[1] as u64),
+            )
+            & 0xFFFF_FFFF) as u32;
+        ThreadCtx {
+            abs_pos,
+            unit_pos: unit[0] + unit[1] * w[0] + unit[2] * w[0] * w[1],
+            cube_pos,
+            cube_dim: w[0] * w[1] * w[2],
+            cube_count: count[0].saturating_mul(count[1]).saturating_mul(count[2]),
+            abs,
+            unit,
+            cube,
+            dim: d.cube_dim,
+            count,
         }
     }
 }
@@ -517,16 +690,26 @@ impl Interp {
 
     fn builtin(&self, b: Builtin, ctx: &ThreadCtx) -> Result<Val, Halt> {
         let v = match b {
-            Builtin::AbsolutePos | Builtin::AbsolutePosX => ctx.abs_pos,
-            Builtin::AbsolutePosY | Builtin::AbsolutePosZ => 0,
-            Builtin::UnitPos | Builtin::UnitPosX => ctx.unit_pos,
-            Builtin::UnitPosY | Builtin::UnitPosZ => 0,
-            Builtin::CubePos | Builtin::CubePosX => ctx.cube_pos,
-            Builtin::CubePosY | Builtin::CubePosZ => 0,
-            Builtin::CubeDim | Builtin::CubeDimX => ctx.cube_dim,
-            Builtin::CubeDimY | Builtin::CubeDimZ => 1,
-            Builtin::CubeCount | Builtin::CubeCountX => ctx.cube_count,
-            Builtin::CubeCountY | Builtin::CubeCountZ => 1,
+            Builtin::AbsolutePos => ctx.abs_pos,
+            Builtin::AbsolutePosX => ctx.abs[0],
+            Builtin::AbsolutePosY => ctx.abs[1],
+            Builtin::AbsolutePosZ => ctx.abs[2],
+            Builtin::UnitPos => ctx.unit_pos,
+            Builtin::UnitPosX => ctx.unit[0],
+            Builtin::UnitPosY => ctx.unit[1],
+            Builtin::UnitPosZ => ctx.unit[2],
+            Builtin::CubePos => ctx.cube_pos,
+            Builtin::CubePosX => ctx.cube[0],
+            Builtin::CubePosY => ctx.cube[1],
+            Builtin::CubePosZ => ctx.cube[2],
+            Builtin::CubeDim => ctx.cube_dim,
+            Builtin::CubeDimX => ctx.dim[0],
+            Builtin::CubeDimY => ctx.dim[1],
+            Builtin::CubeDimZ => ctx.dim[2],
+            Builtin::CubeCount => ctx.cube_count,
+            Builtin::CubeCountX => ctx.count[0],
+            Builtin::CubeCountY => ctx.count[1],
+            Builtin::CubeCountZ => ctx.count[2],
             _ => {
                 return Err(Halt::Unsupported(format!(
                     "topology builtin {b:?} is outside the interpreter v0 subset"
@@ -1525,7 +1708,7 @@ mod tests {
     // KernelBuilder, no client/runtime/device needed. -----------------------
 
     fn ins(buffers: Vec<Buffer>, scalars: Vec<ScalarBinding>, n: u32) -> Inputs {
-        Inputs { buffers, scalars, cube_dim: 256, num_threads: n }
+        Inputs { buffers, scalars, cube_dim: 256, num_threads: n, dispatch: None }
     }
 
     fn out_buf(o: &Outcome, id: usize) -> &Buffer {

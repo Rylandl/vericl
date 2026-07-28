@@ -19,9 +19,11 @@ evidence manifest that goes stale when anything it depends on changes.
 Bring it if it is a **1-D elementwise, gather, stencil, RNG/hash, or shared-memory tree-reduction**
 kernel over `Array<T>` — those are supported, exercised, and carry committed evidence. Vectorized
 `Vector<P, N>` elementwise, `cube_struct!`/`config!` struct arguments, and f64 work with caveats worth
-reading first. **Do not bring it yet** if it needs 2-D/3-D dispatch, atomics, or `plane_*` subgroup
-reductions — those are rejected at compile time today and are the next three milestones.
-`Tensor`/`View`/`cmma` tiling is deliberately out of scope, with reasons.
+reading first. Image-space **2-D/3-D dispatch** — elementwise, transpose, branch-free clamped
+stencils — is supported behind a `dispatch(...)` clause, with a narrower boundary than "2-D works"
+suggests (read the row). **Do not bring it yet** if it needs 2-D *shared-memory tiles*, atomics, or
+`plane_*` subgroup reductions — those are rejected at compile time today and are the next three
+milestones. `Tensor`/`View`/`cmma` tiling is deliberately out of scope, with reasons.
 
 **[docs/coverage.md](docs/coverage.md) is the per-kernel-class matrix** — differential-tested,
 bounds-proved, race-proved, and status for each class, every cell cited to a real example or test,
@@ -591,6 +593,65 @@ workgroup) and launches `(cube_count, cube_dim)`. The v1 subset is the 1-D reduc
 store); anything else — a barrier under a thread-varying condition (barrier divergence), a
 non-uniform tree loop, multiple tiles — is rejected with a targeted error, never mis-modelled.
 Design: `docs/design-shared-memory.md`.
+
+### The `dispatch(...)` clause: 2-D / 3-D image-space kernels
+
+```rust
+#[vericl::kernel(
+    dispatch(cube_dim = (16, 16), extents = (w, h)),
+    assumes(inp.len() == out.len(), inp.len() == (w as usize) * (h as usize)),
+    compare(max_ulp = 0),
+    gen(inp in -100.0..=100.0, out in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn box_blur3x3(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    if x < w && y < h {
+        let x0 = u32::max(x, 1u32) - 1u32;
+        let x2 = u32::min(x + 1u32, w - 1u32);
+        /* … y0, y2, nine adds … */
+        out[(y * w + x) as usize] = acc * 0.111111111f32;
+    }
+}
+```
+
+`dispatch(cube_dim = (Wx, Wy[, Wz]), extents = (e0, e1[, e2]))` is `cooperative(cube_dim = N)`'s
+precedent moved one position over: the pinned literal dims are the single source of truth for the
+launch's `CubeDim`, the twin's per-axis loop strides, and the prover's `CUBE_DIM_X/Y/Z` numerals —
+and pinning them is what keeps every position recomposition **linear**. `extents` names the kernel's
+own runtime `u32` extent parameters; the harness binds them from each case's declared size, derives
+`CubeCount::Static(ceil(e0/Wx), …)`, and sizes un-pinned buffers to their product. The twin becomes a
+**nested grid loop**, `for z { for y { for x { … } } }` over the *grid* (so padding threads run the
+guard exactly as on device) in Z→Y→X order (which is the flat `ABSOLUTE_POS` order, so a kernel
+ported from flat to per-axis addressing keeps the same aliasing-write convention).
+
+Three things are load-bearing and each is measured, not asserted:
+
+- **The flat `ABSOLUTE_POS`/`CUBE_POS`/`CUBE_COUNT` are rejected inside the clause.** The identity
+  the 1-D cooperative model encodes — `ABSOLUTE_POS == CUBE_POS * CUBE_DIM + UNIT_POS` — is **false**
+  in a multi-axis dispatch: swept on hardware over 722 launch shapes it held in 189 and broke in 533,
+  and 912 of 960 threads violate it at the image-like `CubeCount(5,3,1) x CubeDim(8,8,1)`. The
+  per-axis relations (`ABSOLUTE_POS_a == CUBE_POS_a * CUBE_DIM_a + UNIT_POS_a`) *are* exact — 0
+  violations in 1 212 threads — so those are what the twin and the prover both use, each through the
+  **same single** exact-modular recomposition the round-5 fix introduced. Flat `CUBE_DIM` and
+  `UNIT_POS` are kept: a numeral and a pinned-coefficient linear form, neither of which can wrap.
+- **`assumes(A.len() == (w as usize) * (h as usize))` is the enabling fact, not sugar.**
+  `ABSOLUTE_POS_Y * w` has no Euclidean parent, so without it the row stride's no-overflow
+  side-obligation is unprovable and *every* 2-D kernel that indexes an array is `OutOfSubset`. It
+  must be widen-then-multiply: the outer-cast spelling `(w * h) as usize` tests the **wrapped**
+  product in `check_assumes` while the model asserts the mathematical one — a false `Proved` at
+  `w = 2, h = 2147483649` with a length-2 buffer — and is rejected at the cast by name.
+- **The stencil clamp must be branch-free.** `if x + 1 < w { x2 = x + 1; }` writes a mutable local in
+  a branch arm, which round-2 branch write-taint correctly taints; `u32::min(x + 1, w - 1)` computes
+  the identical function and lowers to an `Arithmetic::Min` the prover models as an exact `ite`.
+
+`dispatch(...)` excludes `cooperative(...)` (2-D shared-memory tiles are deferred: the intra-cube
+race obligation discharges in under 10 ms, the inter-cube one times out in z3 at 180 s and needs a
+new write-pattern recognizer), `Vector<P, W>` (two `sizes_unit` conventions, undecided), and a
+runtime `cube_struct!` parameter. **Honest reach: 1 of 464 surveyed ecosystem items is sole-blocked
+by 2-D and 0 additional private kernels are unlocked** — this is a capability-and-soundness
+milestone, not a coverage one. Design: `docs/design-2d-dispatch.md`.
 
 ### Vector (SIMD) element support: `Array<Vector<P, N>>`
 

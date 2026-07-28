@@ -53,9 +53,49 @@ fn prove_kernel(
             vericl::StructuredAssume::LenPlusConstLe { a, k, b } => {
                 vericl_ir::Assume::LenPlusConstLe { a, k, b }
             }
+            vericl::StructuredAssume::LenEqProduct { a, x: _, y: _, x_scalar, y_scalar } => {
+                vericl_ir::Assume::LenEqProduct { a, x_scalar, y_scalar }
+            }
         })
         .collect();
     vericl_ir::prove_bounds_freedom(def, &buffers, &assumes)
+}
+
+/// [`prove_kernel`]'s multi-axis sibling — the `dispatch(...)` prover entry
+/// point, with the clause's pinned per-axis cube dims
+/// (docs/design-2d-dispatch.md §4.3).
+fn prove_kernel_dispatch(
+    def: &KernelDefinition,
+    buffer_params: &[(&str, bool)],
+    structured_assumes: &[vericl::StructuredAssume],
+    cube_dim: [u32; 3],
+) -> vericl_ir::ProveResult {
+    let buffers: Vec<vericl_ir::BufferParam> = buffer_params
+        .iter()
+        .map(|&(name, is_output)| vericl_ir::BufferParam { name, is_output })
+        .collect();
+    let assumes: Vec<vericl_ir::Assume> = structured_assumes
+        .iter()
+        .map(|a| match *a {
+            vericl::StructuredAssume::LenEq { a, b } => vericl_ir::Assume::LenEq { a, b },
+            vericl::StructuredAssume::LenEqConst { a, value } => {
+                vericl_ir::Assume::LenEqConst { a, value }
+            }
+            vericl::StructuredAssume::ElemsBelowLen { arr, len_of } => {
+                vericl_ir::Assume::ElemsBelowLen { arr, len_of }
+            }
+            vericl::StructuredAssume::ElemsBelowConst { arr, bound } => {
+                vericl_ir::Assume::ElemsBelowConst { arr, bound }
+            }
+            vericl::StructuredAssume::LenPlusConstLe { a, k, b } => {
+                vericl_ir::Assume::LenPlusConstLe { a, k, b }
+            }
+            vericl::StructuredAssume::LenEqProduct { a, x: _, y: _, x_scalar, y_scalar } => {
+                vericl_ir::Assume::LenEqProduct { a, x_scalar, y_scalar }
+            }
+        })
+        .collect();
+    vericl_ir::prove_bounds_freedom_dispatch(def, &buffers, &assumes, cube_dim)
 }
 
 /// Run the two-thread race-freedom prover for a cooperative kernel — the
@@ -265,6 +305,59 @@ fn main() {
             println!("      {}", vericl::describe_case_outcome(o));
         }
     }
+
+    // 2-D dispatch defect: the clamped stencil with the clamp DELETED — the
+    // design's own negative control (`p2d`) promoted to a kernel
+    // (docs/design-2d-dispatch.md §6, §12 M7). Two independent catches:
+    //
+    //  * the bounds proof REFUTES it, with the extents in the counterexample;
+    //  * the differential lane fails too, because the derived twin is ordinary
+    //    Rust and *panics* on the out-of-bounds read — reported as a finding by
+    //    `catch_reference_panic`, not as a harness crash.
+    //
+    // Its clamped sibling `box_blur3x3` is suite-wired and `Proved`, and the two
+    // differ by exactly the `u32::min`/`u32::max` calls, so this is what makes
+    // that `Proved` mean something.
+    println!("\n2-D dispatch bounds proof (the design's `p2d` negative control, as a kernel):");
+    let unclamped_def = box_blur3x3_unclamped_vericl::kernel_definition();
+    let unclamped_cd =
+        box_blur3x3_unclamped_vericl::DISPATCH_CUBE_DIM.expect("declares dispatch(...)");
+    match prove_kernel_dispatch(
+        &unclamped_def,
+        box_blur3x3_unclamped_vericl::BUFFER_PARAMS,
+        box_blur3x3_unclamped_vericl::contract().structured_assumes,
+        unclamped_cd,
+    ) {
+        vericl_ir::ProveResult::Refuted { obligation, counterexample } => {
+            println!("  [REFUTED] box_blur3x3_unclamped: {obligation}");
+            println!("    counterexample (validated in-checker): {counterexample}");
+            println!(
+                "  -> 2-D bounds defect caught (`inp[(y+1)*w + (x+1)]` leaves the image at the \
+                 bottom-right corner; the smallest witness is a 1x1 image reading inp[2] from a \
+                 length-1 buffer)"
+            );
+        }
+        other => {
+            eprintln!(
+                "  !! box_blur3x3_unclamped's bounds check did NOT refute ({other:?}) — this is a \
+                 vericl failure"
+            );
+            all_caught = false;
+        }
+    }
+
+    let unclamped_outcomes: Vec<_> = [[37usize, 19, 1], [64, 64, 1]]
+        .iter()
+        .map(|&e| {
+            box_blur3x3_unclamped_vericl::conformance_case::<R>(&client, e, SEED ^ 0x2D2D)
+        })
+        .collect();
+    demo_defect(
+        "box_blur3x3_unclamped",
+        &box_blur3x3_unclamped_vericl::contract().compare.describe(),
+        &unclamped_outcomes,
+        &mut all_caught,
+    );
 
     std::process::exit(if all_caught { 0 } else { 1 });
 }

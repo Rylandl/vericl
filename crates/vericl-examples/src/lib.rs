@@ -4855,3 +4855,349 @@ pub fn blend_mode_map(x: &Array<f32>, p: &BlendCfg, y: &mut Array<f32>) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 2-D / 3-D dispatch (docs/design-2d-dispatch.md) — per-axis topology in the
+// kernel body, gated by the `dispatch(cube_dim = (…), extents = (…))` clause.
+//
+// Three things make these kernels different from every example above, and all
+// three are the milestone:
+//
+//   * They index with the PER-AXIS builtins (`ABSOLUTE_POS_X`/`_Y`), which the
+//     twin rewrites to a nested grid loop (`for y { for x { … } }`, Z→Y→X, over
+//     the GRID so padding threads run the guard) and the prover models as
+//     per-axis leaves with a per-axis exact modular recomposition. The FLAT
+//     `ABSOLUTE_POS` is rejected inside the clause: in a multi-axis dispatch it
+//     is NOT `CUBE_POS * CUBE_DIM + UNIT_POS` — measured, the two disagree for
+//     912 of 960 threads at `CubeCount(5,3,1) x CubeDim(8,8,1)` (§2.2).
+//   * They carry the new `A.len() == (w as usize) * (h as usize)` assume. That
+//     is not ergonomics — it is the ENABLING fact: `abs_y * w` has no Euclidean
+//     parent the way a flat kernel's `row * w` does, so without the product
+//     assume its no-overflow side-obligation is genuinely unprovable and every
+//     2-D kernel is `OutOfSubset` (measured sat, `p2e`; unsat with it, `p2a`).
+//   * Their sizes are per-axis EXTENTS, so they live in their own suite
+//     (`tests/conformance_2d.rs`) with its own evidence file — the same
+//     precedent `conformance_f64.rs` set.
+//
+// **X is the fastest-varying axis.** A row-major image of width `w` is indexed
+// `inp[(y * w + x) as usize]`. Writing `inp[(x * h + y) as usize]` is *in
+// bounds* and *transposed* — vericl's proof will not catch it, because a
+// transposed image is a functional bug, not a memory-safety one. The
+// differential lane will (§10.3 R9).
+// ---------------------------------------------------------------------------
+
+/// 2-D elementwise — the coverage floor of the multi-axis subset, and the
+/// smallest kernel that exercises every new piece at once: the
+/// `dispatch(cube_dim = (16, 16), extents = (w, h))` clause, the per-axis guard
+/// `x < w && y < h`, row-major `y * w + x` addressing, and the
+/// `out.len() == (w as usize) * (h as usize)` product assume.
+///
+/// Bit-exact (`max_ulp = 0`): one multiply and one add per element, in the same
+/// order on both sides. Wired into `vericl::suite!` (`tests/conformance_2d.rs`)
+/// — carries `tested` (differential over six image shapes) + `proved`
+/// (SMT bounds, recorded logic `QF_NIA` because the product assume is
+/// nonlinear).
+#[vericl::kernel(
+    dispatch(cube_dim = (16, 16), extents = (w, h)),
+    assumes(inp.len() == out.len(), out.len() == (w as usize) * (h as usize)),
+    compare(max_ulp = 0),
+    gen(inp in -100.0..=100.0, out in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn elementwise2d_scale(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    if x < w && y < h {
+        let i = (y * w + x) as usize;
+        out[i] = inp[i] * 2.0f32 + 1.0f32;
+    }
+}
+
+/// Transpose — `out[x * h + y] = inp[y * w + x]`, the canonical
+/// decode/encode-*both-ways* kernel, and the reason the product assume matters
+/// beyond one direction.
+///
+/// It carries **two independent `checked_mul` side-obligations against two
+/// different extents** (`y * w` for the read, `x * h` for the write), and both
+/// discharge from the single product assume: `y <= h-1 ⟹ y*w <= w*h - w`, and
+/// `x <= w-1 ⟹ x*h <= w*h - h`. A flat 1-D kernel gets the equivalent fact for
+/// free from Euclidean division (`row*w <= ABSOLUTE_POS`); genuine per-axis
+/// addressing does not, which is §5's asymmetry in one kernel.
+///
+/// `u32` elements, so `compare(exact)` is unambiguous — a transpose is a pure
+/// permutation with no arithmetic to round.
+#[vericl::kernel(
+    dispatch(cube_dim = (16, 16), extents = (w, h)),
+    assumes(inp.len() == out.len(), inp.len() == (w as usize) * (h as usize)),
+    compare(exact)
+)]
+#[cube(launch)]
+pub fn transpose2d(inp: &Array<u32>, out: &mut Array<u32>, w: u32, h: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    if x < w && y < h {
+        out[(x * h + y) as usize] = inp[(y * w + x) as usize];
+    }
+}
+
+/// A clamped 3x3 box blur — the canonical image-space stencil, and the shape
+/// that decides whether the milestone is "2-D elementwise and transpose" or
+/// "the whole stencil class".
+///
+/// **The clamp must be branch-free, and that is a soundness fact, not a style
+/// choice.** The idiomatic spelling
+///
+/// ```ignore
+/// let mut x2 = x;
+/// if x + 1 < w { x2 = x + 1; }
+/// ```
+///
+/// writes a mutable local inside a branch arm, and round-2 branch write taint —
+/// a confirmed-critical fix with three false-`Proved` manifestations — taints
+/// `x2` after the arm closes, so the neighbour index is unmodelable no matter
+/// how much per-axis leaf modeling exists. `u32::min(x + 1, w - 1)` computes the
+/// identical function (under the guard `x < w`, so `x <= w-1`) and lowers to a
+/// single `Arithmetic::Min` instruction the prover models as an exact `ite` —
+/// one of the operands, both already in range, so no side-obligation, no wrap
+/// correction, no new leaf. Same for `u32::max(x, 1) - 1` at the low edge.
+///
+/// Bit-exact (`max_ulp = 0`): nine `f32` adds in a fixed order — the same order
+/// in the twin — then one multiply. No `a*b + c` shape anywhere, so there is no
+/// FMA-contraction question (unlike `vec_madd_bitexact`).
+///
+/// The worst index in the kernel is the bottom-right neighbour
+/// `min(y+1, h-1) * w + min(x+1, w-1)`; its obligation was hand-discharged as
+/// SMT-LIB before any of this was implemented (unsat in 0.20 s), together with
+/// its negative control — the same read with the clamp deleted — which is sat
+/// with the witness `w=1, h=1, x=0, y=0`, a 1x1 image reading `inp[2]` from a
+/// length-1 buffer. Both are pinned as tests
+/// (`box_blur3x3_worst_neighbour_obligation_discharges`,
+/// `unclamped_stencil_is_refuted_with_the_1x1_witness`).
+#[vericl::kernel(
+    dispatch(cube_dim = (16, 16), extents = (w, h)),
+    assumes(inp.len() == out.len(), inp.len() == (w as usize) * (h as usize)),
+    compare(max_ulp = 0),
+    gen(inp in -100.0..=100.0, out in 0.0..=0.0)
+)]
+#[cube(launch)]
+// The 1/9 literal is the design's own (`docs/design-2d-dispatch.md` §4.1) and is
+// deliberately written to more digits than f32 carries: the kernel and the twin
+// must round the SAME literal, and trimming it here would silently change the
+// computed function on both sides at once.
+#[allow(clippy::excessive_precision)]
+pub fn box_blur3x3(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    if x < w && y < h {
+        let x0 = u32::max(x, 1u32) - 1u32;
+        let x2 = u32::min(x + 1u32, w - 1u32);
+        let y0 = u32::max(y, 1u32) - 1u32;
+        let y2 = u32::min(y + 1u32, h - 1u32);
+        let mut acc = 0f32;
+        acc += inp[(y0 * w + x0) as usize];
+        acc += inp[(y0 * w + x) as usize];
+        acc += inp[(y0 * w + x2) as usize];
+        acc += inp[(y * w + x0) as usize];
+        acc += inp[(y * w + x) as usize];
+        acc += inp[(y * w + x2) as usize];
+        acc += inp[(y2 * w + x0) as usize];
+        acc += inp[(y2 * w + x) as usize];
+        acc += inp[(y2 * w + x2) as usize];
+        out[(y * w + x) as usize] = acc * 0.111111111f32;
+    }
+}
+
+/// 3-D dispatch — the same machinery at rank 3, which is a `cube_dim` tuple
+/// arity and nothing else: three loops in the twin instead of two, three
+/// per-axis leaf sets in the prover, `CubeCount::Static(cx, cy, cz)` at the
+/// launch. Included because "3-D is just rank 3" is a claim, and an untested
+/// claim is a guess — the axis mapping was measured with 0 violations in 144
+/// threads at `CubeCount(3,2,2) x CubeDim(2,3,2)` (§1.4), and this exercises the
+/// generated path end to end.
+///
+/// **Differential-only, and the reason is a stated v1 boundary, not an
+/// oversight.** A `w x h x d` volume index needs the length fact
+/// `len == w*h*d`, and `Assume::LenEqProduct` is binary — it recognizes
+/// `A.len() == (x as usize) * (y as usize)` and nothing wider. So the two
+/// `checked_mul` side-obligations on `(z*h + y) * w` have nothing to bound them
+/// and the kernel is `OutOfSubset`, exactly as §11's table says a shape outside
+/// the enabling assume's reach should be. That is pinned by a test
+/// (`elementwise3d_scale_is_out_of_subset_for_want_of_a_triple_product_assume`)
+/// so the boundary is a measurement rather than a claim, and so that widening
+/// the assume vocabulary later has a test that must flip.
+///
+/// Deliberately NOT suite-wired: its cases are 3-tuples (a third evidence file
+/// for one kernel) and its proof claim would be a failing entry. It is fully
+/// tested instead — bit-exact against its generated twin at six volume shapes in
+/// `tests/dispatch2d_gpu_ground_truth.rs` — the same treatment
+/// `grid_stride_reduce` gets.
+#[vericl::kernel(
+    dispatch(cube_dim = (8, 8, 4), extents = (w, h, d)),
+    assumes(inp.len() == out.len()),
+    compare(max_ulp = 0),
+    gen(inp in -100.0..=100.0, out in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn elementwise3d_scale(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32, d: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    let z = ABSOLUTE_POS_Z;
+    if x < w && y < h && z < d {
+        let i = ((z * h + y) * w + x) as usize;
+        out[i] = inp[i] * 3.0f32;
+    }
+}
+
+/// **Deliberately defective** — the 3x3 stencil with the clamp deleted, i.e.
+/// `inp[((y + 1) * w + (x + 1)) as usize]` at the image's bottom-right corner.
+/// This is `p2d`, the design's own negative control, promoted to a kernel: the
+/// bounds proof must **Refute** it. The design's hand-written SMT-LIB found the
+/// smallest witness — a `1x1` image where the kernel reads `inp[2]` from a
+/// length-1 buffer; the shipped prover picks an equally degenerate one from the
+/// same family (measured: `w = 1, h = 2, x = 0, y = 1`, reading `inp[3]` from a
+/// length-2 buffer). The class is what the control pins, not one model.
+///
+/// It is not in any suite — it belongs to the `conform` binary's demo-defects
+/// mode, which shows the checks catching it on purpose. Its differential lane
+/// also fails, for the honest reason: the derived twin is ordinary Rust and
+/// *panics* on the out-of-bounds read, which `catch_reference_panic` reports as
+/// a finding rather than a harness crash.
+///
+/// Keeping this next to `box_blur3x3` is what makes the clamped version's
+/// `Proved` mean something — the two differ by exactly the `u32::min`/`u32::max`
+/// calls, so the gate demonstrably discriminates.
+#[vericl::kernel(
+    dispatch(cube_dim = (16, 16), extents = (w, h)),
+    assumes(inp.len() == out.len(), inp.len() == (w as usize) * (h as usize)),
+    compare(max_ulp = 0),
+    gen(inp in -100.0..=100.0, out in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn box_blur3x3_unclamped(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    if x < w && y < h {
+        let mut acc = inp[(y * w + x) as usize];
+        acc += inp[((y + 1u32) * w + (x + 1u32)) as usize];
+        out[(y * w + x) as usize] = acc * 0.5f32;
+    }
+}
+
+/// A 2-D kernel with **aliasing writes** — `out[(x + y)]`, so the slot `k` is
+/// written by every `(x, y)` on the anti-diagonal `x + y == k`. Its purpose is
+/// to make the twin's *write order* observable, which an injective 2-D kernel
+/// cannot: for a full rectangular iteration the last writer of a slot is the
+/// same under either nesting unless the slot's writers straddle both axes, and
+/// an anti-diagonal is exactly that (`(1,0)` and `(0,1)` share slot 1).
+///
+/// The twin must visit in **Z outer → Y → X inner** order, which is the flat
+/// `ABSOLUTE_POS` order (§1.3's row-major flatten, X fastest) — so slot 1's last
+/// writer is `(x=0, y=1)` and it holds `y`, not `100*x`. Under the opposite
+/// nesting it would hold `100`. That is pinned, both directions, by
+/// `twin_write_order_is_the_flat_absolute_pos_order` — the write-ordering
+/// convention for aliasing writes is the one property a 1-D→2-D port must not
+/// silently change.
+///
+/// Not suite-wired: aliasing writes make the GPU's own result order-dependent,
+/// so a differential lane against it would be nondeterministic by construction.
+/// This is a twin-only example, the same treatment `sequential_slice_mut_scale`
+/// gets.
+#[vericl::kernel(
+    dispatch(cube_dim = (2, 2), extents = (w, h)),
+    assumes(out.len() == (w as usize) * (h as usize)),
+    compare(exact)
+)]
+#[cube(launch)]
+pub fn diag_alias_write2d(out: &mut Array<u32>, w: u32, h: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    if x < w && y < h {
+        out[(x + y) as usize] = x * 100u32 + y;
+    }
+}
+
+/// Every per-axis builtin the `dispatch(...)` clause admits, in one kernel, each
+/// used in the way its twin binding claims is exact: `CUBE_POS_a * CUBE_DIM_a +
+/// UNIT_POS_a` (which must equal `ABSOLUTE_POS_a`), the runtime `CUBE_COUNT_a`
+/// leaves, and the two flat builtins the clause KEEPS — `CUBE_DIM` (a pinned
+/// numeral, `Wx*Wy*Wz`) and `UNIT_POS` (the pinned-coefficient linear form
+/// `ux + uy*Wx`, which cannot wrap).
+///
+/// The differential lane is what makes this a measurement rather than a
+/// restatement: the twin binds `UNIT_POS_a` as `abs_a % Wa` and `CUBE_POS_a` as
+/// `abs_a / Wa`, and if either disagreed with the device's own value the output
+/// would differ. It is the per-axis half of §1.3's check (5), re-run through the
+/// generated twin instead of a hand-written probe.
+///
+/// The flat `ABSOLUTE_POS`/`CUBE_POS`/`CUBE_COUNT` are deliberately absent —
+/// they are rejected inside the clause (R1), and this kernel is what shows that
+/// rejection costs nothing an image kernel needs.
+///
+/// The written *value* is tainted for the prover (`cube_x * 16`'s no-overflow
+/// side-obligation cannot discharge from a free `u32` leaf), which is exactly
+/// right and costs nothing: only *indices* need modeling, and the index here is
+/// the ordinary `y*w + x`. So the kernel still carries `tested` + `proved`.
+#[vericl::kernel(
+    dispatch(cube_dim = (16, 16), extents = (w, h)),
+    assumes(out.len() == (w as usize) * (h as usize)),
+    compare(exact)
+)]
+#[cube(launch)]
+pub fn topology_report2d(out: &mut Array<u32>, w: u32, h: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    if x < w && y < h {
+        let rebuilt_x = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+        let rebuilt_y = CUBE_POS_Y * CUBE_DIM_Y + UNIT_POS_Y;
+        // Weights chosen so every component is separately recoverable and the
+        // whole sum stays well inside u32 at the largest declared shape
+        // (`255x257` → counts 16 and 17, so the leading term is ~5.6e8): the
+        // twin is ordinary Rust and would *panic* on overflow, which is the
+        // right behaviour but not the property this kernel is measuring.
+        let counts = CUBE_COUNT_X + 32u32 * CUBE_COUNT_Y;
+        out[(y * w + x) as usize] =
+            rebuilt_x + 1000u32 * rebuilt_y + 1000000u32 * counts + 7u32 * CUBE_DIM + UNIT_POS;
+    }
+}
+
+/// A per-axis position, computed in the kernel and passed to a
+/// `#[vericl::helper]` as a plain `u32` — the composition half of the dispatch
+/// milestone, and the reason it needed a compiled instance rather than a row in
+/// a table.
+///
+/// A helper's host twin has no notion of "which thread" is calling it, so a
+/// helper may not read topology *at all* — per axis or otherwise (the rejection
+/// says exactly that). What composes instead is the position as an ordinary
+/// argument, which is how a 1-D kernel already passes `ABSOLUTE_POS`. Nothing
+/// about the helper machinery changes for a `dispatch(...)` kernel; this kernel
+/// is what makes that a measurement.
+#[vericl::helper]
+#[cube]
+pub fn checkerboard_sign(x: u32, y: u32) -> f32 {
+    let mut s = 1.0f32;
+    if (x + y) % 2u32 == 1u32 {
+        s = -1.0f32;
+    }
+    s
+}
+
+/// `uses(...)` composition under a `dispatch(...)` clause. Not suite-wired (the
+/// 2-D suite already carries four kernels and this adds no new *claim* shape),
+/// but bit-exact against its generated twin in
+/// `tests/dispatch2d_gpu_ground_truth.rs` and `Proved` there too.
+#[vericl::kernel(
+    dispatch(cube_dim = (16, 16), extents = (w, h)),
+    assumes(inp.len() == out.len(), out.len() == (w as usize) * (h as usize)),
+    compare(max_ulp = 0),
+    gen(inp in -100.0..=100.0, out in 0.0..=0.0),
+    uses(checkerboard_sign)
+)]
+#[cube(launch)]
+pub fn checkerboard2d(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    if x < w && y < h {
+        let i = (y * w + x) as usize;
+        out[i] = inp[i] * checkerboard_sign(x, y);
+    }
+}

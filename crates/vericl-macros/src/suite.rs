@@ -141,6 +141,14 @@ struct SuiteSpec {
     sizes: Vec<Expr>,
     seed: Expr,
     cube_dim: Expr,
+    /// The `cube_dim:` field's own span, when the author wrote one — R7 blames
+    /// it (docs/design-2d-dispatch.md §10.3). `None` when the default applies.
+    cube_dim_span: Option<proc_macro2::Span>,
+    /// `Some(rank)` when every `sizes:` entry is a 2- or 3-tuple: this is a
+    /// **multi-axis dispatch suite** and its sizes are per-axis EXTENTS, not
+    /// thread counts (docs/design-2d-dispatch.md §4.8). `None` for the ordinary
+    /// 1-D suite.
+    sizes_rank: Option<u8>,
     prove: Expr,
     /// Whether this suite's primary runtime is a front-end-independent
     /// execution lane relative to the macro-derived twin. `true` (default) for
@@ -255,12 +263,56 @@ fn build_spec(fields: Punctuated<SuiteField, Token![,]>) -> syn::Result<SuiteSpe
         syn::Error::new(call_site, "suite! requires an `evidence: \"path/to/vericl.json\"` field")
     })?;
 
+    // --- multi-axis suite detection (docs/design-2d-dispatch.md §4.8). A
+    // 2-D/3-D suite is spelled by its SIZES: `sizes: [(37, 19), (64, 64)]`.
+    // Mixing tuple and scalar entries is rejected rather than guessed — the two
+    // are different units (extents vs. thread counts), and round 8's units
+    // discipline says decide it, not paper over it.
+    let sizes_rank = match sizes.as_deref() {
+        Some(list) if !list.is_empty() => {
+            let arity = |e: &Expr| match e {
+                Expr::Tuple(t) => Some(t.elems.len()),
+                _ => None,
+            };
+            let first = arity(&list[0]);
+            for e in list {
+                if arity(e) != first {
+                    return Err(syn::Error::new(
+                        e.span(),
+                        "suite!: every `sizes:` entry must have the same shape — either all \
+                         scalars (a 1-D suite, sizes are thread counts) or all 2-/3-tuples (a \
+                         `dispatch(...)` suite, sizes are per-axis extents). The two are \
+                         different units and mixing them in one evidence config is not defined \
+                         (docs/design-2d-dispatch.md §4.8)",
+                    ));
+                }
+            }
+            match first {
+                None => None,
+                Some(n @ (2 | 3)) => Some(n as u8),
+                Some(n) => {
+                    return Err(syn::Error::new(
+                        list[0].span(),
+                        format!(
+                            "suite!: a tuple `sizes:` entry declares a multi-axis dispatch \
+                             suite's per-axis extents and must have 2 or 3 elements; this one \
+                             has {n}"
+                        ),
+                    ));
+                }
+            }
+        }
+        _ => None,
+    };
+
     Ok(SuiteSpec {
         runtime,
         kernels,
         evidence,
         sizes: sizes.unwrap_or_else(default_sizes),
         seed: seed.unwrap_or_else(|| syn::parse_quote!(0xE901u64)),
+        cube_dim_span: cube_dim.as_ref().map(|c| c.span()),
+        sizes_rank,
         cube_dim: cube_dim.unwrap_or_else(|| syn::parse_quote!(256u32)),
         prove: prove.unwrap_or_else(|| syn::parse_quote!(true)),
         frontend_independent: frontend_independent.unwrap_or_else(|| syn::parse_quote!(true)),
@@ -290,61 +342,249 @@ fn kernel_salt(name: &str) -> u64 {
 /// docs/design-shared-memory.md §6; a non-cooperative kernel keeps the ordinary
 /// bounds-only pipeline. The branch is on a per-kernel const the kernel macro
 /// emits, since `suite!` (a separate macro invocation) cannot see the clauses.
-fn kernel_block(kernel: &Ident) -> TokenStream2 {
-    let kmod = format_ident!("{}_vericl", kernel);
-    let salt = kernel_salt(&kernel.to_string());
-    quote! {
-        {
-            let __outcomes: ::std::vec::Vec<::vericl::CaseOutcome> = __vericl_sizes
+/// The per-case `conformance_case` fan-out, in whichever unit this suite's
+/// `sizes:` declares — a scalar thread count (`n: usize`, the 1-D suite) or a
+/// per-axis extents triple (`[usize; 3]`, a `dispatch(...)` suite). The pinned
+/// cube dims mean a dispatch case takes no `cube_dim` argument at all: there is
+/// exactly one source of truth for it and it is the clause.
+fn case_call_tokens(
+    kmod: &Ident,
+    salt: u64,
+    sizes_rank: Option<u8>,
+    sizes: TokenStream2,
+    runtime: &Ident,
+    client: TokenStream2,
+) -> TokenStream2 {
+    if sizes_rank.is_some() {
+        quote! {
+            #sizes
+                .iter()
+                .map(|&__vericl_e| {
+                    // Decorrelate the per-case RNG stream by all three extents,
+                    // not by their product: `(64, 64)` and `(4096, 1)` are
+                    // different cases and should not share a draw.
+                    let __vericl_case_salt = (__vericl_e[0] as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ (__vericl_e[1] as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                        ^ (__vericl_e[2] as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    #kmod::conformance_case::<#runtime>(
+                        #client,
+                        __vericl_e,
+                        __vericl_seed ^ #salt ^ __vericl_case_salt,
+                    )
+                })
+                .collect()
+        }
+    } else {
+        quote! {
+            #sizes
                 .iter()
                 .map(|&n| {
-                    #kmod::conformance_case::<__VericlR>(
-                        &__vericl_client,
+                    #kmod::conformance_case::<#runtime>(
+                        #client,
                         n,
                         __vericl_seed ^ #salt ^ (n as u64),
                         __vericl_cube_dim,
                     )
                 })
-                .collect();
+                .collect()
+        }
+    }
+}
 
-            let __pass = __outcomes.iter().all(::vericl::CaseOutcome::pass);
-            println!(
-                "  [{}] {} ({})",
-                if __pass { "PASS" } else { "FAIL" },
-                #kmod::contract().kernel,
-                #kmod::contract().compare.describe(),
+/// The compile-time agreement check between this suite's declared `sizes:`
+/// shape and each listed kernel's `dispatch(...)` clause. A rank mismatch is
+/// caught here — with the reason — rather than as a raw type error on
+/// `conformance_case`'s size argument.
+fn dispatch_rank_check(kmod: &Ident, kernel: &Ident, sizes_rank: Option<u8>) -> TokenStream2 {
+    let kname = kernel.to_string();
+    match sizes_rank {
+        Some(rank) => {
+            let msg = format!(
+                "suite!: this suite declares tuple `sizes:` (a {rank}-D dispatch suite), but \
+                 kernel `{kname}`'s `dispatch(...)` clause is absent or of a different rank. The \
+                 suite's size arity and the clause's `cube_dim` arity must agree — they are the \
+                 same dispatch rank seen from two places."
             );
-            for o in &__outcomes {
-                println!("      {}", ::vericl::describe_case_outcome(o));
+            quote! {
+                const _: () = assert!(
+                    match #kmod::DISPATCH_RANK {
+                        ::core::option::Option::Some(__r) => __r == #rank,
+                        ::core::option::Option::None => false,
+                    },
+                    #msg
+                );
             }
-
-            let __detail = __outcomes
-                .iter()
-                .filter(|o| !o.pass())
-                .map(::vericl::describe_case_outcome)
-                .collect::<::std::vec::Vec<_>>()
-                .join("; ");
-            let __result = if __pass {
-                ::vericl::ClaimResult::Pass
-            } else {
-                ::vericl::ClaimResult::Fail { detail: __detail }
-            };
-
-            let mut __trusted = ::vericl::reference_twin_trust();
-            __trusted.push(::vericl::backend_buffer_trust(&__vericl_backend));
-            if __vericl_frontend_independent {
-                __trusted.push(::vericl::GPU_HARDWARE_TRUST.to_string());
-            } else {
-                // Non-independent primary lane (the f64 / cubecl-cpu case): the
-                // only execution backend shares CubeCL's front end with the
-                // kernel under test, so evidence must NOT imply an independent
-                // execution lane exists. "GPU hardware" is also a misnomer here.
-                __trusted.push(::vericl::HOST_HARDWARE_TRUST.to_string());
-                __trusted.push(::vericl::shared_frontend_lane_trust(&__vericl_backend));
+        }
+        None => {
+            let msg = format!(
+                "suite!: kernel `{kname}` declares a `dispatch(...)` clause, so its cases are \
+                 per-axis EXTENTS — but this suite's `sizes:` are scalar thread counts. Declare \
+                 the sizes as tuples, e.g. `sizes: [(37, 19), (64, 64)]`, in a suite of its own \
+                 (docs/design-2d-dispatch.md §4.8)."
+            );
+            quote! {
+                const _: () = assert!(#kmod::DISPATCH_RANK.is_none(), #msg);
             }
-            let mut __identity = #kmod::identity();
-            let mut __claims: ::std::vec::Vec<::vericl::Claim> = ::std::vec::Vec::new();
+        }
+    }
+}
 
+/// The `Tested` claim's `config` builder for this suite's unit — selected at
+/// macro-expansion time, not at run time, because the three builders take
+/// different `sizes` types (`&[usize]` vs `&[[usize; 3]]`).
+fn differential_config_tokens(
+    kmod: &Ident,
+    sizes_rank: Option<u8>,
+    sizes: TokenStream2,
+) -> TokenStream2 {
+    if sizes_rank.is_some() {
+        // A multi-axis suite's `sizes` are per-axis EXTENTS, and the recorded
+        // launch shape is the full pinned triple + rank
+        // (docs/design-2d-dispatch.md §4.8, §10.4 correction 2).
+        quote! {
+            ::vericl::differential_dispatch_config(
+                #sizes,
+                __vericl_seed,
+                #kmod::DISPATCH_CUBE_DIM.expect("a dispatch suite's kernels pin their cube dims"),
+                #kmod::DISPATCH_RANK.expect("a dispatch kernel has a rank"),
+            )
+        }
+    } else {
+        quote! {
+            if let ::core::option::Option::Some(__w) = #kmod::VECTOR_WIDTH {
+                ::vericl::differential_vector_config(#sizes, __vericl_seed, __vericl_cube_dim, __w)
+            } else {
+                ::vericl::differential_config(#sizes, __vericl_seed, __vericl_cube_dim)
+            }
+        }
+    }
+}
+
+/// The bounds-prover entry point for this suite's unit — likewise selected at
+/// macro-expansion time so a 1-D suite never mentions the dispatch entry point.
+fn prove_call_tokens(kmod: &Ident, sizes_rank: Option<u8>) -> TokenStream2 {
+    if sizes_rank.is_some() {
+        quote! {
+            ::vericl_ir::prove_bounds_freedom_dispatch(
+                &__def,
+                &__buffers,
+                &__assumes,
+                #kmod::DISPATCH_CUBE_DIM.expect("a dispatch suite's kernels pin their cube dims"),
+            )
+        }
+    } else {
+        quote!(::vericl_ir::prove_bounds_freedom(&__def, &__buffers, &__assumes))
+    }
+}
+
+/// The claim pipeline for one kernel, selected at macro-expansion time.
+///
+/// A **dispatch suite** emits only the ordinary (non-cooperative) pipeline:
+/// `dispatch(...)` and `cooperative(...)` are mutually exclusive in v1 (D6/R4),
+/// so the cooperative branch is not merely dead there — it would not type-check,
+/// because `cooperative_differential_config` takes `&[usize]` thread counts
+/// while a dispatch suite's sizes are `[usize; 3]` extents. Emitting the branch
+/// and relying on a runtime `if` would silently couple the two units.
+fn pipeline_tokens(
+    kmod: &Ident,
+    sizes_rank: Option<u8>,
+    differential_config: &TokenStream2,
+    prove_call: &TokenStream2,
+) -> TokenStream2 {
+    let ordinary = quote! {
+                // ---- Ordinary (non-cooperative) pipeline ----
+                // A vector kernel records its pinned lane width in the config
+                // (design-line-vector.md §9) so the `sizes` read as line counts
+                // and a re-run at a different width is a visibly different claim.
+                let __config = #differential_config;
+                __claims.push(::vericl::Claim {
+                    kind: ::vericl::ClaimKind::Tested,
+                    check: "differential".to_string(),
+                    backend: Some(__vericl_backend.clone()),
+                    config: __config,
+                    result: __result,
+                });
+
+                if __vericl_prove {
+                    let __def = #kmod::kernel_definition();
+                    let __ir_hash = ::vericl_ir::kernel_ir_hash(&__def);
+                    let __buffers: ::std::vec::Vec<::vericl_ir::BufferParam> = #kmod::BUFFER_PARAMS
+                        .iter()
+                        .map(|(name, is_output)| ::vericl_ir::BufferParam { name, is_output: *is_output })
+                        .collect();
+                    let __assumes: ::std::vec::Vec<::vericl_ir::Assume> = #kmod::contract()
+                        .structured_assumes
+                        .iter()
+                        .map(|a| match *a {
+                            ::vericl::StructuredAssume::LenEq { a, b } => ::vericl_ir::Assume::LenEq { a, b },
+                            ::vericl::StructuredAssume::LenEqConst { a, value } => {
+                                ::vericl_ir::Assume::LenEqConst { a, value }
+                            }
+                            ::vericl::StructuredAssume::ElemsBelowLen { arr, len_of } => {
+                                ::vericl_ir::Assume::ElemsBelowLen { arr, len_of }
+                            }
+                            ::vericl::StructuredAssume::ElemsBelowConst { arr, bound } => {
+                                ::vericl_ir::Assume::ElemsBelowConst { arr, bound }
+                            }
+                            ::vericl::StructuredAssume::LenPlusConstLe { a, k, b } => {
+                                ::vericl_ir::Assume::LenPlusConstLe { a, k, b }
+                            }
+                            ::vericl::StructuredAssume::LenEqProduct {
+                                a, x: _, y: _, x_scalar, y_scalar,
+                            } => ::vericl_ir::Assume::LenEqProduct { a, x_scalar, y_scalar },
+                        })
+                        .collect();
+                    let __prove_result = #prove_call;
+                    let (__obligations, __claim_result) = match &__prove_result {
+                        ::vericl_ir::ProveResult::Proved { obligations } => {
+                            (*obligations, ::vericl::ClaimResult::Pass)
+                        }
+                        ::vericl_ir::ProveResult::Refuted { obligation, counterexample } => (
+                            0,
+                            ::vericl::ClaimResult::Fail {
+                                detail: format!("REFUTED: {obligation} — counterexample: {counterexample}"),
+                            },
+                        ),
+                        ::vericl_ir::ProveResult::OutOfSubset { reason } => (
+                            0,
+                            ::vericl::ClaimResult::Fail { detail: format!("outside the vericl v0 subset: {reason}") },
+                        ),
+                        ::vericl_ir::ProveResult::SolverError { detail } => {
+                            (0, ::vericl::ClaimResult::Fail { detail: format!("solver error: {detail}") })
+                        }
+                    };
+                    __identity.ir_hash = Some(__ir_hash);
+                    __claims.push(::vericl::Claim {
+                        kind: ::vericl::ClaimKind::Proved,
+                        check: ::vericl_ir::SMT_OOB_FREEDOM_CHECK.to_string(),
+                        backend: None,
+                        config: ::vericl::proved_config_with_logic(
+                            __vericl_solver.as_deref().expect("prove checked z3 above"),
+                            __obligations,
+                            // §10.4 correction 3: the logic actually in force.
+                            // A `LenEqProduct` assume asserts a nonlinear
+                            // `len = x*y` into the global context, so `QF_LIA`
+                            // would be wrong for that kernel.
+                            if #kmod::contract().structured_assumes.iter().any(|__a| {
+                                matches!(__a, ::vericl::StructuredAssume::LenEqProduct { .. })
+                            }) {
+                                "QF_NIA"
+                            } else {
+                                "QF_LIA"
+                            },
+                        ),
+                        result: __claim_result,
+                    });
+                    __trusted.extend(::vericl::proved_bounds_trust(
+                        __vericl_solver.as_deref().expect("prove checked z3 above"),
+                    ));
+                }
+    };
+    if sizes_rank.is_some() {
+        return quote! { { #ordinary } };
+    }
+    quote! {
             if let ::core::option::Option::Some(__coop_cd) = #kmod::COOPERATIVE_CUBE_DIM {
                 // ---- Cooperative pipeline (docs/design-shared-memory.md §6) ----
                 // The phase-split twin is a faithful reference only under
@@ -393,6 +633,9 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
                             ::vericl::StructuredAssume::LenPlusConstLe { a, k, b } => {
                                 ::vericl_ir::Assume::LenPlusConstLe { a, k, b }
                             }
+                            ::vericl::StructuredAssume::LenEqProduct {
+                                a, x: _, y: _, x_scalar, y_scalar,
+                            } => ::vericl_ir::Assume::LenEqProduct { a, x_scalar, y_scalar },
                         })
                         .collect();
                     match ::vericl_ir::prove_cooperative(
@@ -491,85 +734,72 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
                 if let Some(__a) = __assumption {
                     __claims.push(__a);
                 }
-            } else {
-                // ---- Ordinary (non-cooperative) pipeline ----
-                // A vector kernel records its pinned lane width in the config
-                // (design-line-vector.md §9) so the `sizes` read as line counts
-                // and a re-run at a different width is a visibly different claim.
-                let __config = if let ::core::option::Option::Some(__w) = #kmod::VECTOR_WIDTH {
-                    ::vericl::differential_vector_config(__vericl_sizes, __vericl_seed, __vericl_cube_dim, __w)
-                } else {
-                    ::vericl::differential_config(__vericl_sizes, __vericl_seed, __vericl_cube_dim)
-                };
-                __claims.push(::vericl::Claim {
-                    kind: ::vericl::ClaimKind::Tested,
-                    check: "differential".to_string(),
-                    backend: Some(__vericl_backend.clone()),
-                    config: __config,
-                    result: __result,
-                });
+        } else {
+            #ordinary
+        }
+    }
+}
 
-                if __vericl_prove {
-                    let __def = #kmod::kernel_definition();
-                    let __ir_hash = ::vericl_ir::kernel_ir_hash(&__def);
-                    let __buffers: ::std::vec::Vec<::vericl_ir::BufferParam> = #kmod::BUFFER_PARAMS
-                        .iter()
-                        .map(|(name, is_output)| ::vericl_ir::BufferParam { name, is_output: *is_output })
-                        .collect();
-                    let __assumes: ::std::vec::Vec<::vericl_ir::Assume> = #kmod::contract()
-                        .structured_assumes
-                        .iter()
-                        .map(|a| match *a {
-                            ::vericl::StructuredAssume::LenEq { a, b } => ::vericl_ir::Assume::LenEq { a, b },
-                            ::vericl::StructuredAssume::LenEqConst { a, value } => {
-                                ::vericl_ir::Assume::LenEqConst { a, value }
-                            }
-                            ::vericl::StructuredAssume::ElemsBelowLen { arr, len_of } => {
-                                ::vericl_ir::Assume::ElemsBelowLen { arr, len_of }
-                            }
-                            ::vericl::StructuredAssume::ElemsBelowConst { arr, bound } => {
-                                ::vericl_ir::Assume::ElemsBelowConst { arr, bound }
-                            }
-                            ::vericl::StructuredAssume::LenPlusConstLe { a, k, b } => {
-                                ::vericl_ir::Assume::LenPlusConstLe { a, k, b }
-                            }
-                        })
-                        .collect();
-                    let __prove_result = ::vericl_ir::prove_bounds_freedom(&__def, &__buffers, &__assumes);
-                    let (__obligations, __claim_result) = match &__prove_result {
-                        ::vericl_ir::ProveResult::Proved { obligations } => {
-                            (*obligations, ::vericl::ClaimResult::Pass)
-                        }
-                        ::vericl_ir::ProveResult::Refuted { obligation, counterexample } => (
-                            0,
-                            ::vericl::ClaimResult::Fail {
-                                detail: format!("REFUTED: {obligation} — counterexample: {counterexample}"),
-                            },
-                        ),
-                        ::vericl_ir::ProveResult::OutOfSubset { reason } => (
-                            0,
-                            ::vericl::ClaimResult::Fail { detail: format!("outside the vericl v0 subset: {reason}") },
-                        ),
-                        ::vericl_ir::ProveResult::SolverError { detail } => {
-                            (0, ::vericl::ClaimResult::Fail { detail: format!("solver error: {detail}") })
-                        }
-                    };
-                    __identity.ir_hash = Some(__ir_hash);
-                    __claims.push(::vericl::Claim {
-                        kind: ::vericl::ClaimKind::Proved,
-                        check: ::vericl_ir::SMT_OOB_FREEDOM_CHECK.to_string(),
-                        backend: None,
-                        config: ::vericl::proved_config(
-                            __vericl_solver.as_deref().expect("prove checked z3 above"),
-                            __obligations,
-                        ),
-                        result: __claim_result,
-                    });
-                    __trusted.extend(::vericl::proved_bounds_trust(
-                        __vericl_solver.as_deref().expect("prove checked z3 above"),
-                    ));
-                }
+fn kernel_block(kernel: &Ident, sizes_rank: Option<u8>) -> TokenStream2 {
+    let kmod = format_ident!("{}_vericl", kernel);
+    let salt = kernel_salt(&kernel.to_string());
+    let case_call = case_call_tokens(
+        &kmod,
+        salt,
+        sizes_rank,
+        quote!(__vericl_sizes),
+        &format_ident!("__VericlR"),
+        quote!(&__vericl_client),
+    );
+    let dispatch_rank_check = dispatch_rank_check(&kmod, kernel, sizes_rank);
+    let differential_config =
+        differential_config_tokens(&kmod, sizes_rank, quote!(__vericl_sizes));
+    let prove_call = prove_call_tokens(&kmod, sizes_rank);
+    let pipeline = pipeline_tokens(&kmod, sizes_rank, &differential_config, &prove_call);
+    quote! {
+        {
+            #dispatch_rank_check
+            let __outcomes: ::std::vec::Vec<::vericl::CaseOutcome> = #case_call;
+
+            let __pass = __outcomes.iter().all(::vericl::CaseOutcome::pass);
+            println!(
+                "  [{}] {} ({})",
+                if __pass { "PASS" } else { "FAIL" },
+                #kmod::contract().kernel,
+                #kmod::contract().compare.describe(),
+            );
+            for o in &__outcomes {
+                println!("      {}", ::vericl::describe_case_outcome(o));
             }
+
+            let __detail = __outcomes
+                .iter()
+                .filter(|o| !o.pass())
+                .map(::vericl::describe_case_outcome)
+                .collect::<::std::vec::Vec<_>>()
+                .join("; ");
+            let __result = if __pass {
+                ::vericl::ClaimResult::Pass
+            } else {
+                ::vericl::ClaimResult::Fail { detail: __detail }
+            };
+
+            let mut __trusted = ::vericl::reference_twin_trust();
+            __trusted.push(::vericl::backend_buffer_trust(&__vericl_backend));
+            if __vericl_frontend_independent {
+                __trusted.push(::vericl::GPU_HARDWARE_TRUST.to_string());
+            } else {
+                // Non-independent primary lane (the f64 / cubecl-cpu case): the
+                // only execution backend shares CubeCL's front end with the
+                // kernel under test, so evidence must NOT imply an independent
+                // execution lane exists. "GPU hardware" is also a misnomer here.
+                __trusted.push(::vericl::HOST_HARDWARE_TRUST.to_string());
+                __trusted.push(::vericl::shared_frontend_lane_trust(&__vericl_backend));
+            }
+            let mut __identity = #kmod::identity();
+            let mut __claims: ::std::vec::Vec<::vericl::Claim> = ::std::vec::Vec::new();
+
+            #pipeline
 
             entries.push(::vericl::Entry {
                 kernel: #kmod::contract().kernel.to_string(),
@@ -586,9 +816,21 @@ fn kernel_block(kernel: &Ident) -> TokenStream2 {
 /// runtime and fold a `Tested` claim + shared-front-end trust wording onto
 /// the matching entry already built by [`kernel_block`] — mirrors
 /// `conform.rs`'s old `add_cpu_lane`.
-fn extra_lane_kernel_block(kernel: &Ident) -> TokenStream2 {
+fn extra_lane_kernel_block(kernel: &Ident, sizes_rank: Option<u8>) -> TokenStream2 {
     let kmod = format_ident!("{}_vericl", kernel);
     let salt = kernel_salt(&kernel.to_string());
+    let case_call = case_call_tokens(
+        &kmod,
+        salt,
+        sizes_rank,
+        quote!((&__extra_sizes[..])),
+        &format_ident!("__VericlExtraR"),
+        quote!(&__vericl_extra_client),
+    );
+    let extra_size_ty: TokenStream2 =
+        if sizes_rank.is_some() { quote!([usize; 3]) } else { quote!(usize) };
+    let differential_config =
+        differential_config_tokens(&kmod, sizes_rank, quote!(&__extra_sizes));
     quote! {
         {
             // Extra-lane sizes. For a COOPERATIVE kernel, cap to single-cube
@@ -601,7 +843,7 @@ fn extra_lane_kernel_block(kernel: &Ident) -> TokenStream2 {
             // lane still covers every declared size (docs/design-shared-memory.md
             // — cubecl-cpu cooperative-execution performance finding). Non-
             // cooperative kernels are unaffected (all sizes).
-            let __extra_sizes: ::std::vec::Vec<usize> =
+            let __extra_sizes: ::std::vec::Vec<#extra_size_ty> =
                 if let ::core::option::Option::Some(__ccd) = #kmod::COOPERATIVE_CUBE_DIM {
                     let mut __v: ::std::vec::Vec<usize> =
                         __vericl_sizes.iter().copied().filter(|&n| n <= __ccd as usize).collect();
@@ -612,17 +854,7 @@ fn extra_lane_kernel_block(kernel: &Ident) -> TokenStream2 {
                 } else {
                     __vericl_sizes.to_vec()
                 };
-            let __outcomes: ::std::vec::Vec<::vericl::CaseOutcome> = __extra_sizes
-                .iter()
-                .map(|&n| {
-                    #kmod::conformance_case::<__VericlExtraR>(
-                        &__vericl_extra_client,
-                        n,
-                        __vericl_seed ^ #salt ^ (n as u64),
-                        __vericl_cube_dim,
-                    )
-                })
-                .collect();
+            let __outcomes: ::std::vec::Vec<::vericl::CaseOutcome> = #case_call;
             for o in &__outcomes {
                 println!("      {}", ::vericl::describe_case_outcome(o));
             }
@@ -673,11 +905,7 @@ fn extra_lane_kernel_block(kernel: &Ident) -> TokenStream2 {
                         result: __result,
                     }
                 } else {
-                    let __config = if let ::core::option::Option::Some(__w) = #kmod::VECTOR_WIDTH {
-                        ::vericl::differential_vector_config(&__extra_sizes, __vericl_seed, __vericl_cube_dim, __w)
-                    } else {
-                        ::vericl::differential_config(&__extra_sizes, __vericl_seed, __vericl_cube_dim)
-                    };
+                    let __config = #differential_config;
                     ::vericl::Claim {
                         kind: ::vericl::ClaimKind::Tested,
                         check: "differential".to_string(),
@@ -700,18 +928,66 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
     let runtime_path = &spec.runtime;
     let evidence_lit = &spec.evidence;
     let sizes_exprs = &spec.sizes;
+
+    // R7 (docs/design-2d-dispatch.md §10.3): a `dispatch(...)` kernel's block
+    // size comes from its own clause, so the suite's `cube_dim:` field has
+    // nothing to set. Two sources of truth for one launch parameter is how a
+    // proof gets bound to a block size the launch does not use — the hazard
+    // `cooperative(...)` already avoids by asserting the two equal.
+    if let (Some(span), Some(_)) = (spec.cube_dim_span, spec.sizes_rank) {
+        let names = spec
+            .kernels
+            .iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "this suite declares tuple `sizes:`, so every kernel it lists ({names}) declares \
+                 its own `dispatch(cube_dim = (...))` — and the suite's `cube_dim:` field has \
+                 nothing to set. Two sources of truth for one launch parameter is how a proof \
+                 gets bound to a block size the launch does not use. Remove `cube_dim:` from \
+                 this suite, or remove the `dispatch(...)` clause from every kernel it lists"
+            ),
+        ));
+    }
+
+    // The declared cases, in this suite's own unit. A dispatch suite's tuples
+    // are normalized to `[usize; 3]` with the unused axis at 1, which is exactly
+    // the shape `conformance_case` derives its per-axis cube count from.
+    let sizes_decl = match spec.sizes_rank {
+        None => quote! { let __vericl_sizes: &[usize] = &[ #(#sizes_exprs),* ]; },
+        Some(rank) => {
+            let rows: Vec<TokenStream2> = spec
+                .sizes
+                .iter()
+                .map(|e| {
+                    let Expr::Tuple(t) = e else { unreachable!("checked in build_spec") };
+                    let mut parts: Vec<TokenStream2> =
+                        t.elems.iter().map(|x| quote!((#x) as usize)).collect();
+                    while parts.len() < 3 {
+                        parts.push(quote!(1usize));
+                    }
+                    quote!([ #(#parts),* ])
+                })
+                .collect();
+            let _ = rank;
+            quote! { let __vericl_sizes: &[[usize; 3]] = &[ #(#rows),* ]; }
+        }
+    };
     let seed_expr = &spec.seed;
     let cube_dim_expr = &spec.cube_dim;
     let prove_expr = &spec.prove;
     let frontend_independent_expr = &spec.frontend_independent;
 
-    let kernel_blocks: Vec<TokenStream2> = spec.kernels.iter().map(kernel_block).collect();
+    let kernel_blocks: Vec<TokenStream2> = spec.kernels.iter().map(|k| kernel_block(k, spec.sizes_rank)).collect();
 
     let extra_lane_block = match &spec.extra_lane {
         None => TokenStream2::new(),
         Some((cfg_predicate, path)) => {
             let extra_kernel_blocks: Vec<TokenStream2> =
-                spec.kernels.iter().map(extra_lane_kernel_block).collect();
+                spec.kernels.iter().map(|k| extra_lane_kernel_block(k, spec.sizes_rank)).collect();
             quote! {
                 #[cfg(#cfg_predicate)]
                 {
@@ -758,7 +1034,7 @@ pub fn expand(input: TokenStream2) -> syn::Result<TokenStream2> {
             let __vericl_frontend_independent: bool = #frontend_independent_expr;
             let __vericl_seed: u64 = #seed_expr;
             let __vericl_cube_dim: u32 = #cube_dim_expr;
-            let __vericl_sizes: &[usize] = &[ #(#sizes_exprs),* ];
+            #sizes_decl
 
             let mut entries: ::std::vec::Vec<::vericl::Entry> = ::std::vec::Vec::new();
 

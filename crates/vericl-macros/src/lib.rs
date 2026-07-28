@@ -63,6 +63,35 @@ const BANNED_IDENTS: &[&str] = &[
     "CUBE_COUNT_X",
     "CUBE_COUNT_Y",
     "CUBE_COUNT_Z",
+    // Plane / cluster topology CONSTANTS (docs/design-2d-dispatch.md §10.3 R8).
+    //
+    // **These were a hole until the 2-D milestone, and the hole was measured.**
+    // R8 recorded them as "unchanged; BANNED_IDENTS + BANNED_PREFIXES" — but
+    // `BANNED_PREFIXES`' `plane_` only catches the lowercase plane *functions*
+    // (`plane_sum`, `plane_broadcast`), and the uppercase constants appeared in
+    // neither list. Outside a `#[cube]` fn every one of them is the literal `2`
+    // (cubecl-core `topology.rs`'s `constant!` macro, §1.1), so a twin derived
+    // from a kernel reading `PLANE_DIM` silently used `2` while the device read
+    // the real plane width — measured in a scratch probe: the twin printed
+    // `PLANE_DIM + CUBE_POS_CLUSTER_X == 4` where wgpu/Metal reports 32 + 1.
+    // Loud rather than silent (the differential lane diverges), but a rejection
+    // surface that lets the shape through at all is not what the guide claims.
+    //
+    // `dispatch(...)` does NOT lift them. The two cluster families additionally
+    // fold to *different constants on different backends* in cubecl 0.10 (`1` on
+    // WGSL, `0` on CUDA/SPIR-V — §1.1), an upstream cross-backend semantic
+    // divergence no twin could model faithfully anyway.
+    "PLANE_DIM",
+    "PLANE_POS",
+    "UNIT_POS_PLANE",
+    "CUBE_CLUSTER_DIM",
+    "CUBE_CLUSTER_DIM_X",
+    "CUBE_CLUSTER_DIM_Y",
+    "CUBE_CLUSTER_DIM_Z",
+    "CUBE_POS_CLUSTER",
+    "CUBE_POS_CLUSTER_X",
+    "CUBE_POS_CLUSTER_Y",
+    "CUBE_POS_CLUSTER_Z",
     // parallel / memory constructs the sequential twin cannot model
     "SharedMemory",
     "sync_cube",
@@ -144,6 +173,225 @@ const BANNED_IDENTS: &[&str] = &[
 ];
 
 const BANNED_PREFIXES: &[&str] = &["plane_", "Atomic"];
+
+/// The twelve per-axis topology builtins the `dispatch(...)` clause un-bans
+/// (docs/design-2d-dispatch.md §10.2), indexed `[axis][which]` so a rewrite can
+/// name the axis it belongs to. Axis order is X, Y, Z — X is the
+/// **fastest-varying** axis (§1.3/§1.4, R9).
+///
+/// `CUBE_DIM_a` and `CUBE_COUNT_a` join the position triples here because both
+/// are per-axis leaves the twin can bind exactly: `CUBE_DIM_a` is the pinned
+/// clause literal and `CUBE_COUNT_a` is `grid_a / Wa` (§4.7 property 4).
+const PER_AXIS_BUILTINS: [[&str; 5]; 3] = [
+    ["ABSOLUTE_POS_X", "UNIT_POS_X", "CUBE_POS_X", "CUBE_DIM_X", "CUBE_COUNT_X"],
+    ["ABSOLUTE_POS_Y", "UNIT_POS_Y", "CUBE_POS_Y", "CUBE_DIM_Y", "CUBE_COUNT_Y"],
+    ["ABSOLUTE_POS_Z", "UNIT_POS_Z", "CUBE_POS_Z", "CUBE_DIM_Z", "CUBE_COUNT_Z"],
+];
+
+/// The three **flat** topology builtins a `dispatch(...)` kernel may not name
+/// (R1, docs/design-2d-dispatch.md §4.4). Each is a row-major flatten whose
+/// stride is a *runtime* product, so modeling it from the per-axis leaves is
+/// variable×variable — and, worse, `ABSOLUTE_POS == CUBE_POS * CUBE_DIM +
+/// UNIT_POS` is measurably FALSE in a multi-axis dispatch (§2.2: it broke in
+/// 533 of 722 swept launch shapes).
+///
+/// Flat `CUBE_DIM` and `UNIT_POS` are deliberately NOT here: with the dims
+/// pinned they are a numeral and a pinned-coefficient linear form, neither of
+/// which can wrap (§4.4).
+const DISPATCH_BANNED_FLAT: [&str; 3] = ["ABSOLUTE_POS", "CUBE_POS", "CUBE_COUNT"];
+
+/// The `dispatch(cube_dim = (Wx, Wy[, Wz]), extents = (e0, e1[, e2]))` contract
+/// clause (docs/design-2d-dispatch.md §4.2) — the multi-axis analogue of
+/// `cooperative(cube_dim = N)`, one position over.
+///
+/// The pinned literal cube dims are the single source of truth for three
+/// consumers at once: the prover's `CUBE_DIM_a` numerals (what keeps every
+/// position recomposition LINEAR — §4.2), the launch's `CubeDim`, and the twin's
+/// per-axis loop strides. A runtime cube dim would leave the first two
+/// variable×variable and the third undefined, which is why D1 exists.
+#[derive(Clone)]
+struct DispatchSpec {
+    /// The whole clause's span (blamed by D5/R3 and R4).
+    span: proc_macro2::Span,
+    /// Pinned per-axis cube dims, `Z = 1` for a rank-2 clause.
+    dims: [u32; 3],
+    /// `2` or `3` — the tuple arity IS the dispatch rank.
+    rank: u8,
+    /// The kernel's own runtime `u32` parameters carrying the problem extents,
+    /// in axis order; `rank` entries.
+    extents: Vec<Ident>,
+}
+
+impl DispatchSpec {
+    /// Is `axis` (0 = X) enabled by this clause's rank?
+    fn axis_enabled(&self, axis: usize) -> bool {
+        (axis as u8) < self.rank
+    }
+
+    /// The axis (0 = X, 1 = Y, 2 = Z) and per-axis role index of `ident` if it
+    /// is one of the twelve per-axis builtins, else `None`.
+    fn per_axis_role(ident: &str) -> Option<(usize, usize)> {
+        for (axis, names) in PER_AXIS_BUILTINS.iter().enumerate() {
+            for (role, n) in names.iter().enumerate() {
+                if *n == ident {
+                    return Some((axis, role));
+                }
+            }
+        }
+        None
+    }
+
+    /// The twin's replacement tokens for a per-axis builtin (§4.7 property 4).
+    /// Every relation here is the *per-axis* one, each of which is exact on
+    /// hardware (measured: 0 violations / 1 212 threads, check (5) §1.3) — none
+    /// of them is §2's broken cross-axis flat identity.
+    fn per_axis_rewrite(&self, axis: usize, role: usize) -> TokenStream2 {
+        let abs = format_ident!("__vericl_abs_{}", ["x", "y", "z"][axis]);
+        let w = self.dims[axis];
+        let grid = syn::Index::from(axis);
+        match role {
+            0 => quote!(#abs),                                    // ABSOLUTE_POS_a
+            1 => quote!((#abs % #w)),                             // UNIT_POS_a
+            2 => quote!((#abs / #w)),                             // CUBE_POS_a
+            3 => quote!(#w),                                      // CUBE_DIM_a
+            _ => quote!((__vericl_grid.#grid / #w)),              // CUBE_COUNT_a
+        }
+    }
+
+    /// The twin's replacement for the flat `UNIT_POS` — the pinned-coefficient
+    /// linear form `ux + uy*Wx + uz*Wx*Wy` (§1.3). Bounded by the constant
+    /// `Wx*Wy*Wz`, so it cannot wrap.
+    fn flat_unit_pos_rewrite(&self) -> TokenStream2 {
+        let mut term = self.per_axis_rewrite(0, 1);
+        if self.rank >= 2 {
+            let uy = self.per_axis_rewrite(1, 1);
+            let wx = self.dims[0];
+            term = quote!(#term + #uy * #wx);
+        }
+        if self.rank >= 3 {
+            let uz = self.per_axis_rewrite(2, 1);
+            let wxy = self.dims[0] * self.dims[1];
+            term = quote!(#term + #uz * #wxy);
+        }
+        quote!((#term))
+    }
+}
+
+/// Whether a kernel body names any of the twelve per-axis topology builtins —
+/// the `dispatch(...)` clause is required iff this is `true` (D5/R2/R3, the
+/// `cooperative(...)` biconditional generalized). Token-level like
+/// `coop::kernel_uses_cooperative`, so a use nested in an `if`/`for` body or a
+/// macro argument still counts.
+fn kernel_uses_per_axis(body: &syn::Block) -> bool {
+    fn scan(ts: TokenStream2) -> bool {
+        ts.into_iter().any(|tt| match tt {
+            TokenTree::Ident(id) => DispatchSpec::per_axis_role(&id.to_string()).is_some(),
+            TokenTree::Group(g) => scan(g.stream()),
+            _ => false,
+        })
+    }
+    scan(body.to_token_stream())
+}
+
+/// The IR `GlobalScalar` id a `u32`-typed runtime scalar parameter gets.
+///
+/// **Measured convention, and why it is positional.** `KernelBuilder::scalar`
+/// keeps one counter *per `StorageType`* and hands out `id = counter++` in
+/// registration order (`cubecl-core-0.10.0/src/compute/builder.rs:31-35`), and
+/// `#[cube(launch)]`'s generated `expand` registers parameters in declaration
+/// order — so the *n*-th `u32`-storage scalar parameter is `GlobalScalar(n)`.
+/// Confirmed in an extracted `KernelDefinition`: for
+/// `fn k(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32)` the IR reads
+/// `AbsolutePosX < scalar<u32>(0)` / `AbsolutePosY < scalar<u32>(1)`
+/// (`scratchpad/design2d/design2d_prover2d.txt`).
+///
+/// `usize` shares the counter: `usize` resolves through `scope.resolve_type`
+/// to the kernel's `AddressType`, which vericl registers as `U32`
+/// (`cubecl-core-0.10.0/src/frontend/element/uint.rs:87-89`) — so a `usize`
+/// parameter occupies a `u32` slot and must be counted here. `#[comptime]`
+/// parameters never reach the builder and are skipped; a runtime
+/// `cube_struct!` parameter would flatten unknown fields into the same counter
+/// and is rejected outright by the `dispatch(...)` gate before this is called.
+///
+/// Returns `None` if `name` is not a `u32` runtime scalar parameter.
+fn u32_scalar_slot(params: &[Param], name: &Ident) -> Option<u32> {
+    let mut slot = 0u32;
+    for p in params {
+        let ParamKind::Scalar(ty) = &p.kind else { continue };
+        let Type::Path(tp) = ty else { continue };
+        let last = tp.path.segments.last()?;
+        let occupies_u32_slot = matches!(last.ident.to_string().as_str(), "u32" | "usize");
+        if !occupies_u32_slot {
+            continue;
+        }
+        if &p.name == name {
+            return Some(slot);
+        }
+        slot += 1;
+    }
+    None
+}
+
+/// R1's rejection text for a flat topology builtin inside a `dispatch(...)`
+/// kernel (docs/design-2d-dispatch.md §10.3). The measured numbers are the
+/// point: this is not a modeling preference, the identity the 1-D machinery
+/// encodes is *false* here.
+fn flat_builtin_in_dispatch_msg(ident: &str) -> String {
+    let what = match ident {
+        "CUBE_POS" => {
+            "in a multi-axis dispatch it is the row-major flatten of the cube grid, \
+             `CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_Z * CUBE_COUNT_X * CUBE_COUNT_Y`"
+        }
+        "CUBE_COUNT" => {
+            "in a multi-axis dispatch it is `CUBE_COUNT_X * CUBE_COUNT_Y * CUBE_COUNT_Z`, a \
+             product of two runtime values"
+        }
+        _ => {
+            "in a multi-axis dispatch it is NOT `CUBE_POS * CUBE_DIM + UNIT_POS`, it is the \
+             row-major flatten of the whole thread grid, `ABSOLUTE_POS_X + ABSOLUTE_POS_Y * \
+             (CUBE_COUNT_X * CUBE_DIM_X) + ...` (measured: the two disagree for 912 of 960 \
+             threads at CubeCount(5,3,1) x CubeDim(8,8,1), and for 533 of 722 launch shapes \
+             swept)"
+        }
+    };
+    format!(
+        "`{ident}` is outside the vericl v0 subset in a `dispatch(...)` kernel — {what}. Its \
+         stride is a *runtime* product, so modeling it needs nonlinear arithmetic the prover \
+         does not use for global facts. Index with the per-axis builtins — \
+         `inp[(ABSOLUTE_POS_Y * w + ABSOLUTE_POS_X) as usize]` — or drop the `dispatch(...)` \
+         clause and use the flat 1-D form throughout (docs/design-2d-dispatch.md §2, §4.4)"
+    )
+}
+
+/// R2's rejection text for a per-axis builtin in a kernel with no
+/// `dispatch(...)` clause — the `cooperative(...)` biconditional generalized.
+fn per_axis_without_clause_msg(ident: &str) -> String {
+    format!(
+        "`{ident}` is a per-axis topology builtin outside the ordinary vericl v0 subset; add a \
+         `dispatch(cube_dim = (Wx, Wy), extents = (w, h))` clause to `#[vericl::kernel(...)]` to \
+         opt this kernel into the multi-axis twin and the per-axis prover model \
+         (docs/design-2d-dispatch.md §4.2). The cube dimensions must be pinned literals: they \
+         are what keeps every position recomposition linear"
+    )
+}
+
+/// The out-of-rank rejection (risk 7): `ABSOLUTE_POS_Z` under a 2-tuple clause.
+/// Deliberately narrower than hardware (a Z builtin is *always zero* on a 2-D
+/// launch, so accepting it would be harmless) — but a 3-D-authored kernel whose
+/// clause was edited to 2-D would silently change meaning from "a Z-strided
+/// walk" to "a constant 0", so the axis is named as not enabled by *this
+/// clause* rather than as an unsupported builtin.
+fn out_of_rank_msg(ident: &str, axis: usize, rank: u8) -> String {
+    let axis_name = ["X", "Y", "Z"][axis];
+    format!(
+        "`{ident}` names the {axis_name} axis, which this kernel's `dispatch(...)` clause does \
+         not enable — the `cube_dim` tuple's arity IS the dispatch rank, and it is {rank}. The \
+         {axis_name} axis builtins are always 0/1 on a rank-{rank} launch, so accepting them \
+         would silently turn a strided walk into a constant; widen the clause to \
+         `cube_dim = (Wx, Wy, Wz)` / `extents = (w, h, d)` if you meant a rank-3 dispatch, or \
+         drop the {axis_name} reference (docs/design-2d-dispatch.md §13 risk 7)"
+    )
+}
 
 /// Free functions (called bare, e.g. `range_stepped(...)`, never as a
 /// method or via a qualified path) empirically known to be host-callable
@@ -466,6 +714,11 @@ struct ContractSpec {
     /// `Expr` is the pinned `cube_dim` (the launch block size and the prover's
     /// `CUBE_DIM` binding).
     cooperative: Option<(proc_macro2::Span, Expr)>,
+    /// `dispatch(cube_dim = (…), extents = (…))` clause, if declared — gates
+    /// the multi-axis (2-D/3-D) twin and the per-axis prover model
+    /// (docs/design-2d-dispatch.md §4.2). Mutually exclusive with
+    /// `cooperative(...)` in v1 (D6/R4).
+    dispatch: Option<DispatchSpec>,
     /// `reference = path::to::fn` clause, if declared — candidate #3, the
     /// declared-reference fallback (docs/design-shared-memory.md §4.4/§6). An
     /// author-supplied sequential reference for a cooperative kernel the
@@ -490,6 +743,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
     let mut instantiate: Option<(proc_macro2::Span, Vec<InstantiateEntry>)> = None;
     let mut uses: Vec<Ident> = Vec::new();
     let mut cooperative: Option<(proc_macro2::Span, Expr)> = None;
+    let mut dispatch: Option<DispatchSpec> = None;
     let mut reference: Option<(proc_macro2::Span, Path)> = None;
 
     for meta in metas {
@@ -643,6 +897,192 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
                 })?;
                 cooperative = Some((list.span(), cube_dim));
             }
+            // `dispatch(cube_dim = (Wx, Wy[, Wz]), extents = (e0, e1[, e2]))`
+            // — docs/design-2d-dispatch.md §4.2. Gates D1/D2/D3/D7 are here
+            // (they are decidable from the clause alone); D4/D5/D6/D8 need the
+            // parameter list or the body and live in `expand`.
+            Meta::List(list) if list.path.is_ident("dispatch") => {
+                // D7.
+                if dispatch.is_some() {
+                    return Err(syn::Error::new(
+                        list.span(),
+                        "duplicate dispatch(...) clause; a kernel declares at most one \
+                         (docs/design-2d-dispatch.md §4.2 D7)",
+                    ));
+                }
+                let inner: Punctuated<Meta, Token![,]> = list
+                    .parse_args_with(Punctuated::parse_terminated)
+                    .map_err(|e| {
+                        syn::Error::new(
+                            list.span(),
+                            format!(
+                                "dispatch(...) expects `cube_dim = (Wx, Wy[, Wz]), \
+                                 extents = (e0, e1[, e2])`: {e}"
+                            ),
+                        )
+                    })?;
+                let mut cube_dim_tuple: Option<(proc_macro2::Span, Vec<u32>)> = None;
+                let mut extents: Option<(proc_macro2::Span, Vec<Ident>)> = None;
+                for m in &inner {
+                    match m {
+                        Meta::NameValue(nv) if nv.path.is_ident("cube_dim") => {
+                            let Expr::Tuple(t) = &nv.value else {
+                                return Err(syn::Error::new(
+                                    nv.value.span(),
+                                    "`dispatch(cube_dim = ...)` takes a 2- or 3-tuple of \
+                                     positive integer *literals*, e.g. `cube_dim = (16, 16)`",
+                                ));
+                            };
+                            let mut dims = Vec::new();
+                            for e in &t.elems {
+                                // D1 / R5a — a literal is what gives the prover
+                                // an SMT numeral and the twin a loop stride.
+                                let Expr::Lit(ExprLit { lit: Lit::Int(li), .. }) = e else {
+                                    return Err(syn::Error::new(
+                                        e.span(),
+                                        format!(
+                                            "`dispatch(cube_dim = ...)` takes 2 or 3 positive \
+                                             integer *literals* — `{}` is not a literal. The \
+                                             prover binds each entry as an SMT numeral and the \
+                                             reference twin uses it as a loop stride, so a \
+                                             runtime value would leave both undefined",
+                                            pretty(&e.to_token_stream())
+                                        ),
+                                    ));
+                                };
+                                let v: u32 = li.base10_parse().map_err(|_| {
+                                    syn::Error::new(
+                                        e.span(),
+                                        "`dispatch(cube_dim = ...)` entries must fit in a u32",
+                                    )
+                                })?;
+                                if v == 0 {
+                                    return Err(syn::Error::new(
+                                        e.span(),
+                                        "`dispatch(cube_dim = ...)` entries must be >= 1 — a \
+                                         zero-width cube launches no threads at all",
+                                    ));
+                                }
+                                dims.push(v);
+                            }
+                            cube_dim_tuple = Some((t.span(), dims));
+                        }
+                        Meta::NameValue(nv) if nv.path.is_ident("extents") => {
+                            let Expr::Tuple(t) = &nv.value else {
+                                return Err(syn::Error::new(
+                                    nv.value.span(),
+                                    "`dispatch(extents = ...)` takes a 2- or 3-tuple naming this \
+                                     kernel's runtime `u32` extent parameters, e.g. \
+                                     `extents = (w, h)`",
+                                ));
+                            };
+                            let mut names = Vec::new();
+                            for e in &t.elems {
+                                match e {
+                                    Expr::Path(p) if p.path.get_ident().is_some() => {
+                                        names.push(p.path.get_ident().unwrap().clone());
+                                    }
+                                    // R12 — a `cube_struct!` field (or any other
+                                    // dotted path) named as an extent.
+                                    other => {
+                                        return Err(syn::Error::new(
+                                            other.span(),
+                                            format!(
+                                                "`dispatch(extents = ...)` names runtime `u32` \
+                                                 *parameters* of this kernel; `{}` is not a bare \
+                                                 parameter name. The launch harness derives the \
+                                                 cube count from the extents before it builds a \
+                                                 struct's launch argument, so a field would have \
+                                                 to be read twice from two places. Pass the \
+                                                 extents as loose `u32` parameters",
+                                                pretty(&other.to_token_stream())
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                            extents = Some((t.span(), names));
+                        }
+                        other => {
+                            return Err(syn::Error::new(
+                                other.span(),
+                                "dispatch(...) only accepts `cube_dim = (…)` and `extents = (…)` \
+                                 (docs/design-2d-dispatch.md §4.2)",
+                            ));
+                        }
+                    }
+                }
+                let (cube_dim_span, dims) = cube_dim_tuple.ok_or_else(|| {
+                    syn::Error::new(
+                        list.span(),
+                        "dispatch(...) requires `cube_dim = (Wx, Wy[, Wz])` (the pinned per-axis \
+                         block dims)",
+                    )
+                })?;
+                let (extents_span, extent_names) = extents.ok_or_else(|| {
+                    syn::Error::new(
+                        list.span(),
+                        "dispatch(...) requires `extents = (e0, e1[, e2])` (this kernel's own \
+                         runtime `u32` problem extents)",
+                    )
+                })?;
+                if dims.len() < 2 || dims.len() > 3 {
+                    return Err(syn::Error::new(
+                        cube_dim_span,
+                        format!(
+                            "`dispatch(cube_dim = ...)` takes 2 or 3 entries (the tuple's arity \
+                             IS the dispatch rank); this one has {}. A 1-D dispatch is the \
+                             ordinary vericl kernel — drop the clause and index with \
+                             `ABSOLUTE_POS`",
+                            dims.len()
+                        ),
+                    ));
+                }
+                // D2 / R5b — the measured `max_units_per_cube` ceiling.
+                let product: u64 = dims.iter().map(|d| *d as u64).product();
+                if product > 1024 {
+                    let listed = dims
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(syn::Error::new(
+                        cube_dim_span,
+                        format!(
+                            "`dispatch(cube_dim = ({listed}))` has {product} units per cube, \
+                             above the 1024 this milestone accepts. 1024 is the measured \
+                             `max_units_per_cube` on the reference backend (wgpu 29 / Metal); \
+                             the WebGPU default is 256, and a clause tuned above it will launch \
+                             here and be rejected elsewhere. cubecl validates the same bound at \
+                             launch (cubecl-runtime `validation.rs`), so this is the early, \
+                             named form of a failure you would otherwise hit at run time"
+                        ),
+                    ));
+                }
+                // D3.
+                if extent_names.len() != dims.len() {
+                    return Err(syn::Error::new(
+                        extents_span,
+                        format!(
+                            "`dispatch(...)`: `extents` has {} entries but `cube_dim` has {} — \
+                             the two arities must match, because the cube_dim tuple's arity is \
+                             the dispatch rank and each axis needs exactly one problem extent \
+                             (docs/design-2d-dispatch.md §4.2 D3)",
+                            extent_names.len(),
+                            dims.len()
+                        ),
+                    ));
+                }
+                let rank = dims.len() as u8;
+                let mut padded = [1u32; 3];
+                padded[..dims.len()].copy_from_slice(&dims);
+                dispatch = Some(DispatchSpec {
+                    span: list.span(),
+                    dims: padded,
+                    rank,
+                    extents: extent_names,
+                });
+            }
             Meta::NameValue(nv) if nv.path.is_ident("reference") => {
                 if reference.is_some() {
                     return Err(syn::Error::new(
@@ -664,7 +1104,8 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
                 return Err(syn::Error::new(
                     other.span(),
                     "expected `assumes(...)`, `compare(...)`, `gen(...)`, `instantiate(...)`, \
-                     `uses(...)`, `cooperative(...)`, `reference = fn`, or `wrapping`",
+                     `uses(...)`, `cooperative(...)`, `dispatch(...)`, `reference = fn`, or \
+                     `wrapping`",
                 ));
             }
         }
@@ -680,6 +1121,7 @@ fn parse_contract(attr: TokenStream2) -> syn::Result<ContractSpec> {
         instantiate,
         uses,
         cooperative,
+        dispatch,
         reference,
     })
 }
@@ -708,19 +1150,79 @@ type GenericSubst = HashMap<String, TokenStream2>;
 /// same treatment as every other topology builtin. The dogfood survey
 /// found zero helpers using topology, so this costs nothing real (see
 /// docs/dogfood-2026-07.md).
+/// The twin-derivation mode [`transform_body`] runs in — one value rather than
+/// four loose booleans, so a caller cannot accidentally combine two mutually
+/// exclusive modes (the macro-side sibling of the prover's `TopologyMode`).
+#[derive(Clone, Copy)]
+struct BodyMode<'a> {
+    /// `true` for a launch kernel's twin (`ABSOLUTE_POS` becomes the sequential
+    /// loop variable), `false` for a `#[vericl::helper]`'s.
+    allow_absolute_pos: bool,
+    /// The `cooperative(...)` clause is declared.
+    coop: bool,
+    /// This is a `Vector<P, W>` kernel (the `Vector` ident is rewritten to the
+    /// host lane-array shim rather than rejected).
+    vector_gate: bool,
+    /// The `dispatch(...)` clause is declared — per-axis builtins are legal (and
+    /// rewritten to the multi-axis twin's loop variables) for the enabled rank,
+    /// and the three flat position/count builtins are rejected (R1).
+    dispatch: Option<&'a DispatchSpec>,
+}
+
+/// [`BodyMode`] for a `#[vericl::helper]` device fn's twin: no topology at all
+/// (a helper's host twin has no notion of "which thread" is calling it).
+const HELPER_BODY_MODE: BodyMode<'static> =
+    BodyMode { allow_absolute_pos: false, coop: false, vector_gate: false, dispatch: None };
+
 fn transform_body(
     ts: TokenStream2,
     subst: &GenericSubst,
-    allow_absolute_pos: bool,
-    coop: bool,
-    vector_gate: bool,
+    mode: BodyMode<'_>,
     errors: &mut Vec<syn::Error>,
 ) -> TokenStream2 {
+    let BodyMode { allow_absolute_pos, coop, vector_gate, dispatch } = mode;
     let mut out = TokenStream2::new();
     for tt in ts {
         match tt {
             TokenTree::Ident(id) => {
                 let s = id.to_string();
+                // --- dispatch(...) mode: the per-axis leaves are legal and
+                // rewritten to the nested grid loop's variables (§4.7), the
+                // three flat position/count builtins are rejected (R1, §4.4).
+                if let Some(d) = dispatch {
+                    if DISPATCH_BANNED_FLAT.contains(&s.as_str()) {
+                        errors.push(syn::Error::new(
+                            id.span(),
+                            flat_builtin_in_dispatch_msg(&s),
+                        ));
+                        out.extend(std::iter::once(TokenTree::Ident(id)));
+                        continue;
+                    }
+                    if let Some((axis, role)) = DispatchSpec::per_axis_role(&s) {
+                        if !d.axis_enabled(axis) {
+                            errors.push(syn::Error::new(
+                                id.span(),
+                                out_of_rank_msg(&s, axis, d.rank),
+                            ));
+                            out.extend(std::iter::once(TokenTree::Ident(id)));
+                            continue;
+                        }
+                        out.extend(d.per_axis_rewrite(axis, role));
+                        continue;
+                    }
+                    // Flat `CUBE_DIM` / `UNIT_POS` stay supported: with the dims
+                    // pinned they are a numeral and a pinned-coefficient linear
+                    // form, and neither can wrap (§4.4).
+                    if s == "CUBE_DIM" {
+                        let total = d.dims[0] * d.dims[1] * d.dims[2];
+                        out.extend(quote!(#total));
+                        continue;
+                    }
+                    if s == "UNIT_POS" {
+                        out.extend(d.flat_unit_pos_rewrite());
+                        continue;
+                    }
+                }
                 // The ordinary twin rewrites `ABSOLUTE_POS` to the flat
                 // sequential loop variable. The cooperative twin does NOT: it
                 // binds `ABSOLUTE_POS = CUBE_POS*cube_dim + unit_pos` per
@@ -772,6 +1274,28 @@ fn transform_body(
                          thread\" is calling it; read positions in the kernel and pass them as \
                          plain scalar arguments instead"
                             .to_string()
+                    } else if DispatchSpec::per_axis_role(&s).is_some() && !allow_absolute_pos
+                    {
+                        // A per-axis builtin in a #[vericl::helper]: the
+                        // `dispatch(...)` clause is a KERNEL clause, so R2's
+                        // "add the clause" advice would send the author to a
+                        // place they cannot write it. Same answer as flat
+                        // `ABSOLUTE_POS` gets one arm up (design §9: "a helper's
+                        // twin cannot read topology at all — per-axis positions
+                        // are passed as plain `u32` arguments").
+                        format!(
+                            "`{s}` is outside the vericl v0 subset for a #[vericl::helper] device \
+                             function — a helper's host twin has no notion of \"which thread\" is \
+                             calling it, per axis or otherwise; read the position in the kernel \
+                             (under its `dispatch(...)` clause) and pass it as a plain `u32` \
+                             argument instead"
+                        )
+                    } else if dispatch.is_none()
+                        && DispatchSpec::per_axis_role(&s).is_some()
+                    {
+                        // R2: a per-axis builtin with no `dispatch(...)` clause
+                        // — the `cooperative(...)` biconditional generalized.
+                        per_axis_without_clause_msg(&s)
                     } else if COOP_CONSTRUCTS.contains(&s.as_str()) {
                         // A cooperative construct in a NON-cooperative kernel:
                         // point the author at the `cooperative(...)` clause
@@ -798,8 +1322,7 @@ fn transform_body(
                 out.extend(std::iter::once(TokenTree::Ident(id)));
             }
             TokenTree::Group(g) => {
-                let inner =
-                    transform_body(g.stream(), subst, allow_absolute_pos, coop, vector_gate, errors);
+                let inner = transform_body(g.stream(), subst, mode, errors);
                 let mut ng = Group::new(g.delimiter(), inner);
                 ng.set_span(g.span());
                 out.extend(std::iter::once(TokenTree::Group(ng)));
@@ -3565,6 +4088,144 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         }
     }
 
+    // --- dispatch(...) gates D3–D6 + R13 (docs/design-2d-dispatch.md §4.2,
+    // §10.3). D1/D2/D3/D7 are decided in `parse_contract` (they need only the
+    // clause); these need the parameter list, the body, or the other clauses.
+    // D8/R1/R2 and the out-of-rank rejection live in `transform_body`, at the
+    // offending ident's own span.
+    if let Some(d) = &spec.dispatch {
+        // D6 / R4 — mutually exclusive with cooperative(...) in v1.
+        if is_coop {
+            return Err(syn::Error::new(
+                d.span,
+                "`dispatch(...)` and `cooperative(...)` are mutually exclusive in the vericl v1 \
+                 subset — 2-D workgroups with shared memory are deferred. The intra-cube half is \
+                 measured tractable (a two-thread tile-write obligation over per-axis unit ids \
+                 discharges in under 10 ms), but the inter-cube half is not: proving \
+                 `out[ABSOLUTE_POS_Y * w + ABSOLUTE_POS_X]` is written by exactly one thread \
+                 across cubes needs a variable-by-variable product, and z3 times out on it at \
+                 180 s where the 1-D `out[ABSOLUTE_POS]` case is an O(1) pattern match. It needs \
+                 a 2-D write-pattern recognizer, not a generalization \
+                 (docs/design-2d-dispatch.md §8)",
+            ));
+        }
+        // D5 / R3 — the clause and the topology must agree both ways (the
+        // `cooperative(...)` biconditional, generalized).
+        if !kernel_uses_per_axis(&func.block) {
+            return Err(syn::Error::new(
+                d.span,
+                "this kernel declares `dispatch(...)` but its body reads no per-axis topology \
+                 builtin — a dispatch clause changes the launch shape, the reference twin's \
+                 iteration space and the recorded evidence, so declaring one for a kernel that \
+                 does not use it is a contract lie. Remove the clause, or index with \
+                 `ABSOLUTE_POS_X`/`ABSOLUTE_POS_Y`",
+            ));
+        }
+        // R13 — `Vector<P, W>` × dispatch: a vector suite's `sizes` are LINE
+        // counts while a dispatch suite's are EXTENTS, two units in one evidence
+        // config with no decided reconciliation (design §9, §10.5).
+        if is_vector_kernel {
+            return Err(syn::Error::new(
+                d.span,
+                "`dispatch(...)` and `Vector<P, W>` arrays are mutually exclusive in the vericl \
+                 v1 subset — a `Vector` kernel's `sizes` are *line* counts (each line is W \
+                 scalars, recorded as `sizes_unit: \"lines\"`) while a dispatch suite's are \
+                 *extents*, and reconciling two units in one evidence config is undecided rather \
+                 than merely unimplemented (docs/design-2d-dispatch.md §9, §10.5)",
+            ));
+        }
+        // D4, and the narrowing this implementation adds: the extents' IR
+        // `GlobalScalar` ids are computed positionally (see
+        // `u32_scalar_slot`), which a runtime `cube_struct!` parameter would
+        // silently shift — its fields flatten into the same per-storage-type
+        // scalar counter and their types live in a `vericl::cube_struct!` block
+        // this macro never parsed. Fail closed rather than guess an id.
+        if let Some(p) = params.iter().find(|p| matches!(p.kind, ParamKind::Struct(_))) {
+            let ParamKind::Struct(ty) = &p.kind else { unreachable!() };
+            return Err(syn::Error::new(
+                ty.span(),
+                format!(
+                    "`dispatch(...)` is outside the vericl v1 subset for a kernel with a runtime \
+                     `vericl::cube_struct!` parameter (`{}: {}`). CubeCL flattens a runtime \
+                     struct's fields into the same per-element-type scalar registration counter \
+                     the extents are numbered by, and this macro cannot see the declared field \
+                     types (they live in a `cube_struct!` block it never parsed) — so it cannot \
+                     compute which IR scalar `dispatch(extents = ...)` names. Pass the extents \
+                     and every other runtime value as loose scalar parameters \
+                     (docs/design-2d-dispatch.md §9, narrowed)",
+                    p.name,
+                    ty.to_token_stream()
+                ),
+            ));
+        }
+        for name in &d.extents {
+            let Some(p) = params.iter().find(|p| &p.name == name) else {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!(
+                        "`dispatch(extents = ...)` names `{name}`, which is not a parameter of \
+                         kernel `{fn_name_str}` — each extent must be a declared runtime `u32` \
+                         parameter carrying that axis's problem extent \
+                         (docs/design-2d-dispatch.md §4.2 D4)"
+                    ),
+                ));
+            };
+            match &p.kind {
+                ParamKind::Scalar(ty) if NumKind::of(ty) == Some(NumKind::U32) => {}
+                ParamKind::Comptime(_) => {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        format!(
+                            "`dispatch(extents = ...)` names the #[comptime] parameter `{name}`; \
+                             an extent must be a *runtime* `u32` parameter. The launch harness \
+                             binds each extent from the differential case's size and derives the \
+                             cube count from it, so a compile-time-pinned extent would make \
+                             every case the same shape (docs/design-2d-dispatch.md §4.2 D4)"
+                        ),
+                    ));
+                }
+                other => {
+                    let shown = match other {
+                        ParamKind::Scalar(ty) => ty.to_token_stream().to_string(),
+                        ParamKind::ArrayRef(e) | ParamKind::ArrayMut(e) => {
+                            format!("Array<{}>", e.to_token_stream())
+                        }
+                        _ => "a non-scalar".to_string(),
+                    };
+                    return Err(syn::Error::new(
+                        name.span(),
+                        format!(
+                            "`dispatch(extents = ...)` names `{name}: {shown}`; an extent must be \
+                             a runtime `u32` parameter. The extent is bound from the case size, \
+                             multiplied to size un-pinned buffers, and divided by the pinned cube \
+                             dim to derive the cube count — all `u32` operations \
+                             (docs/design-2d-dispatch.md §4.2 D4)"
+                        ),
+                    ));
+                }
+            }
+            // An extent is BOUND from the case size, never drawn — a
+            // `gen(...)` range for it would be silently ignored, which is
+            // exactly the kind of contract lie the biconditional gates exist to
+            // prevent.
+            if spec.gen_entries.iter().any(|e| match e {
+                GenEntry::Range { name: n, .. } => n == name,
+                GenEntry::Len { .. } => false,
+            }) {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!(
+                        "`{name}` is a `dispatch(extents = ...)` parameter, so it is bound from \
+                         each differential case's declared size — a `gen({name} in ...)` range \
+                         for it would never be drawn. Remove the gen(...) entry; the suite's \
+                         `sizes:` tuples are where a 2-D/3-D case's extents come from \
+                         (docs/design-2d-dispatch.md §4.8)"
+                    ),
+                ));
+            }
+        }
+    }
+
     // --- derive the reference twin body: ABSOLUTE_POS rewrite (ordinary twin
     // only — the cooperative twin binds ABSOLUTE_POS per segment) + F -> f32
     // token substitution + banned-construct rejection, then always parse as
@@ -3578,8 +4239,17 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     let comptime_set: HashSet<String> =
         comptime_param_names.iter().map(|i| i.to_string()).collect();
     let pre_body = rewrite_comptime_blocks(func.block.to_token_stream(), &comptime_set, &mut errors);
-    let ref_body_tokens =
-        transform_body(pre_body, &plan.generic_subst, true, is_coop, is_vector_kernel, &mut errors);
+    let ref_body_tokens = transform_body(
+        pre_body,
+        &plan.generic_subst,
+        BodyMode {
+            allow_absolute_pos: true,
+            coop: is_coop,
+            vector_gate: is_vector_kernel,
+            dispatch: spec.dispatch.as_ref(),
+        },
+        &mut errors,
+    );
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
         a
@@ -3963,10 +4633,28 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             _ => None,
         })
         .collect();
+    // Runtime `u32` scalar parameters and their IR `GlobalScalar` ids — the
+    // operands `Assume::LenEqProduct` names (docs/design-2d-dispatch.md §4.6).
+    // Empty of dispatch relevance for every other kernel: a kernel with no
+    // product assume never reaches the recognizer, and one with a runtime
+    // `cube_struct!` parameter cannot declare `dispatch(...)` at all (the id
+    // would be unknowable), so this map is only ever consulted where it is
+    // exact.
+    let u32_scalar_slots: HashMap<String, u32> = params
+        .iter()
+        .filter(|p| matches!(&p.kind, ParamKind::Scalar(t) if NumKind::of(t) == Some(NumKind::U32)))
+        .filter_map(|p| u32_scalar_slot(&params, &p.name).map(|s| (p.name.to_string(), s)))
+        .collect();
+    // R6 — the wrapping product spelling is a hard error, not merely
+    // unrecognized (docs/design-2d-dispatch.md §10.3). Runs before recognition
+    // so the author gets the named fix rather than a silent no-op clause.
+    reject_wrapping_product_assume(&spec.assumes, &array_param_names, &u32_scalar_slots)?;
     let recognized_assumes: Vec<RecognizedAssume> = spec
         .assumes
         .iter()
-        .filter_map(|e| recognize_assume(e, &array_param_names, &array_elem_kinds))
+        .filter_map(|e| {
+            recognize_assume(e, &array_param_names, &array_elem_kinds, &u32_scalar_slots)
+        })
         .collect();
     let structured_assumes: Vec<TokenStream2> =
         recognized_assumes.iter().map(RecognizedAssume::to_tokens).collect();
@@ -4078,6 +4766,42 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     // any kernel without a `Vector` width generic — the scalar path unchanged).
     let kd_width_args = &plan.width_args;
 
+    // --- §10.4 correction 4: extract the IR at the cube dim the kernel is
+    // actually LAUNCHED with.
+    //
+    // `kernel_definition()` used to call `KernelSettings::default()`, whose cube
+    // dim is `CubeDim { x: 1, y: 1, z: 1 }` (measured, design §1.2) — so the
+    // `def.cube_dim` that `vericl_ir::kernel_ir_hash` dutifully folds
+    // (`hash.rs:80`) was the SAME CONSTANT for every kernel in the tree,
+    // `cooperative(cube_dim = 256)` included, and contributed nothing. The IR
+    // *body* really is byte-identical across cube dims (measured: `new_1d(256)`
+    // and `new_2d(16,16)` produce identical bodies and differ only in
+    // `def.cube_dim`), and a clause edit stales evidence anyway through
+    // `SOURCE_HASH`'s attribute tokens — but "vericl extracts and hashes IR
+    // under settings the launch does not use" is round 11's classification split
+    // in miniature, and a milestone whose whole contract IS the launch shape
+    // should not leave it. Threading the pinned dims in makes `ir_hash` an
+    // independent tripwire on the dispatch shape rather than a constant.
+    //
+    // A kernel with NO pinned clause keeps `KernelSettings::default()`: its
+    // launch cube dim is the suite's runtime `cube_dim:` field, which this macro
+    // cannot see, so pinning anything here would be a different lie.
+    let kernel_settings = if let Some(d) = &spec.dispatch {
+        let [wx, wy, wz] = d.dims;
+        if d.rank == 2 {
+            quote!(::cubecl::prelude::KernelSettings::default()
+                .cube_dim(::cubecl::prelude::CubeDim::new_2d(#wx, #wy)))
+        } else {
+            quote!(::cubecl::prelude::KernelSettings::default()
+                .cube_dim(::cubecl::prelude::CubeDim::new_3d(#wx, #wy, #wz)))
+        }
+    } else if let Some((_, cd)) = &spec.cooperative {
+        quote!(::cubecl::prelude::KernelSettings::default()
+            .cube_dim(::cubecl::prelude::CubeDim::new_1d((#cd) as u32)))
+    } else {
+        quote!(::cubecl::prelude::KernelSettings::default())
+    };
+
     // --- reference() function + conformance_case(): the macro-generated GPU
     // launch/input-gen glue (README ergonomics milestone). The cooperative
     // clause swaps in the phase-split twin (coop.rs) and the cooperative
@@ -4132,13 +4856,64 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
         )?;
         (reference_fn, conformance)
     } else {
-        let reference_fn = quote! {
-            /// Sequential scalar reference execution over
-            /// `ABSOLUTE_POS in 0..num_threads` — the same iteration space as
-            /// the GPU dispatch, in deterministic ascending order.
-            pub fn reference(#(#ref_params,)* num_threads: usize) {
-                #(#comptime_bindings)*
-                for __vericl_abs_pos in 0..num_threads #ref_body
+        let reference_fn = if let Some(d) = &spec.dispatch {
+            // The multi-axis twin (docs/design-2d-dispatch.md §4.7): one loop
+            // per enabled axis, Z outermost and X innermost, over the GRID (not
+            // the image) so the padding threads run the guard exactly as on
+            // device. Four decided properties, in the doc's order:
+            //
+            //   1. Z -> Y -> X reproduces the flat `ABSOLUTE_POS` order exactly
+            //      (§1.3's row-major flatten), so the twin's write-ordering
+            //      convention for aliasing writes is UNCHANGED from the 1-D twin
+            //      and a kernel ported from flat to per-axis addressing keeps
+            //      the same reference semantics. Any other nesting would
+            //      silently change the convention.
+            //   2. The bounds are `__vericl_grid.a = ceil(e_a/Wa)*Wa >= e_a`
+            //      — the grid, not the image. A twin looping `0..w` would model
+            //      a *different* kernel (one with no padding) and would agree
+            //      with the device only by luck.
+            //   3. The loop variables are `u32`, matching `ABSOLUTE_POS_X`'s
+            //      frontend type; index expressions carry the author's own
+            //      `as usize`, as they must in the kernel.
+            //   4. Every per-axis builtin rewrite (`UNIT_POS_a -> abs_a % Wa`,
+            //      `CUBE_POS_a -> abs_a / Wa`, `CUBE_DIM_a -> the literal`,
+            //      `CUBE_COUNT_a -> grid_a / Wa`) is an exact per-axis relation,
+            //      measured 0 violations / 1 212 threads — none of them is the
+            //      cross-axis flat identity that breaks in §2.
+            let mut nest = quote!(#ref_body);
+            for axis in 0..d.rank as usize {
+                let var = format_ident!("__vericl_abs_{}", ["x", "y", "z"][axis]);
+                let idx = syn::Index::from(axis);
+                nest = quote! {
+                    for #var in 0u32..__vericl_grid.#idx { #nest }
+                };
+            }
+            quote! {
+                /// Sequential scalar reference execution over the multi-axis
+                /// thread GRID — `for z { for y { for x { … } } }`, the same
+                /// iteration space (padding threads included) and the same
+                /// row-major order as the real dispatch
+                /// (docs/design-2d-dispatch.md §4.7).
+                ///
+                /// `__vericl_grid` is `(ceil(e0/Wx)*Wx, ceil(e1/Wy)*Wy,
+                /// ceil(e2/Wz)*Wz)`, derived by the caller
+                /// (`conformance_case`) from the case extents and the clause's
+                /// pinned cube dims — the SAME tokens the launch uses, so the
+                /// twin and the dispatch cannot disagree about the grid.
+                pub fn reference(#(#ref_params,)* __vericl_grid: (u32, u32, u32)) {
+                    #(#comptime_bindings)*
+                    #nest
+                }
+            }
+        } else {
+            quote! {
+                /// Sequential scalar reference execution over
+                /// `ABSOLUTE_POS in 0..num_threads` — the same iteration space as
+                /// the GPU dispatch, in deterministic ascending order.
+                pub fn reference(#(#ref_params,)* num_threads: usize) {
+                    #(#comptime_bindings)*
+                    for __vericl_abs_pos in 0..num_threads #ref_body
+                }
             }
         };
         // The vectorized differential path (flat-scalar gen of `lines*W`
@@ -4168,6 +4943,7 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                 &plan.comptime_values,
                 generic_types,
                 &elem_gen_bounds,
+                spec.dispatch.as_ref(),
             )?
         };
         (reference_fn, conformance)
@@ -4196,6 +4972,17 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     let coop_cube_dim_const = match &spec.cooperative {
         Some((_, cd)) => quote!(::core::option::Option::Some((#cd) as u32)),
         None => quote!(::core::option::Option::None),
+    };
+    let (dispatch_rank_const, dispatch_cube_dim_const) = match &spec.dispatch {
+        Some(d) => {
+            let rank = d.rank;
+            let [wx, wy, wz] = d.dims;
+            (
+                quote!(::core::option::Option::Some(#rank)),
+                quote!(::core::option::Option::Some([#wx, #wy, #wz])),
+            )
+        }
+        None => (quote!(::core::option::Option::None), quote!(::core::option::Option::None)),
     };
     // The twin's declared top-level barrier count, for the prover's
     // cooperative-composition barrier check (§7.4). 0 for a non-cooperative
@@ -4279,6 +5066,22 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
             /// `vericl::suite!` reads this to tag the tested claim with the
             /// strictly-weaker `differential-declared-reference` check string.
             pub const DECLARED_REFERENCE: bool = #declared_reference_const;
+
+            /// `Some(rank)` iff this kernel declares `dispatch(cube_dim = (…),
+            /// extents = (…))` — 2 or 3, the tuple arity that IS the dispatch
+            /// rank (docs/design-2d-dispatch.md §4.2). `vericl::suite!` reads
+            /// this to select the multi-axis case pipeline (tuple `sizes:`,
+            /// per-axis `CubeCount`, `differential_dispatch_config`) and to
+            /// reject a rank mismatch between the clause and the suite's
+            /// declared sizes at compile time.
+            pub const DISPATCH_RANK: ::core::option::Option<u8> = #dispatch_rank_const;
+
+            /// The `dispatch(...)` clause's pinned per-axis cube dims
+            /// (`Z = 1` for a rank-2 clause), or `None`. The prover's
+            /// `CUBE_DIM_X/Y/Z` numerals, the launch's `CubeDim`, and the twin's
+            /// loop strides all come from this one place (§4.2).
+            pub const DISPATCH_CUBE_DIM: ::core::option::Option<[u32; 3]> =
+                #dispatch_cube_dim_const;
 
             pub fn contract() -> ::vericl::Contract {
                 ::vericl::Contract {
@@ -4372,7 +5175,7 @@ fn expand(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
                     #(#kd_width_args,)*
                     #(#kd_call_args),*
                 );
-                __vericl_builder.build(::cubecl::prelude::KernelSettings::default())
+                __vericl_builder.build(#kernel_settings)
             }
 
             #conformance_items
@@ -4776,7 +5579,7 @@ fn expand_helper(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2>
     // deferred past V3 — the gate is off here, so a `Vector` in a helper body
     // stays banned. Kernel-level vector support is the V3 deliverable.
     let ref_body_tokens =
-        transform_body(pre_body, &plan.generic_subst, false, false, false, &mut errors);
+        transform_body(pre_body, &plan.generic_subst, HELPER_BODY_MODE, &mut errors);
     if let Some(combined) = errors.into_iter().reduce(|mut a, b| {
         a.combine(b);
         a
@@ -5177,6 +5980,12 @@ enum RecognizedAssume {
     /// `A.len() + K <= B.len()` (integer literal `K`; `K = 0` for the bare
     /// `A.len() <= B.len()` form).
     LenPlusConstLe { a: String, k: u64, b: String },
+    /// `A.len() == (x as usize) * (y as usize)` for two runtime `u32` scalar
+    /// parameters `x`, `y` — the fact that ties a 2-D dispatch's extents to a
+    /// buffer length (docs/design-2d-dispatch.md §4.6). `x_scalar`/`y_scalar`
+    /// are the operands' IR `GlobalScalar` ids (see [`u32_scalar_slot`]); the
+    /// names are kept for legibility only.
+    LenEqProduct { a: String, x: String, y: String, x_scalar: u32, y_scalar: u32 },
 }
 
 impl RecognizedAssume {
@@ -5197,6 +6006,11 @@ impl RecognizedAssume {
             }
             RecognizedAssume::LenPlusConstLe { a, k, b } => {
                 quote!(::vericl::StructuredAssume::LenPlusConstLe { a: #a, k: #k, b: #b })
+            }
+            RecognizedAssume::LenEqProduct { a, x, y, x_scalar, y_scalar } => {
+                quote!(::vericl::StructuredAssume::LenEqProduct {
+                    a: #a, x: #x, y: #y, x_scalar: #x_scalar, y_scalar: #y_scalar
+                })
             }
         }
     }
@@ -5227,10 +6041,132 @@ fn recognize_assume(
     expr: &Expr,
     array_params: &[String],
     elem_kinds: &HashMap<String, IntKind>,
+    u32_scalars: &HashMap<String, u32>,
 ) -> Option<RecognizedAssume> {
     recognize_len_assume(expr, array_params)
         .or_else(|| recognize_lenrel_assume(expr, array_params))
+        .or_else(|| recognize_product_assume(expr, array_params, u32_scalars))
         .or_else(|| recognize_elem_assume(expr, array_params, elem_kinds))
+}
+
+/// Peel exactly `<ident> as usize` for a declared runtime `u32` scalar
+/// parameter, returning `(name, GlobalScalar id)`.
+///
+/// **The round-4 cast rule, reused not reinvented.** The cast is peeled only
+/// because it is *value-preserving for the operand's own type*: `u32 -> usize`
+/// is a widening cast with no signedness flip on every host vericl supports
+/// (`usize` is 32 or 64 bits and unsigned), so the Rust value the executable
+/// `check_assumes` computes and the mathematical value the prover asserts are
+/// the same number at every input. That equivalence is exactly what
+/// [`cast_is_value_preserving`] decides for the prover's own casts, applied
+/// here at the recognizer.
+fn cast_u32_scalar_to_usize(e: &Expr, u32_scalars: &HashMap<String, u32>) -> Option<(String, u32)> {
+    let Expr::Cast(c) = peel_paren(e) else { return None };
+    let Type::Path(tp) = c.ty.as_ref() else { return None };
+    if tp.qself.is_some() || !tp.path.is_ident("usize") {
+        return None;
+    }
+    let Expr::Path(p) = peel_paren(&c.expr) else { return None };
+    let name = p.path.get_ident()?.to_string();
+    u32_scalars.get(&name).map(|slot| (name, *slot))
+}
+
+/// Recognize `A.len() == (x as usize) * (y as usize)` (either side of the
+/// `==`), for two declared runtime `u32` scalar parameters `x`, `y` — the
+/// **widen-then-multiply** spelling, and only that one
+/// (docs/design-2d-dispatch.md §4.6).
+///
+/// The other spelling, `A.len() == (x * y) as usize`, is a *false `Proved`*
+/// and is rejected outright by [`reject_wrapping_product_assume`] (R6) rather
+/// than merely left unrecognized: it multiplies in `u32` and then widens, so
+/// the executable `check_assumes` predicate tests the WRAPPED product while a
+/// naive recognizer asserts the mathematical one. Measured witness (`p3`, sat
+/// in 0.13 s): `w = 2, h = 2147483649` wraps to `2`, so a length-2 buffer
+/// satisfies the host predicate while the model believes the length is
+/// 4 294 967 298 — and an index of 2 then proves in bounds against a buffer
+/// that does not have it.
+fn recognize_product_assume(
+    expr: &Expr,
+    array_params: &[String],
+    u32_scalars: &HashMap<String, u32>,
+) -> Option<RecognizedAssume> {
+    let Expr::Binary(ExprBinary { left, op: BinOp::Eq(_), right, .. }) = expr else {
+        return None;
+    };
+    let (len_side, prod_side) = match len_call_target(left, array_params) {
+        Some(a) => (a, right.as_ref()),
+        None => (len_call_target(right, array_params)?, left.as_ref()),
+    };
+    let Expr::Binary(ExprBinary { left: pl, op: BinOp::Mul(_), right: pr, .. }) =
+        peel_paren(prod_side)
+    else {
+        return None;
+    };
+    let (x, x_scalar) = cast_u32_scalar_to_usize(pl, u32_scalars)?;
+    let (y, y_scalar) = cast_u32_scalar_to_usize(pr, u32_scalars)?;
+    Some(RecognizedAssume::LenEqProduct { a: len_side, x, y, x_scalar, y_scalar })
+}
+
+/// R6 — reject the **wrapping** product-assume spelling `A.len() == (x * y) as
+/// usize` at the cast's own span (docs/design-2d-dispatch.md §10.3).
+///
+/// Left merely unrecognized this would be *sound but useless*; rejected, it is
+/// a named authoring error with the fix in the message. The gate is
+/// load-bearing, not decorative: `recognize_product_assume` above would
+/// otherwise be one obvious "helpfully also accept the other spelling" edit
+/// away from the measured `p3` false `Proved`.
+fn reject_wrapping_product_assume(
+    exprs: &[Expr],
+    array_params: &[String],
+    u32_scalars: &HashMap<String, u32>,
+) -> syn::Result<()> {
+    for expr in exprs {
+        let Expr::Binary(ExprBinary { left, op: BinOp::Eq(_), right, .. }) = expr else {
+            continue;
+        };
+        let cast_side = match len_call_target(left, array_params) {
+            Some(_) => right.as_ref(),
+            None => {
+                if len_call_target(right, array_params).is_none() {
+                    continue;
+                }
+                left.as_ref()
+            }
+        };
+        let Expr::Cast(c) = peel_paren(cast_side) else { continue };
+        let Type::Path(tp) = c.ty.as_ref() else { continue };
+        if tp.qself.is_some() || !tp.path.is_ident("usize") {
+            continue;
+        }
+        let Expr::Binary(ExprBinary { left: pl, op: BinOp::Mul(_), right: pr, .. }) =
+            peel_paren(&c.expr)
+        else {
+            continue;
+        };
+        let named = |e: &Expr| -> Option<String> {
+            let Expr::Path(p) = peel_paren(e) else { return None };
+            let n = p.path.get_ident()?.to_string();
+            u32_scalars.contains_key(&n).then_some(n)
+        };
+        let (Some(x), Some(y)) = (named(pl), named(pr)) else { continue };
+        return Err(syn::Error::new(
+            c.span(),
+            format!(
+                "`{a}.len() == ({x} * {y}) as usize` multiplies in u32 and then widens, so the \
+                 executable `check_assumes` predicate tests the WRAPPED product while the prover \
+                 would assert the mathematical one. Measured, those disagree: at \
+                 `{x} = 2, {y} = 2147483649` the wrapped product is 2, so a length-2 buffer \
+                 satisfies the clause while the model believes the length is 4294967298 — and an \
+                 index of 2 then proves in bounds against a buffer that does not have it. Write \
+                 `{a}.len() == ({x} as usize) * ({y} as usize)`: widening first makes the two \
+                 agree at every input (docs/design-2d-dispatch.md §4.6)",
+                a = len_call_target(left, array_params)
+                    .or_else(|| len_call_target(right, array_params))
+                    .unwrap_or_else(|| "A".to_string()),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Recognize the length-*relationship* form `A.len() + K <= B.len()` (and the
@@ -6022,6 +6958,7 @@ fn build_gen_field(
 /// for one kernel's `<name>_vericl` module (README ergonomics milestone:
 /// `#[vericl::kernel]` already knows every signature, so the harness no
 /// longer hand-writes GPU launch/input-gen glue per kernel).
+#[allow(clippy::too_many_arguments)]
 fn build_conformance_items(
     params: &[Param],
     gen_entries: &[GenEntry],
@@ -6030,6 +6967,7 @@ fn build_conformance_items(
     comptime_values: &HashMap<String, TokenStream2>,
     generic_types: &[Type],
     elem_gen_bounds: &HashMap<String, ElemGenBound>,
+    dispatch: Option<&DispatchSpec>,
 ) -> syn::Result<TokenStream2> {
     let (ranges, lens) = resolve_gen_entries(params, gen_entries, fn_name_str)?;
     // #[comptime] params are pinned by instantiate(...), not generated —
@@ -6060,6 +6998,26 @@ fn build_conformance_items(
         })
         .collect::<syn::Result<_>>()?;
 
+    // A `dispatch(extents = …)` parameter is BOUND from the case's declared
+    // extents, never drawn (docs/design-2d-dispatch.md §4.8) — the extents are
+    // the case's size, exactly as `n` is for a 1-D kernel. Rewriting the field's
+    // draw statement here (rather than special-casing `build_gen_field`) keeps
+    // the resample loop, `check_assumes` call and parameter order identical to
+    // every other kernel's.
+    let mut fields = fields;
+    if let Some(d) = dispatch {
+        for (axis, extent) in d.extents.iter().enumerate() {
+            let idx = axis;
+            for f in fields.iter_mut() {
+                if &f.name == extent {
+                    let name = &f.name;
+                    f.stmt = quote!(let #name: u32 = __vericl_extents[#idx] as u32;);
+                }
+            }
+        }
+    }
+    let fields = fields;
+
     let gen_stmts: Vec<&TokenStream2> = fields.iter().map(|f| &f.stmt).collect();
     let owned_tys: Vec<&TokenStream2> = fields.iter().map(|f| &f.owned_ty).collect();
     let field_names: Vec<&Ident> = fields.iter().map(|f| &f.name).collect();
@@ -6073,6 +7031,21 @@ fn build_conformance_items(
             }
         })
         .collect();
+
+    // A dispatch kernel's "size" is the extents tuple, not a scalar `n`. The
+    // un-pinned default buffer length becomes their product (§4.8), which is
+    // exactly what binding `n` to it here achieves — every `build_gen_field`
+    // length default reads `n` and is otherwise untouched.
+    let (gen_case_size_param, gen_case_n_binding) = if dispatch.is_some() {
+        (
+            quote!(__vericl_extents: [usize; 3]),
+            quote! {
+                let n: usize = __vericl_extents[0] * __vericl_extents[1] * __vericl_extents[2];
+            },
+        )
+    } else {
+        (quote!(n: usize), TokenStream2::new())
+    };
 
     let generate_case_fn = quote! {
         /// Generate one differential case's inputs deterministically from
@@ -6088,7 +7061,8 @@ fn build_conformance_items(
         /// harness ACTUALLY draws rather than hand-building a struct and
         /// asserting something about it — round-11 review, MODERATE 3.
         #[doc(hidden)]
-        pub fn generate_case(n: usize, seed: u64) -> ( #(#owned_tys,)* ) {
+        pub fn generate_case(#gen_case_size_param, seed: u64) -> ( #(#owned_tys,)* ) {
+            #gen_case_n_binding
             let mut __vericl_rng = ::vericl::SplitMix64::new(seed);
             for _vericl_attempt in 0..64u32 {
                 #(#gen_stmts)*
@@ -6221,36 +7195,94 @@ fn build_conformance_items(
         quote!(<#(#generic_types,)* R>)
     };
 
+    // The launch/twin-call preamble differs between the 1-D and the multi-axis
+    // dispatch: the SAME clause tokens feed the `CubeDim`, the per-axis
+    // `CubeCount` and the twin's `grid` triple (risk 6's mitigation — the twin
+    // and the launch share the derivation instead of re-deriving it), and the
+    // pinned dims mean there is no `cube_dim` argument to get wrong.
+    let (case_size_param, case_cube_dim_param, case_preamble, case_ref_arg, case_label) =
+        if let Some(d) = dispatch {
+            let [wx, wy, wz] = d.dims;
+            let cube_dim_ctor = if d.rank == 2 {
+                quote!(::cubecl::prelude::CubeDim::new_2d(#wx, #wy))
+            } else {
+                quote!(::cubecl::prelude::CubeDim::new_3d(#wx, #wy, #wz))
+            };
+            let label = if d.rank == 2 {
+                quote!(format!(
+                    "extents=({}, {})",
+                    __vericl_extents[0], __vericl_extents[1]
+                ))
+            } else {
+                quote!(format!(
+                    "extents=({}, {}, {})",
+                    __vericl_extents[0], __vericl_extents[1], __vericl_extents[2]
+                ))
+            };
+            (
+                quote!(__vericl_extents: [usize; 3]),
+                TokenStream2::new(),
+                quote! {
+                    let __vericl_cx = (__vericl_extents[0] as u32).div_ceil(#wx).max(1);
+                    let __vericl_cy = (__vericl_extents[1] as u32).div_ceil(#wy).max(1);
+                    let __vericl_cz = (__vericl_extents[2] as u32).div_ceil(#wz).max(1);
+                    let __vericl_cube_count = ::cubecl::prelude::CubeCount::Static(
+                        __vericl_cx, __vericl_cy, __vericl_cz,
+                    );
+                    let __vericl_cube_dim = #cube_dim_ctor;
+                    let __vericl_grid: (u32, u32, u32) =
+                        (__vericl_cx * #wx, __vericl_cy * #wy, __vericl_cz * #wz);
+                },
+                quote!(__vericl_grid),
+                label,
+            )
+        } else {
+            (
+                quote!(n: usize),
+                quote!(cube_dim: u32,),
+                quote! {
+                    let __vericl_count = (n as u32).div_ceil(cube_dim).max(1);
+                    let __vericl_cube_count =
+                        ::cubecl::prelude::CubeCount::Static(__vericl_count, 1, 1);
+                    let __vericl_cube_dim = ::cubecl::prelude::CubeDim::new_1d(cube_dim);
+                    let __vericl_num_threads = (__vericl_count * cube_dim) as usize;
+                },
+                quote!(__vericl_num_threads),
+                quote!(format!("n={n}")),
+            )
+        };
+    let case_size_arg =
+        if dispatch.is_some() { quote!(__vericl_extents) } else { quote!(n) };
+
     let conformance_case_fn = quote! {
         /// Run one differential case: generate inputs via `gen(...)`, run
         /// the sequential reference (catching a panic as a finding, not a
-        /// harness crash), launch the real kernel with standard 1D dispatch
-        /// (`CubeCount = ceil(n/cube_dim)`, `num_threads = count*cube_dim`),
-        /// and compare every `&mut Array` parameter's final contents
-        /// against the reference's — the single point of custody for the
-        /// GPU launch/input-gen glue every kernel previously hand-wrote.
+        /// harness crash), launch the real kernel (1-D: `CubeCount =
+        /// ceil(n/cube_dim)`, `num_threads = count*cube_dim`; under a
+        /// `dispatch(...)` clause: the per-axis `CubeCount =
+        /// (ceil(e0/Wx), ceil(e1/Wy), ceil(e2/Wz))` with the clause's pinned
+        /// `CubeDim`), and compare every `&mut Array` parameter's final
+        /// contents against the reference's — the single point of custody for
+        /// the GPU launch/input-gen glue every kernel previously hand-wrote.
         pub fn conformance_case<R: ::cubecl::prelude::Runtime>(
             client: &::cubecl::prelude::ComputeClient<R>,
-            n: usize,
+            #case_size_param,
             seed: u64,
-            cube_dim: u32,
+            #case_cube_dim_param
         ) -> ::vericl::CaseOutcome {
-            let ( #(#field_names,)* ) = generate_case(n, seed);
+            let ( #(#field_names,)* ) = generate_case(#case_size_arg, seed);
 
             #(#ref_clone_stmts)*
 
-            let __vericl_count = (n as u32).div_ceil(cube_dim).max(1);
-            let __vericl_cube_count = ::cubecl::prelude::CubeCount::Static(__vericl_count, 1, 1);
-            let __vericl_cube_dim = ::cubecl::prelude::CubeDim::new_1d(cube_dim);
-            let __vericl_num_threads = (__vericl_count * cube_dim) as usize;
+            #case_preamble
 
             let __vericl_ref_outcome = ::vericl::catch_reference_panic(|| {
-                reference(#(#reference_args,)* __vericl_num_threads);
+                reference(#(#reference_args,)* #case_ref_arg);
             });
 
             match __vericl_ref_outcome {
                 Err(__vericl_panic_msg) => ::vericl::CaseOutcome {
-                    case: format!("n={n}"),
+                    case: #case_label,
                     reports: ::std::vec::Vec::new(),
                     reference_panic: Some(__vericl_panic_msg),
                 },
@@ -6269,7 +7301,7 @@ fn build_conformance_items(
                     #(#compare_stmts)*
 
                     ::vericl::CaseOutcome {
-                        case: format!("n={n}"),
+                        case: #case_label,
                         reports: __vericl_reports,
                         reference_panic: None,
                     }
@@ -6610,6 +7642,12 @@ fn build_vector_conformance_items(
 
 #[cfg(test)]
 mod tests {
+    /// No runtime `u32` scalar parameters — the assume-recognizer fixtures here
+    /// are all about buffer lengths, so the `LenEqProduct` scalar map is empty.
+    fn no_scalars() -> HashMap<String, u32> {
+        HashMap::new()
+    }
+
     use super::*;
 
     /// The verified-safe and unverified/unsafe Float method name lists must
@@ -6956,7 +7994,7 @@ mod tests {
         let elems = elem_kinds(&[("offsets", "u32")]); // `x` is f32 → absent
         let expr: Expr =
             syn::parse_str("offsets.iter().all(|v| (*v as u8 as usize) < x.len())").unwrap();
-        let got = recognize_assume(&expr, &params, &elems);
+        let got = recognize_assume(&expr, &params, &elems, &no_scalars());
         assert!(
             got.is_none(),
             "truncating `as u8 as usize` chain must stay string-only, got {got:?}"
@@ -6979,7 +8017,7 @@ mod tests {
         let elems = elem_kinds(&[("offsets", "u32")]);
         let expr: Expr =
             syn::parse_str("offsets.iter().all(|v| (*v as u8) < x.len())").unwrap();
-        assert!(recognize_assume(&expr, &params, &elems).is_none());
+        assert!(recognize_assume(&expr, &params, &elems, &no_scalars()).is_none());
     }
 
     /// Value-preserving element-range forms are still recognized as
@@ -7002,7 +8040,7 @@ mod tests {
             let expr: Expr = syn::parse_str(src).unwrap();
             assert!(
                 matches!(
-                    recognize_assume(&expr, &params, &u32e),
+                    recognize_assume(&expr, &params, &u32e, &no_scalars()),
                     Some(RecognizedAssume::ElemsBelowLen { arr, len_of }) if arr == "offsets" && len_of == "x"
                 ),
                 "expected ElemsBelowLen for `{src}`"
@@ -7020,7 +8058,7 @@ mod tests {
             let expr: Expr = syn::parse_str(src).unwrap();
             assert!(
                 matches!(
-                    recognize_assume(&expr, &params, &u32e),
+                    recognize_assume(&expr, &params, &u32e, &no_scalars()),
                     Some(RecognizedAssume::ElemsBelowConst { arr, bound: 16 }) if arr == "offsets"
                 ),
                 "expected ElemsBelowConst for `{src}`"
@@ -7043,7 +8081,7 @@ mod tests {
             syn::parse_str("offsets.iter().all(|v| (*v as u64 as usize) < x.len())").unwrap();
         assert!(
             matches!(
-                recognize_assume(&expr, &params, &u32e),
+                recognize_assume(&expr, &params, &u32e, &no_scalars()),
                 Some(RecognizedAssume::ElemsBelowLen { arr, len_of }) if arr == "offsets" && len_of == "x"
             ),
             "value-preserving chain `as u64 as usize` from u32 must be recognized"
@@ -7061,14 +8099,14 @@ mod tests {
         let narrowing: Expr =
             syn::parse_str("offsets.iter().all(|v| (*v as usize) < x.len())").unwrap();
         assert!(
-            recognize_assume(&narrowing, &params, &u64e).is_none(),
+            recognize_assume(&narrowing, &params, &u64e, &no_scalars()).is_none(),
             "u64 element `as usize` may truncate on a 32-bit host — must stay string-only"
         );
         let width_equal: Expr =
             syn::parse_str("offsets.iter().all(|v| (*v as u64) < x.len())").unwrap();
         assert!(
             matches!(
-                recognize_assume(&width_equal, &params, &u64e),
+                recognize_assume(&width_equal, &params, &u64e, &no_scalars()),
                 Some(RecognizedAssume::ElemsBelowLen { .. })
             ),
             "width-equal `u64 as u64` is value-preserving and must be recognized"
@@ -7088,14 +8126,14 @@ mod tests {
         let cast: Expr =
             syn::parse_str("offsets.iter().all(|v| (*v as usize) < x.len())").unwrap();
         assert!(
-            recognize_assume(&cast, &params, &i32e).is_none(),
+            recognize_assume(&cast, &params, &i32e, &no_scalars()).is_none(),
             "signed-element cast `i32 as usize` must stay string-only"
         );
 
         let bare: Expr = syn::parse_str("offsets.iter().all(|v| *v < 16)").unwrap();
         assert!(
             matches!(
-                recognize_assume(&bare, &params, &i32e),
+                recognize_assume(&bare, &params, &i32e, &no_scalars()),
                 Some(RecognizedAssume::ElemsBelowConst { arr, bound: 16 }) if arr == "offsets"
             ),
             "bare signed element (no cast) must still be recognized"
@@ -7113,14 +8151,14 @@ mod tests {
         let cast: Expr =
             syn::parse_str("offsets.iter().all(|v| (*v as usize) < x.len())").unwrap();
         assert!(
-            recognize_assume(&cast, &params, &empty).is_none(),
+            recognize_assume(&cast, &params, &empty, &no_scalars()).is_none(),
             "cast peeling must be disabled when the element type is unknown"
         );
 
         let bare: Expr = syn::parse_str("offsets.iter().all(|v| *v < 16)").unwrap();
         assert!(
             matches!(
-                recognize_assume(&bare, &params, &empty),
+                recognize_assume(&bare, &params, &empty, &no_scalars()),
                 Some(RecognizedAssume::ElemsBelowConst { .. })
             ),
             "bare binding is recognized regardless of element type"
@@ -7158,7 +8196,7 @@ mod tests {
         let e: Expr = syn::parse_str("a.len() + 4 <= b.len()").unwrap();
         assert!(
             matches!(
-                recognize_assume(&e, &params, &no_elems),
+                recognize_assume(&e, &params, &no_elems, &no_scalars()),
                 Some(RecognizedAssume::LenPlusConstLe { a, k: 4, b }) if a == "a" && b == "b"
             ),
             "expected LenPlusConstLe{{a,4,b}}"
@@ -7168,7 +8206,7 @@ mod tests {
         let e: Expr = syn::parse_str("a.len() <= b.len()").unwrap();
         assert!(
             matches!(
-                recognize_assume(&e, &params, &no_elems),
+                recognize_assume(&e, &params, &no_elems, &no_scalars()),
                 Some(RecognizedAssume::LenPlusConstLe { a, k: 0, b }) if a == "a" && b == "b"
             ),
             "expected LenPlusConstLe{{a,0,b}}"
@@ -7177,7 +8215,7 @@ mod tests {
         // Explicit `+ 0` also lands on k = 0.
         let e: Expr = syn::parse_str("a.len() + 0 <= b.len()").unwrap();
         assert!(matches!(
-            recognize_assume(&e, &params, &no_elems),
+            recognize_assume(&e, &params, &no_elems, &no_scalars()),
             Some(RecognizedAssume::LenPlusConstLe { k: 0, .. })
         ));
     }
@@ -7191,7 +8229,7 @@ mod tests {
         let reject = |src: &str| {
             let e: Expr = syn::parse_str(src).unwrap();
             assert!(
-                recognize_assume(&e, &params, &no_elems).is_none(),
+                recognize_assume(&e, &params, &no_elems, &no_scalars()).is_none(),
                 "shape must stay string-only: `{src}`"
             );
         };

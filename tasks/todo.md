@@ -3210,6 +3210,144 @@ manifest it wrote is byte-identical to `HEAD`).
 
 ---
 
+## 2-D / 3-D dispatch (M-A) — CAPABILITY + SOUNDNESS milestone — DONE 2026-07-27 (round 12)
+
+Design: `docs/design-2d-dispatch.md` (measured against pinned `cubecl =0.10.0`, wgpu 29 / Metal on an
+M3, z3 4.16.0; probes preserved in the session scratchpad). **Round 12 covers this milestone.**
+
+The first frontier item in three rounds whose headline gate turned out to be *real*: today's
+rejection is correctly fail-closed with no false `Proved` anywhere on the accepted path (design §3.2).
+What the milestone found instead is one identity that does **not** survive the generalization, and it
+is the centre of the design.
+
+### The identity that breaks, and what it forced
+
+`ABSOLUTE_POS == CUBE_POS * CUBE_DIM + UNIT_POS` — what `abs_pos_sym` has encoded as
+soundness-critical since round 5 — is **FALSE in 2-D**. `ABSOLUTE_POS` linearizes the global thread
+coordinate over the whole grid; `CUBE_POS*CUBE_DIM + UNIT_POS` linearizes cube-major-then-unit. Swept
+on hardware over **722 launch shapes** the identity held in 189 and broke in **533**; **912 of 960**
+threads violate it at the image-like `CubeCount(5,3,1) x CubeDim(8,8,1)`. It holds for every thread
+iff `CUBE_DIM_Y == CUBE_DIM_Z == 1` — true today only because `coop.rs` and `conformance_case` both
+build `CubeDim::new_1d`, and **nothing said so**.
+
+Three consequences, all shipped:
+
+1. The **flat** `ABSOLUTE_POS`/`CUBE_POS`/`CUBE_COUNT` are rejected inside `dispatch(...)` (R1), with
+   the measured numbers in the message. Flat `CUBE_DIM`/`UNIT_POS` are kept (a numeral and a
+   pinned-coefficient linear form; neither can wrap).
+2. The recomposition is re-expressed **per axis**, where it *is* exact (0 violations / 1 212 threads).
+3. `abs_pos_sym` gains a `REQUIRED WORK:` note in the round-9 F4 style, asserted by a test that reads
+   the doc text and the measurement (§10.4 correction 1).
+
+### Risk 1 — the sharpest pre-registered risk, answered structurally
+
+The design pre-registered as risk 1 that a naive M2 produces **four copies** of the round-5
+recomposition equation (`abs_pos_sym` + one per axis) kept apart only by a clause gate. Both halves of
+its suggested mitigation shipped, and neither is a comment:
+
+- **One construction.** `Prover::recompose_pos(pos_hint, wrap_hint, cube, unit, dim)` is the *only*
+  place `pos = cube*dim + unit - wrap*2^32` is built. `abs_pos_sym` and `abs_pos_axis_sym(axis)` both
+  call it, differing only in which leaves and which pinned `dim` they hand it. A source-level test
+  (`the_position_recomposition_has_exactly_one_construction_site`) counts the construction sites and
+  fails at two — the risk is that a *future* edit adds a copy, which no runtime verdict can see.
+  **Measured:** deleting the `- wrap*2^32` term makes BOTH the cooperative round-5 regression AND the
+  per-axis X regression report FALSE PROOF, which is exactly the property the risk asked for.
+- **Structurally exclusive modes.** `Prover.coop: Option<u32>` became
+  `topology: TopologyMode { Flat | Coop(u32) | Dispatch([u32;3]) }` — "cooperative and per-axis at
+  once" is no longer a representable state, so R4's macro gate is a diagnostic, not the only thing
+  holding the two apart.
+
+*Test-quality note, recorded because it nearly shipped:* the first draft of the per-axis wrap test
+guarded on an *extent* (`x < w`) rather than on `out.len()`, so it refuted either way and **passed
+with the wrap term deleted**. Two more tests in this batch had the same disease — the predeclaration
+test needed three attempts before it reached the hazard at all (a float cast, then a carried
+accumulator on the LHS, each short-circuiting `value_of` before the per-axis leaf was ever resolved).
+Every negative control here was run by injecting the defect, not by reasoning about it.
+
+### What shipped
+
+- **`dispatch(cube_dim = (Wx, Wy[, Wz]), extents = (e0, e1[, e2]))`** — the clause, with gates
+  D1–D8 + R1–R13 all macro-authored at the offending span. The pinned literal dims are the single
+  source of truth for the launch's `CubeDim`, the twin's loop strides, and the prover's numerals.
+- **Prover**: `prove_bounds_freedom_dispatch`, per-axis leaves (unit/cube/count/abs/wrap, 15
+  predeclared at the outermost scope), `Arithmetic::Min`/`Max` as exact `ite`, and
+  `Assume::LenEqProduct` — the *enabling* fact (without it every 2-D kernel that indexes an array is
+  `OutOfSubset`; measured sat/unsat both ways).
+- **Twin**: a nested grid loop, Z outer → X inner (= the flat `ABSOLUTE_POS` order, so the
+  aliasing-write convention is unchanged from 1-D), ranging over the **grid** not the image, with
+  `u32` loop variables and per-axis rewrites (`UNIT_POS_a → abs_a % Wa`, `CUBE_POS_a → abs_a / Wa`,
+  `CUBE_COUNT_a → grid_a / Wa`).
+- **Launch/suite/evidence**: tuple `sizes:` (per-axis extents), per-axis `CubeCount`,
+  `differential_dispatch_config` (`sizes_unit: "extents"`, `cube_dim` triple, `rank`), R7's
+  `cube_dim:` rejection, and compile-time rank agreement between the suite and every kernel it lists.
+- **Interpreter (M5)**: `Inputs::dispatch` + per-axis `ThreadCtx`. The old pinned
+  `AbsolutePosY => 0` / `CubeDimY => 1` answers were correct for 1-D and a round-11-style
+  *classification split* for 2-D; a multi-axis kernel with a 1-D `Inputs` is now `Unsupported`, never
+  silently placed at `y = z = 0`.
+- **§10.4 corrections 2/3/4**: the differential config records the launch shape (`rank`, and the full
+  triple for a dispatch kernel); `proved_config`'s `logic` is the logic actually in force (`QF_NIA`
+  when a product assume is in scope) instead of a hardcoded `QF_LIA`; and `kernel_definition()` builds
+  at the clause's pinned cube dim, so the `def.cube_dim` that `hash.rs:80` already folded stops being
+  the constant `(1,1,1)` for every kernel in the tree.
+
+### Ground truth
+
+**24 / 24 bit-exact through the GENERATED twin** on wgpu/Metal
+(`tests/dispatch2d_gpu_ground_truth.rs`): three rank-2 kernels × the design's six image shapes
+(`37x19`, `64x64`, `1x1`, `3x129`, `129x3`, `255x257`) plus the rank-3 kernel × six volume shapes.
+The design's §6 probe measured the same count with *hand-written* kernels and *hand-written* twins;
+this reproduces it through the derived twin, the derived launch and the derived grid.
+
+Committed evidence: `crates/vericl-examples/evidence/vericl_2d.json` — four kernels, each `tested`
+(six shapes) + `proved` (`box_blur3x3` at 10 obligations).
+
+### A hole found while building, not designed for
+
+**R8 was false.** The design recorded the plane/cluster builtins as "unchanged; `BANNED_IDENTS` +
+`BANNED_PREFIXES`" — but `BANNED_PREFIXES`' `plane_` only catches the lowercase plane *functions*, and
+the uppercase constants (`PLANE_DIM`, `PLANE_POS`, `UNIT_POS_PLANE`, `CUBE_CLUSTER_DIM*`,
+`CUBE_POS_CLUSTER*`) appeared in neither list. Outside a `#[cube]` fn every one of them is the literal
+`2`, so a twin derived from a kernel reading `PLANE_DIM` silently used `2` while the device read the
+real plane width — **measured in a scratch probe**: an ordinary 1-D kernel compiled and its twin
+printed `PLANE_DIM + CUBE_POS_CLUSTER_X == 4` where wgpu/Metal reports `32 + 1`. Loud rather than
+silent (the differential diverges), but a rejection surface that admits the shape at all is not what
+the guide claims. All eleven idents are now in `BANNED_IDENTS`, and `dispatch(...)` does not lift them.
+
+### Narrowed relative to the design, deliberately
+
+`docs/design-2d-dispatch.md` §9 lists `cube_struct!` × `dispatch(...)` as "support, with one
+restriction". It is **rejected outright** here, and the reason is one the design did not consider:
+`Assume::LenEqProduct` must name its scalar operands by IR `GlobalScalar` **id**, which the macro
+computes positionally (the *n*-th `u32`-storage scalar parameter is `GlobalScalar(n)` —
+`cubecl-core-0.10.0/src/compute/builder.rs:31-35`, confirmed in an extracted definition). CubeCL
+flattens a runtime struct's fields into that same counter, and the kernel macro cannot see a
+`cube_struct!` block's field types. Guessing the id would be a false `Proved` waiting to happen, so
+the combination fails closed with a targeted message.
+
+Also narrowed: a **rank-3 volume index is differential-only**. `len == w*h*d` has no expressible form
+(the product assume is binary), so `elementwise3d_scale` is `tested` but `OutOfSubset` — pinned by a
+test so widening the vocabulary later has something that must flip, and stated as such on the coverage
+page rather than left to be discovered.
+
+### Deferred, with the cost already measured
+
+2-D cooperative tiles (`dispatch` × `cooperative`, i.e. tiled matmul's shape) is now **M-E** on the
+gap-closure plan rather than a guess: the intra-cube two-thread tile-write obligation discharges in
+under 10 ms, and the inter-cube write-disjointness half **times out in z3 at 180 s** because
+`abs_y * w` is variable×variable on both threads. It needs a 2-D write-pattern recognizer, not a
+generalization of the existing one.
+
+### Residual (carried forward, honestly)
+
+The D1 hole's *unrecordable* half stands: evidence now records the launch shape it measured, but
+nothing constrains the user's own `kernel::launch::<R>(…)` call, and `ABSOLUTE_POS` stops being
+injective above `2^32` threads — reachable only on a multi-axis grid, on this adapter at
+`CubeCount(2048,2048,1) x CubeDim(32,32,1)`. The end-to-end witness was **not dispatched** (a
+4.3-billion-thread launch risks a GPU watchdog reset on a display-connected device); the claim rests
+on two composed measurements (the flatten is `u32`, and the formula is exact). It is now an explicit
+line in `docs/guide.md` §13, together with the `cube_count_spread` hazard that can hand a user a
+multi-axis grid they did not ask for.
+
 ## Gap-closure plan — RECORDED 2026-07-27 (M-0 SHIPPED)
 
 The roadmap through round 11 was driven by two measured corpora: a private production DSP codebase

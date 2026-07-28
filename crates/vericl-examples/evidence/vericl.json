@@ -29,6 +29,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -91,6 +92,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -153,6 +155,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -218,6 +221,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -280,6 +284,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -346,6 +351,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -413,6 +419,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -476,6 +483,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -538,6 +546,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -600,6 +609,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -644,7 +654,7 @@
       "identity": {
         "source_hash": "sha256:a1b1ed1eaff3e165ebf10ae58472aad8f2c1d8587c70c34781dd208cff3eeb80",
         "vericl_version": "0.1.0",
-        "ir_hash": "sha256:6b4c5e6ad7f18c7cec8a5cf85f3ca87be6b1c8c453a30a111ac393b9f09b09ac"
+        "ir_hash": "sha256:5d2dd12d28e2f3acc2e4b521e167d33117d29ac5daf306c1ec6497927d858d3f"
       },
       "contract": {
         "assumes": [
@@ -752,6 +762,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -815,6 +826,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -879,6 +891,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -943,6 +956,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -987,7 +1001,7 @@
       "identity": {
         "source_hash": "sha256:efe4e93161949330e154bdd8497ea65c81baa925d6a1e210fc6e6d554da78d5f",
         "vericl_version": "0.1.0",
-        "ir_hash": "sha256:0ed442448daa16a3d738ef5def27a22dc8c6b8b41053754fff200bf6ca9833b3"
+        "ir_hash": "sha256:fc9a179ba0b0c69b99f7d08200a911839faad0d9f2bf145d63ffcaea4a5c4d77"
       },
       "contract": {
         "assumes": [
@@ -1164,6 +1178,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1227,6 +1242,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1291,6 +1307,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1351,6 +1368,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1415,6 +1433,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1478,6 +1497,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1540,6 +1560,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1602,6 +1623,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1666,6 +1688,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1730,6 +1753,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1794,6 +1818,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1860,6 +1885,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1924,6 +1950,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [
@@ -1988,6 +2015,7 @@
           "backend": "\"wgpu<wgsl>\"",
           "config": {
             "cube_dim": 256,
+            "rank": 1,
             "reference": "vericl-macros sequential twin",
             "seed": 59649,
             "sizes": [

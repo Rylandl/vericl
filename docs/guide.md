@@ -36,12 +36,13 @@ supported yet. It will save you an afternoon if your kernel is one VeriCL reject
    - [5.2 Runtime struct parameters: `vericl::cube_struct!`](#52-runtime-struct-parameters-vericlcube_struct)
 6. [Kernel composition: `#[vericl::helper]` + `uses(...)`](#6-kernel-composition-vericlhelper--uses)
 7. [Cooperative kernels: shared-memory reductions](#7-cooperative-kernels-shared-memory-reductions)
-8. [The `suite!` block](#8-the-suite-block)
-9. [The `VERICL_UPDATE` workflow](#9-the-vericl_update-workflow)
-10. [Reading an evidence file](#10-reading-an-evidence-file)
-11. [Reading rejections](#11-reading-rejections)
-12. [What VeriCL does not do](#12-what-vericl-does-not-do)
-13. [Where to go next](#13-where-to-go-next)
+8. [Image-space kernels: `dispatch(...)`](#8-image-space-kernels-dispatch)
+9. [The `suite!` block](#9-the-suite-block)
+10. [The `VERICL_UPDATE` workflow](#10-the-vericl_update-workflow)
+11. [Reading an evidence file](#11-reading-an-evidence-file)
+12. [Reading rejections](#12-reading-rejections)
+13. [What VeriCL does not do](#13-what-vericl-does-not-do)
+14. [Where to go next](#14-where-to-go-next)
 
 ---
 
@@ -761,7 +762,142 @@ the cube count. Design detail lives in `docs/design-shared-memory.md`.
 
 ---
 
-## 8. The `suite!` block
+## 8. Image-space kernels: `dispatch(...)`
+
+An image kernel wants to say "this thread is at `(x, y)`", not "this thread is number 4 217". Opt
+into the multi-axis machinery with a `dispatch(...)` clause and index with the per-axis builtins:
+
+```rust
+#[vericl::kernel(
+    dispatch(cube_dim = (16, 16), extents = (w, h)),
+    assumes(inp.len() == out.len(), inp.len() == (w as usize) * (h as usize)),
+    compare(max_ulp = 0),
+    gen(inp in -100.0..=100.0, out in 0.0..=0.0)
+)]
+#[cube(launch)]
+pub fn box_blur3x3(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32) {
+    let x = ABSOLUTE_POS_X;
+    let y = ABSOLUTE_POS_Y;
+    if x < w && y < h {
+        let x0 = u32::max(x, 1u32) - 1u32;
+        let x2 = u32::min(x + 1u32, w - 1u32);
+        let y0 = u32::max(y, 1u32) - 1u32;
+        let y2 = u32::min(y + 1u32, h - 1u32);
+        let mut acc = 0f32;
+        acc += inp[(y0 * w + x0) as usize];
+        /* … seven more … */
+        acc += inp[(y2 * w + x2) as usize];
+        out[(y * w + x) as usize] = acc * 0.111111111f32;
+    }
+}
+```
+
+- **`cube_dim`** is a 2- or 3-tuple of positive integer **literals**, and its arity *is* the dispatch
+  rank. Those literals are the single source of truth for three consumers: the launch's `CubeDim`,
+  the twin's per-axis loop strides, and the prover's `CUBE_DIM_X/Y/Z` numerals. They must be pinned
+  because that is what keeps every position recomposition linear — the same trade
+  `cooperative(cube_dim = N)` already makes. Their product must be `<= 1024`.
+- **`extents`** names this kernel's own runtime `u32` parameters carrying the problem extents. The
+  harness binds them from each case's declared size, derives
+  `CubeCount::Static(ceil(w/Wx), ceil(h/Wy), …)`, and sizes un-pinned buffers to their product.
+
+The clause is required exactly when the body reads a per-axis builtin, and rejected when it does not
+— the same biconditional `cooperative(...)` has, for the same reason: a clause changes the launch
+shape, the twin's iteration space and the recorded evidence, so declaring an unused one is a
+contract lie.
+
+### 8.1 X is the fastest-varying axis
+
+`ABSOLUTE_POS_X` moves along a row; a row-major image of width `w` is indexed
+`inp[(y * w + x) as usize]`. Writing `inp[(x * h + y) as usize]` is *in bounds* and *transposed* —
+**VeriCL's proof will not catch it**, because a transposed image is a functional bug, not a
+memory-safety one. The differential lane will.
+
+This is not a convention VeriCL chose. `CubeCount::Static(x, y, z)` reaches
+`dispatch_workgroups(x, y, z)` reaches `workgroup_id.x/.y/.z` with no transposition at any layer,
+and every flatten is row-major with X fastest, consistently across WGSL, CUDA/HIP, SPIR-V and the
+CPU runtime — measured with 0 violations in 1 212 threads across 6 launch shapes.
+
+### 8.2 The length assume is what makes any of it provable
+
+`out.len() == (w as usize) * (h as usize)` is not ergonomics. A 1-D kernel that decodes
+`row = ABSOLUTE_POS / w` gets `row * w <= ABSOLUTE_POS` for free from Euclidean division, so its row
+stride is bounded. `ABSOLUTE_POS_Y * w` has no such parent: `abs_y` and `w` are unrelated leaves, so
+the multiply's no-overflow side-obligation is *unprovable* and the index is `OutOfSubset`. With the
+product assume, `abs_y <= h-1` gives `abs_y * w <= w*h - w = len - w`, and the whole 3x3 clamped
+stencil discharges.
+
+**Write it widen-then-multiply.** `out.len() == (w * h) as usize` multiplies in `u32` and then
+widens, so the executable `check_assumes` predicate tests the **wrapped** product while the prover
+would assert the mathematical one. Measured, those disagree: at `w = 2, h = 2147483649` the wrapped
+product is `2`, so a length-2 buffer satisfies the clause while the model believes the length is
+4 294 967 298 — and an index of 2 then proves in bounds against a buffer that does not have it. That
+spelling is rejected by name, at the cast.
+
+Because the assume is *binary*, a rank-3 volume index needs `len == w*h*d`, which has no expressible
+form: a 3-D dispatch runs, launches and twins correctly, but its bounds claim is `OutOfSubset`.
+
+### 8.3 Clamp branch-free, or not at all
+
+The idiomatic stencil clamp
+
+```rust
+let mut x2 = x;
+if x + 1 < w { x2 = x + 1; }        // rejected: x2 is tainted after the arm
+```
+
+writes a mutable local inside a branch arm. VeriCL taints such a variable once the arm closes —
+adversarial review round 2 found that *not* doing so was a confirmed false `Proved` on a real
+out-of-bounds write — so the neighbour index built from `x2` is unmodelable, and no amount of
+per-axis machinery changes that. Write it branch-free instead:
+
+```rust
+let x2 = u32::min(x + 1u32, w - 1u32);
+let x0 = u32::max(x, 1u32) - 1u32;
+```
+
+Both compute the identical function under the guard `x < w`, and both lower to a single arithmetic
+instruction the prover models exactly.
+
+### 8.4 What a 2-D suite looks like
+
+A dispatch kernel's cases are per-axis **extents**, not thread counts, so they need their own
+`suite!` with tuple `sizes:` — and no `cube_dim:` field, because the clause already pins it:
+
+```rust
+vericl::suite! {
+    runtime: cubecl::wgpu::WgpuRuntime,
+    kernels: [elementwise2d_scale, transpose2d, box_blur3x3, topology_report2d],
+    evidence: "evidence/vericl_2d.json",
+    sizes: [(37, 19), (64, 64), (1, 1), (3, 129), (129, 3), (255, 257)],
+}
+```
+
+The claim's config records `sizes_unit: "extents"`, the full pinned `cube_dim` triple and the `rank`,
+so a reader can tell what launch shape the evidence was produced under — which 1-D evidence could not
+say before this milestone. Because the product assume is nonlinear, the proved claim's recorded
+`logic` reads `QF_NIA` for these kernels rather than `QF_LIA`.
+
+### 8.5 What `dispatch(...)` does not admit
+
+Each of these is a targeted compile error naming the reason, not a silent approximation:
+
+| Written | Why not |
+|---|---|
+| flat `ABSOLUTE_POS` / `CUBE_POS` / `CUBE_COUNT` inside the clause | in a multi-axis dispatch `ABSOLUTE_POS != CUBE_POS * CUBE_DIM + UNIT_POS` — measured, the two disagree for 912 of 960 threads at `CubeCount(5,3,1) x CubeDim(8,8,1)`, and in 533 of 722 swept launch shapes. Flat `CUBE_DIM` and `UNIT_POS` **are** kept |
+| a per-axis builtin with no clause | add the clause; the message says so |
+| `ABSOLUTE_POS_Z` under a 2-tuple `cube_dim` | the arity is the rank; a Z read under a rank-2 launch is a constant 0, and accepting it would silently change a strided walk into one |
+| `dispatch(...)` + `cooperative(...)` | 2-D shared-memory tiles are deferred: the intra-cube race obligation discharges in under 10 ms, the inter-cube one times out in z3 at 180 s |
+| `dispatch(...)` + `Vector<P, W>` | a vector suite's sizes are *lines*, a dispatch suite's are *extents*; two units in one evidence config, undecided |
+| `dispatch(...)` + a runtime `cube_struct!` parameter | CubeCL flattens a struct's fields into the same scalar registration counter the extents are numbered by, and this macro cannot see the field types |
+| a non-literal `cube_dim` entry, or a product above 1024 | the prover needs numerals and the twin needs a loop stride; 1024 is the measured `max_units_per_cube` on wgpu/Metal (the WebGPU default is 256) |
+| `gen(w in …)` for an extent | an extent is bound from the case size, never drawn |
+
+Design and measurements: `docs/design-2d-dispatch.md`.
+
+---
+
+## 9. The `suite!` block
 
 `vericl::suite!` expands to a single `#[test] fn vericl_conformance()`. It runs every listed kernel's
 conformance case across the declared sizes, discharges the SMT proofs, and assembles the evidence
@@ -784,12 +920,16 @@ vericl::suite! {
 
 - **`runtime`** — the backend runtime path. `cubecl::wgpu::WgpuRuntime` for GPU;
   `cubecl::cpu::CpuRuntime` for the host CPU backend.
-- **`kernels`** — the list of kernel names. Each must carry `#[vericl::kernel]` (see section 11 for
-  the error you get if one doesn't). Adding a fourth honest kernel is one name here, not new
+- **`kernels`** — the list of kernel names. Each must carry `#[vericl::kernel]` (see section 12 for
+  the error you get if one doesn't). Every kernel in one suite must agree on the case *unit* — all
+  1-D (scalar `sizes`) or all `dispatch(...)` of the same rank (tuple `sizes`, section 8.4); a
+  mismatch is a compile error naming the kernel. Adding a fourth honest kernel is one name here, not new
   boilerplate.
 - **`evidence`** — the manifest path, relative to `CARGO_MANIFEST_DIR` (your crate root).
 - **`sizes`** — the buffer sizes to test. Defaults to a spread from 1 to 65536 including
-  non-multiples of `cube_dim` (which is where off-by-one and clamping bugs hide).
+  non-multiples of `cube_dim` (which is where off-by-one and clamping bugs hide). In a
+  `dispatch(...)` suite these are per-axis **extents** tuples instead — `[(37, 19), (64, 64), …]` —
+  and `cube_dim:` must be absent (the clause pins it; declaring it twice is rejected).
 - **`prove`** — whether to run the SMT proofs. Default `true`; set `false` to omit proved claims (and
   drop the z3 requirement) rather than fake them.
 - **`extra_lane`** — an additional differential lane behind a `cfg`, e.g. the `cubecl-cpu` backend
@@ -806,7 +946,7 @@ file for a kernel that needs a different runtime (the f64-on-cpu case is
 
 ---
 
-## 9. The `VERICL_UPDATE` workflow
+## 10. The `VERICL_UPDATE` workflow
 
 There is no separate CLI. Conformance is a `cargo test` citizen.
 
@@ -843,7 +983,7 @@ source and IR hash — the whole point.
 
 ---
 
-## 10. Reading an evidence file
+## 11. Reading an evidence file
 
 An evidence manifest is JSON: a `vericl_version` and a list of `entries`, one per kernel. Here is
 `axpy`'s entry (abridged):
@@ -928,7 +1068,7 @@ independent reference. For an f64 kernel — where wgpu is unusable — the macr
 
 ---
 
-## 11. Reading rejections
+## 12. Reading rejections
 
 VeriCL rejects constructs it cannot faithfully model, at compile time, rather than silently
 approximating them. Rejections come in three flavors: **VeriCL's own** targeted messages, a couple of
@@ -945,15 +1085,25 @@ are the common ones and what to do.
 | `` parameter `alpha` is a float with no declared gen(...) range `` | A float input with no range | Add `gen(alpha in lo..=hi)` (section 4.3) |
 | `` call to `foo` in the reference twin is not recognized as a local binding, a declared helper, … `` | The twin calls a function VeriCL can't follow | Annotate `foo` with `#[vericl::helper]` and add it to `uses(foo)` (section 6) |
 | `` host-callability of `F::erf` in the reference twin is unverified `` | A float method that panics on the host | Use a whitelisted method, or precompute it (section 5) |
-| `` `<construct>` is outside the vericl v0 kernel subset; … Rewrite the kernel within the supported subset … or see the rejection reference in docs/guide.md `` | A construct VeriCL doesn't model (`return`, `plane_*`, `Atomic`, `View`, `terminate!`, …) | Rewrite within the supported subset, below |
+| `` `<construct>` is outside the vericl v0 kernel subset; … Rewrite the kernel within the supported subset … or see the rejection reference in docs/guide.md `` | A construct VeriCL doesn't model (`return`, `plane_*`, `PLANE_DIM`, `Atomic`, `View`, `terminate!`, …) | Rewrite within the supported subset, below |
+| `` `ABSOLUTE_POS_X` is a per-axis topology builtin outside the ordinary vericl v0 subset; add a `dispatch(cube_dim = (Wx, Wy), extents = (w, h))` clause `` | You indexed by axis in a kernel with no dispatch clause | Add the clause (section 8) |
+| `` `ABSOLUTE_POS` is outside the vericl v0 subset in a `dispatch(...)` kernel — in a multi-axis dispatch it is NOT `CUBE_POS * CUBE_DIM + UNIT_POS` … `` | You mixed the flat and the per-axis addressing schemes | Index with the per-axis builtins, or drop the clause and stay flat (section 8.5) |
+| `` this kernel declares `dispatch(...)` but its body reads no per-axis topology builtin `` | An unused dispatch clause — it still changes the launch shape and the evidence | Remove the clause, or index by axis |
+| `` `ABSOLUTE_POS_Z` names the Z axis, which this kernel's `dispatch(...)` clause does not enable `` | A rank-3 read under a 2-tuple `cube_dim` | Widen the clause to a 3-tuple, or drop the Z read (section 8.5) |
+| `` `out.len() == (w * h) as usize` multiplies in u32 and then widens … `` | The wrapping product spelling — a measured false `Proved` | Write `out.len() == (w as usize) * (h as usize)` (section 8.2) |
+| `` `dispatch(cube_dim = ...)` takes 2 or 3 positive integer *literals* `` / `` … has 2048 units per cube, above the 1024 `` | A runtime or over-large cube dim | Pin literals whose product is `<= 1024` (section 8) |
+| `` `dispatch(...)` and `cooperative(...)` are mutually exclusive `` | 2-D shared-memory tiles are deferred, with the cost measured | See section 8.5 and `docs/design-2d-dispatch.md` §8 |
 
 The **supported v0 kernel subset** is: affine `ABSOLUTE_POS` indexing; bounded `for` and `match`;
 `&Array<T>`/`&mut Array<T>` and core `Slice`; `#[comptime]` and generic parameters pinned via
-`instantiate(...)`; the `wrapping` clause for integer overflow; and — behind
-`cooperative(cube_dim = N)` — workgroup shared memory with barriers. Constructs *outside* it are
-rejected rather than approximated: unbounded `while`/`loop`, stepped/descending range loops,
-`return`, `plane_*` reductions, `Atomic*`, the `View`/`Layout` strided-tensor machinery,
-`terminate!()` outside the cooperative uniform guard, and 2-D topology are all future work.
+`instantiate(...)`; the `wrapping` clause for integer overflow; behind
+`cooperative(cube_dim = N)` — workgroup shared memory with barriers; and behind
+`dispatch(cube_dim = (…), extents = (…))` — per-axis 2-D/3-D topology (section 8). Constructs
+*outside* it are rejected rather than approximated: unbounded `while`/`loop`, stepped/descending
+range loops, `return`, `plane_*` reductions (including the `PLANE_DIM`/`PLANE_POS` constants and the
+whole `CUBE_*_CLUSTER*` family), `Atomic*`, the `View`/`Layout` strided-tensor machinery,
+`terminate!()` outside the cooperative uniform guard, and 2-D *shared-memory tiles* are all future
+work.
 
 For the same boundary organized by **kernel class** rather than by construct — "is my gather / my
 stencil / my histogram / my 2-D image kernel in scope, and what exactly is proved about it?" — see
@@ -1003,7 +1153,7 @@ recognize them for what they are:
 
 ---
 
-## 12. What VeriCL does not do
+## 13. What VeriCL does not do
 
 Read this section before you rely on a green run. VeriCL is deliberately narrow, and its honesty
 depends on you knowing the boundary.
@@ -1025,11 +1175,25 @@ depends on you knowing the boundary.
 - **It does not verify arbitrary Rust, or anything that isn't a CubeCL kernel.**
 - **It does not recover intent from an existing kernel automatically, or prove performance or
   algorithmic appropriateness.**
-- **The supported kernel subset is narrow (section 11).** Whole classes of real kernels — `plane_*`
-  reductions, 2-D topology, `Tensor`/`View` strided machinery, atomics — are out of scope for v0 and
-  rejected explicitly, not approximated. (Custom `CubeType` struct arguments *were* on this list and
-  are now supported via `vericl::cube_struct!`, section 5.2; [docs/coverage.md](coverage.md) is the
-  maintained per-class status.)
+- **The supported kernel subset is narrow (section 12).** Whole classes of real kernels — `plane_*`
+  reductions, 2-D *shared-memory tiles*, `Tensor`/`View` strided machinery, atomics — are out of scope
+  for v0 and rejected explicitly, not approximated. (Custom `CubeType` struct arguments and 2-D/3-D
+  dispatch *were* on this list and are now supported, sections 5.2 and 8;
+  [docs/coverage.md](coverage.md) is the maintained per-class status.)
+- **No claim constrains the launch shape you choose.** VeriCL's claims are about the kernel *as
+  launched by the suite*: `kernel::launch::<R>(…)` is an ordinary public CubeCL entry point taking
+  any `CubeCount`/`CubeDim`, and nothing stops you calling it differently. For the value claims this
+  is benign — `ABSOLUTE_POS` is the row-major flatten of the grid, and as long as it does not wrap it
+  is a bijection onto `0..num_threads`, exactly the twin's iteration space. The residual is the wrap:
+  above `2^32` threads two distinct threads receive the same `ABSOLUTE_POS`, and an
+  `out[ABSOLUTE_POS] = …` kernel then has a write-write race no claim covers. That is reachable only
+  on a multi-axis grid (a 1-D dispatch tops out at `65535 x 1024 < 2^32` under the measured per-axis
+  caps) and needs a deliberate, enormous launch — on the reference adapter,
+  `CubeCount(2048, 2048, 1) x CubeDim(32, 32, 1)`. Differential claims now *record* the launch shape
+  they were produced under (`rank`, and the full `cube_dim` triple for a dispatch kernel); nothing
+  makes a hand-written launch honour it. Note also that `cubecl_core::calculate_cube_count_elemwise`
+  and `cube_count_spread` will silently turn a 1-D request above ~65535 cubes into a *multi-axis*
+  grid, so a kernel certified as 1-D can reach a 2-D launch without asking for one.
 - **`f64` has no front-end-independent lane on a wgpu-only machine.** WGSL has no f64; the honest lane
   is cubecl-cpu, which shares CubeCL's front end. For an f64 kernel the macro-derived twin is the sole
   independent reference.
@@ -1040,7 +1204,7 @@ approximation. That is the point — a simpler-looking correctness badge would b
 
 ---
 
-## 13. Where to go next
+## 14. Where to go next
 
 - **`README.md`** — the design decisions, the claim model, and the CubeCL-semantics findings behind
   each clause.

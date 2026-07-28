@@ -564,6 +564,20 @@ pub enum Assume<'a> {
     /// `B[i + K]` in bounds. Adding this constraint only narrows the
     /// counterexample search, so it can never mint a false `Proved`.
     LenPlusConstLe { a: &'a str, k: u64, b: &'a str },
+    /// `A.len() == (x as usize) * (y as usize)` for two runtime `u32` scalar
+    /// parameters — asserted as `len_a = x·y` over the two scalars' SMT leaves
+    /// and `A`'s length leaf (docs/design-2d-dispatch.md §4.6).
+    ///
+    /// The operands are given as IR `GlobalScalar` **ids**, not names: the IR
+    /// records scalars only as `scalar<u32>(id)`, and unlike buffers there is no
+    /// name to recover. The macro computes the id positionally (the *n*-th
+    /// `u32`-storage scalar parameter is `GlobalScalar(n)` —
+    /// `cubecl-core-0.10.0/src/compute/builder.rs:31-35`) and carries it here,
+    /// the same custody `BufferParam` has for buffers.
+    ///
+    /// Unlike every other variant this asserts a **nonlinear** fact into the
+    /// global context; see `assert_structured_assumes`' feasibility guard.
+    LenEqProduct { a: &'a str, x_scalar: u32, y_scalar: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -667,7 +681,7 @@ pub fn prove_bounds_freedom(
     buffers: &[BufferParam],
     assumes: &[Assume],
 ) -> ProveResult {
-    prove_bounds_freedom_impl(def, buffers, assumes, None)
+    prove_bounds_freedom_impl(def, buffers, assumes, TopologyMode::Flat)
 }
 
 /// Prove out-of-bounds freedom for a **workgroup-cooperative** `def`, pinning
@@ -690,7 +704,35 @@ pub fn prove_bounds_freedom_cooperative(
     assumes: &[Assume],
     cube_dim: u32,
 ) -> ProveResult {
-    prove_bounds_freedom_impl(def, buffers, assumes, Some(cube_dim))
+    prove_bounds_freedom_impl(def, buffers, assumes, TopologyMode::Coop(cube_dim))
+}
+
+/// Prove out-of-bounds freedom for a **multi-axis (2-D/3-D) dispatch** `def`,
+/// pinning `CUBE_DIM_X/Y/Z` to `cube_dim` (the `dispatch(cube_dim = (…))`
+/// contract clause, docs/design-2d-dispatch.md §4.3). `Z` is `1` for a rank-2
+/// clause.
+///
+/// Relative to [`prove_bounds_freedom`] it models the twelve per-axis topology
+/// builtins plus flat `CUBE_DIM`/`UNIT_POS`, with `AbsolutePos_a` recomposed as
+/// the **per-axis** exact modular `(CubePos_a*Wa + UnitPos_a) mod 2^32`
+/// ([`Prover::abs_pos_axis_sym`], sharing its single implementation with the 1-D
+/// cooperative case). The three *flat* position/count builtins
+/// (`ABSOLUTE_POS`, `CUBE_POS`, `CUBE_COUNT`) stay unmodeled: modeling them
+/// needs a variable×variable stride, and `ABSOLUTE_POS == CUBE_POS*CUBE_DIM +
+/// UNIT_POS` is measurably false in a multi-axis dispatch (§2.2). The macro
+/// rejects them at the source (R1); this is the fail-closed backstop.
+///
+/// `cube_dim` must be the block size the kernel is actually launched with —
+/// binding it to a value the launch does not use would be unsound, which the
+/// harness prevents by sourcing the launch's `CubeDim`, the twin's loop strides
+/// and this argument from the single `dispatch(...)` clause.
+pub fn prove_bounds_freedom_dispatch(
+    def: &KernelDefinition,
+    buffers: &[BufferParam],
+    assumes: &[Assume],
+    cube_dim: [u32; 3],
+) -> ProveResult {
+    prove_bounds_freedom_impl(def, buffers, assumes, TopologyMode::Dispatch(cube_dim))
 }
 
 /// The `check` string of the out-of-bounds-freedom `Proved` claim. A single
@@ -776,7 +818,7 @@ fn prove_bounds_freedom_impl(
     def: &KernelDefinition,
     buffers: &[BufferParam],
     assumes: &[Assume],
-    coop: Option<u32>,
+    topology: TopologyMode,
 ) -> ProveResult {
     let mut smt = match ContextBuilder::new().solver("z3").solver_args(["-smt2", "-in"]).build() {
         Ok(ctx) => ctx,
@@ -798,7 +840,7 @@ fn prove_bounds_freedom_impl(
         obligations: 0,
         carried_stack: Vec::new(),
         write_log_stack: Vec::new(),
-        coop,
+        topology,
         race: None,
         elem_bounds: HashMap::new(),
         elem_invalidated: HashSet::new(),
@@ -806,7 +848,7 @@ fn prove_bounds_freedom_impl(
         // A cooperative bounds walk may hit a `terminate!()` before deferring at
         // the tree loop; compute the thread-varying set so its uniformity can be
         // checked. Empty for a non-cooperative walk (no terminate reachable).
-        coop_varying: if coop.is_some() {
+        coop_varying: if topology.coop_dim().is_some() {
             collect_thread_varying(&def.body)
         } else {
             HashSet::new()
@@ -825,6 +867,12 @@ fn prove_bounds_freedom_impl(
     // before `process_scope` opens any branch push — see the module docs'
     // "Cooperative mode" bullet for why lazy declaration would be unsound.
     if let Err(e) = prover.predeclare_coop_leaves() {
+        return e.into_result();
+    }
+    // Same discipline, per axis (docs/design-2d-dispatch.md §4.3): fifteen
+    // leaves at the outermost scope, before `process_scope` opens any branch or
+    // loop push. No-op outside dispatch mode.
+    if let Err(e) = prover.predeclare_dispatch_leaves() {
         return e.into_result();
     }
 
@@ -892,7 +940,7 @@ fn prove_race_freedom_detailed(
         write_log_stack: Vec::new(),
         // Race mode is a cooperative walk: the leaf modeling (`UnitPos` etc.)
         // and shared-array bounds are all needed.
-        coop: Some(cube_dim),
+        topology: TopologyMode::Coop(cube_dim),
         race: Some(RaceState {
             cube_dim,
             thread: Thread::T1,
@@ -949,6 +997,52 @@ fn prove_race_freedom_detailed(
         uniformity: r.uniformity_checks,
         phases,
     })
+}
+
+/// Axis suffixes for leaf names, in the IR's own order — X is the
+/// fastest-varying axis (docs/design-2d-dispatch.md §1.3).
+const AXIS_NAMES: [&str; 3] = ["x", "y", "z"];
+
+/// Which topology model a walk uses. The three are **mutually exclusive by
+/// construction** — a single field of this type, never a pair of `Option`s —
+/// because the 2-D milestone's sharpest open risk was exactly that two
+/// recompositions of the same equation would be kept apart only by a clause
+/// gate somewhere else (docs/design-2d-dispatch.md §13 risk 1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TopologyMode {
+    /// The plain single-thread bounds walk. Only `AbsolutePos` is modeled (a
+    /// bare fresh `u32` leaf); `UnitPos`/`CubePos`/`CubeDim`/`CubeCount` and
+    /// every per-axis builtin taint.
+    Flat,
+    /// `cooperative(cube_dim = N)` — the 1-D leaves, with `AbsolutePos`
+    /// recomposed from `CubePos*N + UnitPos` (module docs' "Cooperative mode").
+    ///
+    /// **This recomposition is correct ONLY because the launch is 1-D in the
+    /// cube.** See [`Prover::abs_pos_sym`].
+    Coop(u32),
+    /// `dispatch(cube_dim = (Wx, Wy[, Wz]))` — the per-axis leaves, with
+    /// `AbsolutePos_a` recomposed per axis from `CubePos_a*Wa + UnitPos_a`.
+    /// `Z = 1` for a rank-2 clause. The three flat position/count builtins stay
+    /// unmodeled here (fail-closed backstop behind the macro's R1).
+    Dispatch([u32; 3]),
+}
+
+impl TopologyMode {
+    /// The pinned 1-D `CUBE_DIM`, in cooperative mode only.
+    fn coop_dim(self) -> Option<u32> {
+        match self {
+            TopologyMode::Coop(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The pinned per-axis cube dims, in dispatch mode only.
+    fn dispatch_dims(self) -> Option<[u32; 3]> {
+        match self {
+            TopologyMode::Dispatch(d) => Some(d),
+            _ => None,
+        }
+    }
 }
 
 enum Stop {
@@ -1031,12 +1125,14 @@ struct Prover<'a, 'b> {
     /// discarded. Empty outside of (nested) branches, so this costs
     /// nothing for a kernel with no `If`/`IfElse` at all.
     write_log_stack: Vec<HashSet<VariableKind>>,
-    /// `Some(cube_dim)` in cooperative mode (the pinned `CUBE_DIM` constant),
-    /// `None` for the plain single-thread bounds walk. Gates all the
-    /// shared-memory-milestone leaf modeling (module docs' "Cooperative
-    /// mode"); when `None`, `UnitPos`/`CubePos`/`CubeDim`/`CubeCount` stay
-    /// tainted exactly as before this milestone.
-    coop: Option<u32>,
+    /// Which topology model this walk uses — see [`TopologyMode`]. **One field,
+    /// not two `Option`s**: "cooperative and per-axis dispatch at once" is not a
+    /// representable state, which is the structural half of the mitigation for
+    /// the 2-D milestone's sharpest pre-registered risk (four constructions of
+    /// the round-5 recomposition equation kept apart only by a clause gate,
+    /// docs/design-2d-dispatch.md §13 risk 1). The other half is that there is
+    /// only ONE construction: [`Prover::recompose_pos`].
+    topology: TopologyMode,
     /// `Some(..)` only for the two-thread race walk (`prove_race_freedom`,
     /// milestones M3+M4); `None` for every bounds walk. When set, `UnitPos`
     /// resolves to whichever of the two thread symbols is currently active,
@@ -1378,6 +1474,9 @@ impl<'a, 'b> Prover<'a, 'b> {
         assumes: &[Assume],
         buffer_tys: &[Type],
     ) -> Result<(), Stop> {
+        // Whether any assume put a NONLINEAR fact in the global context — see
+        // the feasibility guard below (design §13 risk 5).
+        let mut has_product_assume = false;
         for assume in assumes {
             match *assume {
                 Assume::LenEq { a, b } => {
@@ -1429,6 +1528,37 @@ impl<'a, 'b> Prover<'a, 'b> {
                     let le = self.smt.lte(sum, lb);
                     self.s_assert(le)?;
                 }
+                // `len_a = x * y` over two runtime u32 scalar leaves — the fact
+                // that ties a multi-axis dispatch's extents to a buffer length
+                // (docs/design-2d-dispatch.md §4.6). This is the *enabling*
+                // assume of the whole milestone, not an ergonomic one: without
+                // it the `checked_mul` side-obligation on the row stride
+                // `abs_y * w` has nothing to bound it (measured sat, `p2e`),
+                // so every 2-D kernel that indexes an array — i.e. all of them
+                // — would be `OutOfSubset`. With it, `abs_y <= h-1 ⟹
+                // abs_y*w <= w*h - w = len - w <= 2^32-1` and the obligation
+                // discharges (measured unsat in 0.13 s, `p2a`).
+                //
+                // The product is genuinely NONLINEAR, and unlike `checked_mul`'s
+                // probes it is in force *globally* — see the feasibility guard
+                // below, which is why an `unknown` there is not allowed through
+                // when a product assume is present (design §13 risk 5).
+                //
+                // Only the widen-then-multiply source spelling reaches here: the
+                // macro rejects `A.len() == (x * y) as usize` outright (R6),
+                // because `check_assumes` would test the WRAPPED u32 product
+                // while this asserts the mathematical one — measured false
+                // `Proved` at `x = 2, y = 2147483649` (`p3`).
+                Assume::LenEqProduct { a, x_scalar, y_scalar } => {
+                    has_product_assume = true;
+                    let ida = self.buffer_id_by_name(a)?;
+                    let la = self.length_of(ida)?;
+                    let sx = self.scalar_u32_sym(x_scalar)?;
+                    let sy = self.scalar_u32_sym(y_scalar)?;
+                    let prod = self.smt.times(sx, sy);
+                    let eq = self.smt.eq(la, prod);
+                    self.s_assert(eq)?;
+                }
             }
         }
         // Infeasible-assumption guard (round-1 "infeasible context vacuously
@@ -1453,11 +1583,33 @@ impl<'a, 'b> Prover<'a, 'b> {
         //     is treated as "not provably contradictory" and allowed through
         //     (conservative). Real kernels' length facts are satisfiable, so it
         //     never fires for them.
-        if self.smt.check().map_err(smt_err)? == Response::Unsat {
+        //
+        //     ONE REFINEMENT for the nonlinear case (docs/design-2d-dispatch.md
+        //     §13 risk 5): the "`unknown` is allowed through" default is safe
+        //     only while every global fact is linear, where z3 does not answer
+        //     `unknown` in practice. A `LenEqProduct` puts a genuinely nonlinear
+        //     `len = x*y` in force for every obligation *and* for this probe, so
+        //     an `unknown` here would mean "we could not tell whether the
+        //     contract is contradictory" while the walk went on to discharge
+        //     everything vacuously against it. When a product assume is present,
+        //     `unknown` is therefore `OutOfSubset` rather than allowed through.
+        let feasibility = self.smt.check().map_err(smt_err)?;
+        if feasibility == Response::Unsat {
             return Err(Stop::OutOfSubset(
                 "the declared assumptions are mutually contradictory (their conjunction is \
                  unsatisfiable) — a contradictory contract would vacuously discharge every bounds \
                  obligation, so it is rejected rather than yielding a false `Proved`"
+                    .into(),
+            ));
+        }
+        if has_product_assume && feasibility == Response::Unknown {
+            return Err(Stop::OutOfSubset(
+                "the solver returned `unknown` for the feasibility of this kernel's assumptions, \
+                 which include a nonlinear `A.len() == (x as usize) * (y as usize)` product. \
+                 Unlike the linear length facts — where `unknown` is treated as \"not provably \
+                 contradictory\" and allowed through — an undecided nonlinear context could be \
+                 contradictory and would then vacuously discharge every bounds obligation, so it \
+                 is rejected (docs/design-2d-dispatch.md §13 risk 5)"
                     .into(),
             ));
         }
@@ -1566,6 +1718,86 @@ impl<'a, 'b> Prover<'a, 'b> {
             })
     }
 
+    /// The SMT leaf for a runtime `u32` `GlobalScalar`, memoized on the same
+    /// `VariableKind` the walk's `value_of` uses — so an assume asserted here,
+    /// before the walk starts, and a body read of that scalar are the SAME
+    /// symbol. Naming (`scalar{id}_`) and range facts are `declare_leaf`'s, i.e.
+    /// byte-identical to what `value_of` would have produced lazily.
+    fn scalar_u32_sym(&mut self, id: Id) -> Result<SExpr, Stop> {
+        let kind = VariableKind::GlobalScalar(id);
+        if let Some(Some(e)) = self.memo.get(&kind) {
+            return Ok(*e);
+        }
+        let sym = self.declare_leaf(&format!("scalar{id}_"), &address_type())?;
+        self.memo.insert(kind, Some(sym));
+        Ok(sym)
+    }
+
+    // -- position recomposition: ONE implementation ----------------------
+
+    /// **The exact modular position recomposition — the single construction of
+    /// the round-5 equation in this crate.**
+    ///
+    /// Declares a fresh in-range leaf `pos` (the address type's `[0, 2^32)`)
+    /// and a fresh wrap counter `k`, and asserts
+    ///
+    /// ```text
+    /// pos = cube * dim + unit - k * 2^32,     0 <= k <= dim - 1
+    /// ```
+    ///
+    /// Both products are variable×constant, so the encoding stays **LINEAR
+    /// (QF_LIA)** — which is the whole reason `dim` must be a pinned literal in
+    /// both the `cooperative(...)` and the `dispatch(...)` clause.
+    ///
+    /// **Why a leaf-plus-congruence and not a raw `times`/`plus` term.** Because
+    /// `cube` is a full-`u32` leaf, the raw sum can exceed `2^32`, which real
+    /// hardware wraps — so the unwrapped term is *not* the hardware value, and a
+    /// guard `pos < len` would unsoundly transfer a bound onto `cube` that
+    /// hardware never honors (adversarial review round 5; measured again for
+    /// this milestone per axis: the unwrapped form gives a false `Proved`
+    /// (`p1`, unsat) where this one gives the honest `Refuted` with the witness
+    /// `cube_x = 16843009, wrap_x = 1, abs_x = 16843008, len = 16843009`
+    /// (`p1b`, sat)). A value in `[0, 2^32)` congruent to `X` mod `2^32` is
+    /// *unique*, so `pos` is pinned to `X mod 2^32` — the true hardware value —
+    /// and the module invariant "every non-tainted modeled integer term equals
+    /// the real hardware value" is preserved.
+    ///
+    /// The `k <= dim - 1` ceiling is tight but **not** soundness-critical (the
+    /// `[0, 2^32)` range plus the congruence already pin `pos`): with
+    /// `cube <= 2^32 - 1` and `unit <= dim - 1` the raw sum is at most
+    /// `2^32*dim - 1`, so `k = floor(raw / 2^32) <= dim - 1`.
+    ///
+    /// **Risk-1 note (docs/design-2d-dispatch.md §13 risk 1).** The 2-D
+    /// milestone would naturally have produced four copies of this equation —
+    /// `abs_pos_sym` plus one per axis — kept apart only by a clause gate. There
+    /// is instead exactly one: `abs_pos_sym` and `abs_pos_axis_sym` both call
+    /// *this*, differing only in which leaves and which pinned `dim` they hand
+    /// it. A defect injected here fails both the cooperative round-5 regression
+    /// and the per-axis ones, which is the property the risk asked for.
+    fn recompose_pos(
+        &mut self,
+        pos_hint: &str,
+        wrap_hint: &str,
+        cube: SExpr,
+        unit: SExpr,
+        dim: u32,
+    ) -> Result<SExpr, Stop> {
+        let pos = self.declare_u32_leaf(pos_hint)?;
+        let k = self.declare_int(wrap_hint, true)?;
+        let k_max = self.smt.numeral((dim as u64).saturating_sub(1));
+        let k_le = self.smt.lte(k, k_max);
+        self.s_assert(k_le)?;
+        let d = self.smt.numeral(dim as u64);
+        let scaled = self.smt.times(cube, d);
+        let sum = self.smt.plus(scaled, unit);
+        let modulus = self.smt.numeral(wrap_modulus(&address_type()));
+        let wraps = self.smt.times(k, modulus);
+        let rhs = self.smt.sub(sum, wraps);
+        let eq = self.smt.eq(pos, rhs);
+        self.s_assert(eq)?;
+        Ok(pos)
+    }
+
     // -- cooperative leaves (shared-memory milestone M1) ----------------
 
     /// Declare the cooperative leaf symbols at the outermost SMT scope so
@@ -1575,7 +1807,7 @@ impl<'a, 'b> Prover<'a, 'b> {
     /// never reads it) is harmless — a free nonnegative constant no
     /// obligation references.
     fn predeclare_coop_leaves(&mut self) -> Result<(), Stop> {
-        if self.coop.is_none() {
+        if self.topology.coop_dim().is_none() {
             return Ok(());
         }
         self.unit_pos_sym()?;
@@ -1599,7 +1831,10 @@ impl<'a, 'b> Prover<'a, 'b> {
         if let Some(Some(e)) = self.memo.get(&kind) {
             return Ok(*e);
         }
-        let cube_dim = self.coop.expect("unit_pos_sym only reachable in cooperative mode");
+        let cube_dim = self
+            .topology
+            .coop_dim()
+            .expect("unit_pos_sym only reachable in cooperative mode");
         let sym = self.declare_int("unit_pos", true)?;
         let bound = self.smt.numeral(cube_dim as u64);
         let lt = self.smt.lt(sym, bound);
@@ -1630,82 +1865,242 @@ impl<'a, 'b> Prover<'a, 'b> {
         Ok(sym)
     }
 
-    /// The `AbsolutePos` leaf in cooperative mode: a fresh in-range `u32` symbol
-    /// `abs_pos` tied to the **exact modular recomposition**
-    /// `abs_pos = cube_pos*cube_dim + unit_pos − k*2^32` for a fresh wrap count
-    /// `k ≥ 0` (module docs' "Cooperative mode"). This is the soundness-critical
-    /// alternative to building `cube_pos*cube_dim + unit_pos` with raw
-    /// `smt.times`/`smt.plus`: because `cube_pos` is a full-`u32` leaf, that raw
-    /// sum can exceed `2^32`, which real hardware wraps, so the raw (unwrapped)
-    /// term is *not* the hardware value and a guard `ABSOLUTE_POS < len` would
-    /// unsoundly transfer a bound onto `cube_pos` that hardware never honors
-    /// (adversarial review round 5). Declaring `abs_pos` as its own leaf in
-    /// `[0, 2^32)` **congruent to the raw sum mod 2^32** models the wrap exactly:
-    /// a value in `[0, 2^32)` congruent to `X` mod `2^32` is unique, so `abs_pos`
-    /// is pinned to `X mod 2^32` = the true hardware value (multiple wraps
-    /// included, since `k` is unconstrained above by soundness). This keeps the
-    /// "every non-tainted modeled integer term equals the real hardware value"
-    /// invariant (module docs' "Bounded-integer overflow model"). Both products
-    /// are variable×constant (`cube_dim` and `2^32` are constants), hence LINEAR
-    /// — QF_LIA, no QF_NIA. Memoized on `VariableKind::Builtin(AbsolutePos)`; in
-    /// the race walk it is re-derived per thread (`race_walk` clears it so it
-    /// picks up that thread's `UnitPos`).
+    /// The `AbsolutePos` leaf in **cooperative (1-D)** mode: the exact modular
+    /// recomposition `abs_pos = cube_pos*cube_dim + unit_pos − k*2^32`, built by
+    /// the shared [`Prover::recompose_pos`] (see it for the round-5 soundness
+    /// argument and for why the equation has exactly one construction site).
+    ///
+    /// **REQUIRED WORK before any 2-D cooperative milestone.** This
+    /// recomposition is the true hardware value **only when the launch is 1-D in
+    /// the cube** (`CUBE_DIM_Y == CUBE_DIM_Z == 1`). In a multi-axis dispatch it
+    /// is simply FALSE: `ABSOLUTE_POS` linearizes the *global thread coordinate*
+    /// over the whole grid while `CUBE_POS*CUBE_DIM + UNIT_POS` linearizes
+    /// *cube-major, then unit-within-cube*, and those are different orderings —
+    /// measured, the two disagree for 912 of 960 threads at
+    /// `CubeCount(5,3,1) x CubeDim(8,8,1)`, and the identity held in only 189 of
+    /// 722 swept launch shapes (docs/design-2d-dispatch.md §2.2, exact algebraic
+    /// predicate agreeing with hardware 722/722).
+    ///
+    /// Today the precondition holds *by construction* and nothing but this
+    /// paragraph said so: `coop.rs`'s launch and `conformance_case` both build
+    /// `CubeDim::new_1d(cube_dim)`, so `Wy = Wz = 1` for every cooperative
+    /// kernel vericl launches. Any milestone that enables a multi-axis `CubeDim`
+    /// for a cooperative kernel **MUST** replace this with the per-axis
+    /// recompositions ([`Prover::abs_pos_axis_sym`]) before doing so — keeping
+    /// this call and merely *adding* per-axis leaves alongside would pin
+    /// `AbsolutePos` to a value hardware never produces, and a guard on it would
+    /// transfer a bound onto `CubePos`/`UnitPos` that is not merely unhonoured
+    /// but arithmetically wrong: a false `Proved` with no wraparound involved at
+    /// all.
+    ///
+    /// Memoized on `VariableKind::Builtin(AbsolutePos)`; in the race walk it is
+    /// re-derived per thread (`race_walk` clears it so it picks up that thread's
+    /// `UnitPos`).
     fn abs_pos_sym(&mut self) -> Result<SExpr, Stop> {
         let kind = VariableKind::Builtin(Builtin::AbsolutePos);
         if let Some(Some(e)) = self.memo.get(&kind) {
             return Ok(*e);
         }
-        let cube_dim = self.coop.expect("abs_pos_sym only reachable in cooperative mode");
+        let cube_dim = self
+            .topology
+            .coop_dim()
+            .expect("abs_pos_sym only reachable in cooperative mode (1-D launch, see doc)");
         let unit = self.unit_pos_sym()?;
         let cube = self.cube_pos_sym()?;
-        // Fresh in-range leaf: `0 <= abs_pos <= u32::MAX` (address-type width).
-        let abs = self.declare_u32_leaf("abs_pos")?;
-        // Fresh wrap count `k >= 0`, additionally bounded above by the constant
-        // `cube_dim - 1`: with `cube_pos <= 2^32 - 1` and `unit_pos <= cube_dim
-        // - 1`, the raw sum is at most `2^32*cube_dim - 1`, so `k = floor(raw /
-        // 2^32) <= cube_dim - 1`. The upper bound is *not* needed for soundness
-        // (the `[0, 2^32)` range plus the congruence already pin `abs_pos` to the
-        // unique residue) but tightens the model at no cost.
-        let k = self.declare_int("abs_wrap", true)?;
-        let k_max = self.smt.numeral((cube_dim as u64).saturating_sub(1));
-        let k_le = self.smt.lte(k, k_max);
-        self.s_assert(k_le)?;
-        // abs_pos = cube_pos*cube_dim + unit_pos - k*2^32  (both products linear).
-        let cd = self.smt.numeral(cube_dim as u64);
-        let scaled = self.smt.times(cube, cd);
-        let sum = self.smt.plus(scaled, unit);
-        let modulus = self.smt.numeral(wrap_modulus(&address_type()));
-        let wraps = self.smt.times(k, modulus);
-        let rhs = self.smt.sub(sum, wraps);
-        let eq = self.smt.eq(abs, rhs);
-        self.s_assert(eq)?;
+        let abs = self.recompose_pos("abs_pos", "abs_wrap", cube, unit, cube_dim)?;
         self.memo.insert(kind, Some(abs));
         Ok(abs)
     }
 
-    /// Resolve a topology builtin. In cooperative mode the 1-D leaves are
-    /// modeled (module docs' "Cooperative mode"); otherwise only
-    /// `AbsolutePos` is (a plain fresh leaf), everything else tainted —
-    /// byte-for-byte the pre-milestone behavior.
+    // -- per-axis leaves (2-D/3-D dispatch milestone M2) ------------------
+
+    /// The per-axis leaf builtins of one axis, in the order
+    /// `predeclare_dispatch_leaves` and `builtin_value` use them.
+    const AXIS_BUILTINS: [[Builtin; 4]; 3] = [
+        [Builtin::UnitPosX, Builtin::CubePosX, Builtin::CubeCountX, Builtin::AbsolutePosX],
+        [Builtin::UnitPosY, Builtin::CubePosY, Builtin::CubeCountY, Builtin::AbsolutePosY],
+        [Builtin::UnitPosZ, Builtin::CubePosZ, Builtin::CubeCountZ, Builtin::AbsolutePosZ],
+    ];
+
+    /// Declare all fifteen per-axis leaves at the **outermost** SMT scope, for
+    /// the same reason `predeclare_coop_leaves` exists: `abs_pos_axis_sym` emits
+    /// `declare-const`s *and* assertions, so a lazy first resolution inside a
+    /// branch arm or a loop body would scope both to that frame and drop them on
+    /// the matching `pop`, leaving a later use referencing an undeclared symbol
+    /// — or, worse, silently losing the recomposition fact.
+    ///
+    /// This is also what closes round 7's queued predeclaration hazard for this
+    /// milestone rather than inheriting it (`tasks/todo.md:1552-1655` classified
+    /// lazy leaf declaration inside the **loop** handlers as latent-LOW because
+    /// no evidence-producing flow reached it; a grid-stride 2-D kernel whose only
+    /// use of `ABSOLUTE_POS_Y` is inside a `while` body is exactly that flow).
+    /// Declaring an unused leaf is harmless — a free nonnegative constant no
+    /// obligation references — which is why all three axes are declared
+    /// unconditionally even for a rank-2 clause.
+    fn predeclare_dispatch_leaves(&mut self) -> Result<(), Stop> {
+        if self.topology.dispatch_dims().is_none() {
+            return Ok(());
+        }
+        for axis in 0..3usize {
+            self.unit_pos_axis_sym(axis)?;
+            self.cube_pos_axis_sym(axis)?;
+            self.cube_count_axis_sym(axis)?;
+            self.abs_pos_axis_sym(axis)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_dim(&self, axis: usize) -> u32 {
+        self.topology
+            .dispatch_dims()
+            .expect("per-axis leaves are only reachable in dispatch mode")[axis]
+    }
+
+    /// `UNIT_POS_a`: a fresh symbol constrained to `[0, Wa)`.
+    fn unit_pos_axis_sym(&mut self, axis: usize) -> Result<SExpr, Stop> {
+        let kind = VariableKind::Builtin(Self::AXIS_BUILTINS[axis][0]);
+        if let Some(Some(e)) = self.memo.get(&kind) {
+            return Ok(*e);
+        }
+        let w = self.dispatch_dim(axis);
+        let sym = self.declare_int(&format!("unit_{}", AXIS_NAMES[axis]), true)?;
+        let bound = self.smt.numeral(w as u64);
+        let lt = self.smt.lt(sym, bound);
+        self.s_assert(lt)?;
+        self.memo.insert(kind, Some(sym));
+        Ok(sym)
+    }
+
+    /// `CUBE_POS_a`: a fresh (cube-uniform) `u32`-range leaf.
+    fn cube_pos_axis_sym(&mut self, axis: usize) -> Result<SExpr, Stop> {
+        let kind = VariableKind::Builtin(Self::AXIS_BUILTINS[axis][1]);
+        if let Some(Some(e)) = self.memo.get(&kind) {
+            return Ok(*e);
+        }
+        let sym = self.declare_u32_leaf(&format!("cube_{}", AXIS_NAMES[axis]))?;
+        self.memo.insert(kind, Some(sym));
+        Ok(sym)
+    }
+
+    /// `CUBE_COUNT_a`: a fresh (cube-uniform) `u32`-range leaf.
+    ///
+    /// Deliberately **not** bounded by the hardware ceiling: `CUBE_COUNT_a <=
+    /// 65535` is true on wgpu and false on CUDA (`2^31 - 1` on X), and the
+    /// round-5 discipline is that the model asserts only what hardware
+    /// *universally* honours (docs/design-2d-dispatch.md §4.2).
+    fn cube_count_axis_sym(&mut self, axis: usize) -> Result<SExpr, Stop> {
+        let kind = VariableKind::Builtin(Self::AXIS_BUILTINS[axis][2]);
+        if let Some(Some(e)) = self.memo.get(&kind) {
+            return Ok(*e);
+        }
+        let sym = self.declare_u32_leaf(&format!("count_{}", AXIS_NAMES[axis]))?;
+        self.memo.insert(kind, Some(sym));
+        Ok(sym)
+    }
+
+    /// `ABSOLUTE_POS_a`: the **per-axis** exact modular recomposition
+    /// `abs_a = cube_a*Wa + unit_a − wrap_a*2^32`, built by the SAME
+    /// [`Prover::recompose_pos`] the 1-D cooperative case uses.
+    ///
+    /// This relation — unlike the flat one `abs_pos_sym` encodes — really is
+    /// exact on hardware for every launch shape: `ABSOLUTE_POS_a ==
+    /// (CUBE_POS_a * CUBE_DIM_a + UNIT_POS_a) mod 2^32`, measured 0 violations
+    /// in 1 212 threads across 6 launch shapes including `(3,2,2)x(2,3,2)`
+    /// (docs/design-2d-dispatch.md §1.3 check (5)). What breaks in 2-D is only
+    /// the *cross-axis* flat identity, and the three flat builtins that would
+    /// need it are unmodeled here.
+    fn abs_pos_axis_sym(&mut self, axis: usize) -> Result<SExpr, Stop> {
+        let kind = VariableKind::Builtin(Self::AXIS_BUILTINS[axis][3]);
+        if let Some(Some(e)) = self.memo.get(&kind) {
+            return Ok(*e);
+        }
+        let w = self.dispatch_dim(axis);
+        let unit = self.unit_pos_axis_sym(axis)?;
+        let cube = self.cube_pos_axis_sym(axis)?;
+        let a = AXIS_NAMES[axis];
+        let abs = self.recompose_pos(
+            &format!("abs_{a}"),
+            &format!("abs_{a}_wrap"),
+            cube,
+            unit,
+            w,
+        )?;
+        self.memo.insert(kind, Some(abs));
+        Ok(abs)
+    }
+
+    /// The flat `UNIT_POS` in dispatch mode: the pinned-coefficient linear form
+    /// `ux + uy*Wx + uz*Wx*Wy` (docs/design-2d-dispatch.md §1.3). **A term, not
+    /// a leaf, and it cannot wrap** — its value is bounded by the constant
+    /// `Wx*Wy*Wz <= 1024`, so no `wrap_to_range` correction is needed and none
+    /// is emitted. This is why flat `UNIT_POS` survives into per-axis mode while
+    /// flat `ABSOLUTE_POS`/`CUBE_POS`/`CUBE_COUNT` do not (§4.4).
+    fn flat_unit_pos_in_dispatch(&mut self) -> Result<SExpr, Stop> {
+        let dims = self.topology.dispatch_dims().expect("dispatch mode");
+        let ux = self.unit_pos_axis_sym(0)?;
+        let uy = self.unit_pos_axis_sym(1)?;
+        let uz = self.unit_pos_axis_sym(2)?;
+        let wx = self.smt.numeral(dims[0] as u64);
+        let wxy = self.smt.numeral((dims[0] as u64) * (dims[1] as u64));
+        let t1 = self.smt.times(uy, wx);
+        let t2 = self.smt.times(uz, wxy);
+        let s1 = self.smt.plus(ux, t1);
+        Ok(self.smt.plus(s1, t2))
+    }
+
+    /// Resolve a topology builtin, per [`TopologyMode`]. In cooperative mode the
+    /// 1-D leaves are modeled (module docs' "Cooperative mode"); in dispatch
+    /// mode the per-axis leaves are (docs/design-2d-dispatch.md §4.3); in flat
+    /// mode only `AbsolutePos` is (a plain fresh leaf), everything else tainted
+    /// — byte-for-byte the pre-milestone behavior.
     fn builtin_value(&mut self, b: Builtin) -> Option<SExpr> {
-        let Some(cube_dim) = self.coop else {
-            return match b {
+        match self.topology {
+            TopologyMode::Flat => match b {
                 Builtin::AbsolutePos => self.declare_u32_leaf("abs_pos").ok(),
                 _ => None,
-            };
-        };
-        match b {
-            Builtin::UnitPos => self.unit_pos_sym().ok(),
-            Builtin::CubePos => self.cube_pos_sym().ok(),
-            Builtin::CubeCount => self.cube_count_sym().ok(),
-            Builtin::CubeDim => Some(self.smt.numeral(cube_dim as u64)),
-            // AbsolutePos = (CubePos*cube_dim + UnitPos) mod 2^32 — the 1-D
-            // identity under finite-width wraparound, encoded exactly by
-            // `abs_pos_sym` (a raw `times`/`plus` here would be the *unwrapped*
-            // over-value and unsound; see `abs_pos_sym`'s docs, round 5).
-            Builtin::AbsolutePos => self.abs_pos_sym().ok(),
-            // X/Y/Z, plane, cluster builtins: out of the 1-D subset.
-            _ => None,
+            },
+            TopologyMode::Coop(cube_dim) => match b {
+                Builtin::UnitPos => self.unit_pos_sym().ok(),
+                Builtin::CubePos => self.cube_pos_sym().ok(),
+                Builtin::CubeCount => self.cube_count_sym().ok(),
+                Builtin::CubeDim => Some(self.smt.numeral(cube_dim as u64)),
+                // AbsolutePos = (CubePos*cube_dim + UnitPos) mod 2^32 — the 1-D
+                // identity under finite-width wraparound, encoded exactly by
+                // `abs_pos_sym` (a raw `times`/`plus` here would be the
+                // *unwrapped* over-value and unsound; round 5).
+                Builtin::AbsolutePos => self.abs_pos_sym().ok(),
+                // X/Y/Z, plane, cluster builtins: out of the 1-D subset.
+                _ => None,
+            },
+            TopologyMode::Dispatch(dims) => match b {
+                Builtin::CubeDimX => Some(self.smt.numeral(dims[0] as u64)),
+                Builtin::CubeDimY => Some(self.smt.numeral(dims[1] as u64)),
+                Builtin::CubeDimZ => Some(self.smt.numeral(dims[2] as u64)),
+                Builtin::CubeDim => Some(
+                    self.smt
+                        .numeral((dims[0] as u64) * (dims[1] as u64) * (dims[2] as u64)),
+                ),
+                Builtin::UnitPosX => self.unit_pos_axis_sym(0).ok(),
+                Builtin::UnitPosY => self.unit_pos_axis_sym(1).ok(),
+                Builtin::UnitPosZ => self.unit_pos_axis_sym(2).ok(),
+                Builtin::UnitPos => self.flat_unit_pos_in_dispatch().ok(),
+                Builtin::CubePosX => self.cube_pos_axis_sym(0).ok(),
+                Builtin::CubePosY => self.cube_pos_axis_sym(1).ok(),
+                Builtin::CubePosZ => self.cube_pos_axis_sym(2).ok(),
+                Builtin::CubeCountX => self.cube_count_axis_sym(0).ok(),
+                Builtin::CubeCountY => self.cube_count_axis_sym(1).ok(),
+                Builtin::CubeCountZ => self.cube_count_axis_sym(2).ok(),
+                Builtin::AbsolutePosX => self.abs_pos_axis_sym(0).ok(),
+                Builtin::AbsolutePosY => self.abs_pos_axis_sym(1).ok(),
+                Builtin::AbsolutePosZ => self.abs_pos_axis_sym(2).ok(),
+                // `AbsolutePos`, `CubePos`, `CubeCount`: the macro's R1 rejects
+                // these before any IR is extracted, so this arm is the
+                // fail-closed backstop rather than the live gate. Modeling them
+                // would need `abs_y * (count_x * Wx)` — variable×variable, whose
+                // inter-cube query z3 times out on at 180 s (`p5`) — and would
+                // re-import §2's broken flat identity into the model.
+                _ => None,
+            },
         }
     }
 
@@ -1747,7 +2142,7 @@ impl<'a, 'b> Prover<'a, 'b> {
     /// `if` to ordinary `process_branch` handling (where `Branch::Return` is a
     /// no-op), which is sound but adds no `!cond`.
     fn as_coop_terminate(&self, inst: &Instruction) -> Option<Variable> {
-        self.coop?; // cooperative mode only
+        self.topology.coop_dim()?; // cooperative mode only
         let Operation::Branch(Branch::If(if_)) = &inst.operation else { return None };
         let insts = &if_.scope.instructions;
         if insts.len() != 1 {
@@ -1944,6 +2339,21 @@ impl<'a, 'b> Prover<'a, 'b> {
             Arithmetic::Mul(b) => self.checked_mul(b, &out.ty)?,
             Arithmetic::Div(b) => self.divmod_int(b, "/", |s, l, r| s.div(l, r))?,
             Arithmetic::Modulo(b) => self.divmod_int(b, "%", |s, l, r| s.modulo(l, r))?,
+            // Integer `min`/`max` as an EXACT `ite` — no side-obligation, no
+            // wrap correction, no new leaf: the result is *one of the operands*,
+            // both of which are in range by the leaf/faithful-term invariant, so
+            // the term is exact and in range by construction. Floats are already
+            // excluded by the `is_modeled_int(&out.ty)` guard above (and integer
+            // min/max has no NaN question).
+            //
+            // This is what makes the whole branch-free clamped-stencil class
+            // provable (docs/design-2d-dispatch.md §4.5): the idiomatic
+            // `if`-based clamp writes a mutable local inside an arm, which
+            // round-2 branch write-taint correctly taints, so `u32::min(x + 1,
+            // w - 1)` is the only remaining spelling — and it lowers to exactly
+            // this instruction (measured IR, §3.2).
+            Arithmetic::Max(b) => self.minmax_int(b, true),
+            Arithmetic::Min(b) => self.minmax_int(b, false),
             _ => None,
         };
         self.bind_out(inst, val);
@@ -1966,6 +2376,26 @@ impl<'a, 'b> Prover<'a, 'b> {
         }
         self.pending_taint_reason = None;
         Ok(())
+    }
+
+    /// Integer `min`/`max` as the exact `ite(l >= r, l, r)` / `ite(l <= r, l,
+    /// r)`. Returns `None` (taint) if either operand is not a modeled integer or
+    /// does not resolve — the same discipline as `wrapping_binary`.
+    ///
+    /// Exactness argument, in full: the SMT term evaluates to `l` or to `r`,
+    /// each of which is already a faithful in-range model of the corresponding
+    /// hardware value, and the selecting comparison is over the same integers
+    /// hardware compares. So the result equals the real hardware value at every
+    /// input, and needs no `wrap_to_range` (a selection cannot leave the range
+    /// its operands are in).
+    fn minmax_int(&mut self, b: &cubecl::ir::BinaryOperator, is_max: bool) -> Option<SExpr> {
+        if !is_modeled_int(&b.lhs.ty) || !is_modeled_int(&b.rhs.ty) {
+            return None;
+        }
+        let l = self.value_of(&b.lhs)?;
+        let r = self.value_of(&b.rhs)?;
+        let cond = if is_max { self.smt.gte(l, r) } else { self.smt.lte(l, r) };
+        Some(self.smt.ite(cond, l, r))
     }
 
     /// Faithful finite-width Add/Sub: resolve both modeled-integer operands,
@@ -8512,5 +8942,436 @@ mod tests {
             }
             other => panic!("expected OutOfSubset (array-element index), got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // 2-D / 3-D dispatch milestone (docs/design-2d-dispatch.md).
+    //
+    // Every SMT verdict the design pre-measured as hand-written SMT-LIB
+    // (`scratchpad/design2d/smt/p*.smt2`) is reproduced here against the real
+    // prover, positive and negative control both.
+    // -----------------------------------------------------------------
+
+    /// The `p1`/`p1b` attack, transplanted to the **X axis**: guard on
+    /// `ABSOLUTE_POS_X`, index with the *unguarded* `CUBE_POS_X`.
+    ///
+    /// This is round 5's repro one axis over. Under an *unwrapped*
+    /// `abs_x = cube_x*Wx + unit_x` the guard `abs_x < out.len()` would imply
+    /// `cube_x*16 < len` and hence `cube_x < len`, a **false `Proved`**
+    /// (measured unsat, `p1`). With the exact modular recomposition the honest
+    /// verdict is `Refuted`, and the witness is the wrapping one (measured sat
+    /// with `cube_x = 16843009, wrap_x = 1, abs_x = 16843008, len = 16843009`,
+    /// `p1b`).
+    ///
+    /// The guard is against `out.len()`, not against an unrelated extent — that
+    /// is what makes the test *discriminate*. A guard on `w` would refute
+    /// either way (nothing relates `w` to the buffer length), so it would pass
+    /// with the wrap term deleted and prove nothing. Measured: with
+    /// `- wrap*2^32` removed from `recompose_pos` this test reports FALSE PROOF.
+    #[cube(launch)]
+    fn prover_test_dispatch_absx_guard_cubex_index(out: &mut Array<f32>, w: u32, h: u32) {
+        let _ = w + h;
+        let n = out.len() as u32;
+        if ABSOLUTE_POS_X < n {
+            out[CUBE_POS_X as usize] = 1.0f32;
+        }
+    }
+
+    /// The same, on the **Y axis** — the sibling hunt round 5's lesson demands:
+    /// audit *every* construction site of the thing the invariant quantifies
+    /// over, not the first one.
+    #[cube(launch)]
+    fn prover_test_dispatch_absy_guard_cubey_index(out: &mut Array<f32>, w: u32, h: u32) {
+        let _ = w + h;
+        let n = out.len() as u32;
+        if ABSOLUTE_POS_Y < n {
+            out[CUBE_POS_Y as usize] = 1.0f32;
+        }
+    }
+
+    /// One `&mut Array<f32>` output plus the two `u32` extents `w`, `h`, built
+    /// at the pinned `(16, 16)` cube dim — the shape every 2-D prover test here
+    /// uses. A macro rather than a function taking a closure: the `expand`
+    /// argument types are cubecl's per-parameter `NativeExpand<..>` wrappers,
+    /// which cannot be named uniformly in a closure signature.
+    macro_rules! build_dispatch_out_w_h {
+        ($k:path) => {{
+            let mut b = KernelBuilder::default();
+            b.runtime_properties(Default::default());
+            cubecl::ir::AddressType::U32.register(&mut b.scope);
+            let out = <Array<f32> as LaunchArg>::expand_output(
+                &ArrayCompilationArg { inplace: None },
+                &mut b,
+            );
+            let w = <u32 as LaunchArg>::expand(&Default::default(), &mut b);
+            let h = <u32 as LaunchArg>::expand(&Default::default(), &mut b);
+            $k(&mut b.scope, out, w, h);
+            b.build(KernelSettings::default().cube_dim(CubeDim::new_2d(16, 16)))
+        }};
+    }
+
+    #[test]
+    fn dispatch_per_axis_wrap_witness_refutes_on_every_axis() {
+        for (axis, def) in [
+            ("x", build_dispatch_out_w_h!(prover_test_dispatch_absx_guard_cubex_index::expand)),
+            ("y", build_dispatch_out_w_h!(prover_test_dispatch_absy_guard_cubey_index::expand)),
+        ] {
+            let buffers = [BufferParam { name: "out", is_output: true }];
+            match prove_bounds_freedom_dispatch(&def, &buffers, &[], [16, 16, 1]) {
+                ProveResult::Refuted { obligation, counterexample } => {
+                    assert!(
+                        obligation.contains("out"),
+                        "axis {axis}: expected the out[CUBE_POS_{axis}] write to refute: {obligation}"
+                    );
+                    assert!(
+                        counterexample.contains(&format!("cube_{axis}")),
+                        "axis {axis}: the counterexample must exhibit the offending cube_{axis}: \
+                         {counterexample}"
+                    );
+                    assert!(
+                        counterexample.contains(&format!("abs_{axis}_wrap")),
+                        "axis {axis}: the witness is the WRAPPING one — the wrap counter must be \
+                         in the model: {counterexample}"
+                    );
+                }
+                ProveResult::Proved { obligations } => panic!(
+                    "FALSE PROOF (unsound), axis {axis}: abs_{axis}-guard / cube_{axis}-index \
+                     Proved with {obligations} obligations — hardware wraps abs_{axis}, so \
+                     cube_{axis} can be ~2^24 with out[cube_{axis}] wildly OOB. The `- wrap*2^32` \
+                     term in `recompose_pos` is what prevents this."
+                ),
+                other => panic!("axis {axis}: expected Refuted, got {other:?}"),
+            }
+        }
+    }
+
+    /// `p2b` + `p2a`: the 2-D write obligation `y*w + x < out.len()` discharges
+    /// **only** with the product assume, and the `checked_mul` side-obligation
+    /// on the row stride `abs_y * w` is what it is really buying.
+    #[cube(launch)]
+    fn prover_test_dispatch_ew2d(out: &mut Array<f32>, w: u32, h: u32) {
+        let x = ABSOLUTE_POS_X;
+        let y = ABSOLUTE_POS_Y;
+        if x < w && y < h {
+            out[(y * w + x) as usize] = 1.0f32;
+        }
+    }
+
+    #[test]
+    fn dispatch_product_assume_is_necessary_and_sufficient() {
+        let def = build_dispatch_out_w_h!(prover_test_dispatch_ew2d::expand);
+        let buffers = [BufferParam { name: "out", is_output: true }];
+
+        // p2b — with `len_out == w * h`, Proved.
+        let with = [Assume::LenEqProduct { a: "out", x_scalar: 0, y_scalar: 1 }];
+        match prove_bounds_freedom_dispatch(&def, &buffers, &with, [16, 16, 1]) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 1),
+            other => panic!("p2b: expected Proved{{1}} with the product assume, got {other:?}"),
+        }
+
+        // p2e — NEGATIVE CONTROL. Without it nothing ties the extents to a
+        // length, the row stride's no-overflow side-obligation cannot discharge,
+        // and the index is unmodelable. The assume is *necessary*, not merely
+        // convenient — this is what makes the milestone's headline claim a
+        // measurement.
+        match prove_bounds_freedom_dispatch(&def, &buffers, &[], [16, 16, 1]) {
+            ProveResult::OutOfSubset { reason } => assert!(
+                reason.contains("write index"),
+                "p2e: expected the write index to be unmodelable, got: {reason}"
+            ),
+            ProveResult::Proved { obligations } => panic!(
+                "p2e: FALSE PROOF — a 2-D write index Proved{{{obligations}}} with NO fact tying \
+                 the extents to a buffer length"
+            ),
+            other => panic!("p2e: expected OutOfSubset without the product assume, got {other:?}"),
+        }
+    }
+
+    /// `p2c` / `p2d`: the 3x3 clamped-stencil neighbour obligation, and its
+    /// negative control with the clamp deleted.
+    #[cube(launch)]
+    fn prover_test_dispatch_clamped_neighbour(inp: &Array<f32>, out: &mut Array<f32>, w: u32, h: u32) {
+        let x = ABSOLUTE_POS_X;
+        let y = ABSOLUTE_POS_Y;
+        if x < w && y < h {
+            let x2 = u32::min(x + 1u32, w - 1u32);
+            let y2 = u32::min(y + 1u32, h - 1u32);
+            out[(y * w + x) as usize] = inp[(y2 * w + x2) as usize];
+        }
+    }
+
+    #[cube(launch)]
+    fn prover_test_dispatch_unclamped_neighbour(
+        inp: &Array<f32>,
+        out: &mut Array<f32>,
+        w: u32,
+        h: u32,
+    ) {
+        let x = ABSOLUTE_POS_X;
+        let y = ABSOLUTE_POS_Y;
+        if x < w && y < h {
+            out[(y * w + x) as usize] = inp[((y + 1u32) * w + (x + 1u32)) as usize];
+        }
+    }
+
+    fn build_dispatch_stencil(clamped: bool) -> KernelDefinition {
+        let mut b = KernelBuilder::default();
+        b.runtime_properties(Default::default());
+        cubecl::ir::AddressType::U32.register(&mut b.scope);
+        let inp = <Array<f32> as LaunchArg>::expand(&ArrayCompilationArg { inplace: None }, &mut b);
+        let out =
+            <Array<f32> as LaunchArg>::expand_output(&ArrayCompilationArg { inplace: None }, &mut b);
+        let w = <u32 as LaunchArg>::expand(&Default::default(), &mut b);
+        let h = <u32 as LaunchArg>::expand(&Default::default(), &mut b);
+        if clamped {
+            prover_test_dispatch_clamped_neighbour::expand(&mut b.scope, inp, out, w, h);
+        } else {
+            prover_test_dispatch_unclamped_neighbour::expand(&mut b.scope, inp, out, w, h);
+        }
+        b.build(KernelSettings::default().cube_dim(CubeDim::new_2d(16, 16)))
+    }
+
+    #[test]
+    fn dispatch_clamped_stencil_proves_and_the_unclamped_control_refutes() {
+        let buffers = [
+            BufferParam { name: "inp", is_output: false },
+            BufferParam { name: "out", is_output: true },
+        ];
+        let assumes = [
+            Assume::LenEq { a: "inp", b: "out" },
+            Assume::LenEqProduct { a: "inp", x_scalar: 0, y_scalar: 1 },
+        ];
+
+        // p2c — the clamped neighbour discharges. This is the whole
+        // stencil class, and it exists only because `Arithmetic::Min` is
+        // modeled as an exact `ite`.
+        match prove_bounds_freedom_dispatch(&build_dispatch_stencil(true), &buffers, &assumes, [16, 16, 1])
+        {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 2),
+            other => panic!("p2c: expected Proved{{2}} for the clamped stencil, got {other:?}"),
+        }
+
+        // p2d — NEGATIVE CONTROL: delete the clamp and the same gate must
+        // refute, with the minimal witness a 1x1 image (`w = h = 1`) where the
+        // kernel reads `inp[2]` from a length-1 buffer.
+        match prove_bounds_freedom_dispatch(&build_dispatch_stencil(false), &buffers, &assumes, [16, 16, 1])
+        {
+            ProveResult::Refuted { obligation, counterexample } => {
+                assert!(
+                    obligation.contains("inp"),
+                    "p2d: the unclamped `inp[(y+1)*w + (x+1)]` read must refute: {obligation}"
+                );
+                assert!(
+                    counterexample.contains("scalar0_") && counterexample.contains("scalar1_"),
+                    "p2d: the witness names both extents: {counterexample}"
+                );
+            }
+            ProveResult::Proved { obligations } => panic!(
+                "p2d: FALSE PROOF — the UNCLAMPED stencil Proved{{{obligations}}}. The clamp gate \
+                 does not discriminate, so `p2c`'s pass is meaningless."
+            ),
+            other => panic!("p2d: expected Refuted for the unclamped stencil, got {other:?}"),
+        }
+    }
+
+    /// `Arithmetic::Min`/`Max` must stay tainted for **floats**. The
+    /// `is_modeled_int(&out.ty)` guard at the top of `process_arithmetic` is
+    /// what does it; this is that guard's own predicate test, since a float
+    /// `min` reaching the integer `ite` path would mint an `Int` term for an
+    /// `f32` value.
+    #[test]
+    fn minmax_is_integer_only() {
+        let f32_ty = Type::scalar(ElemType::Float(cubecl::ir::FloatKind::F32));
+        assert!(!is_modeled_int(&f32_ty), "a float min/max must never reach the integer ite path");
+        assert!(is_modeled_int(&address_type()), "an integer min/max must");
+    }
+
+    /// §13 risk 3 / round 7's queued predeclaration hazard, made reachable and
+    /// closed: a per-axis leaf whose FIRST resolution is inside a loop body must
+    /// still be in scope for an obligation *after* the loop.
+    ///
+    /// Without `predeclare_dispatch_leaves` the `declare-const` for `abs_y` (and
+    /// its recomposition assertion) would be emitted inside the loop's SMT
+    /// frame and dropped at the matching `pop`, leaving the later obligation
+    /// referencing an undeclared symbol — a `SolverError` at best, a silently
+    /// dropped range fact at worst. Reverting the predeclaration must make this
+    /// test fail.
+    #[cube(launch)]
+    fn prover_test_dispatch_leaf_first_used_in_loop(out: &mut Array<f32>, w: u32, h: u32) {
+        let x = ABSOLUTE_POS_X;
+        // First mention of the Y axis anywhere in the body, inside a loop — and
+        // an INTEGER use, so the prover really does resolve the leaf there (a
+        // `as f32` cast would taint before reaching `value_of`, which is how an
+        // earlier draft of this test failed to discriminate).
+        let mut acc = 0u32;
+        for _j in 0..4u32 {
+            // `ABSOLUTE_POS_Y` must be the FIRST operand resolved: a carried
+            // accumulator on the left short-circuits `wrapping_binary` before it
+            // ever reaches the right-hand operand, which is how two earlier
+            // drafts of this test failed to reach the hazard at all.
+            let t = ABSOLUTE_POS_Y * 2u32;
+            acc += t;
+        }
+        if x < w && ABSOLUTE_POS_Y < h {
+            out[(ABSOLUTE_POS_Y * w + x) as usize] = acc as f32;
+        }
+    }
+
+    #[test]
+    fn dispatch_leaf_first_resolved_in_a_loop_is_still_declared_after_it() {
+        let def = build_dispatch_out_w_h!(prover_test_dispatch_leaf_first_used_in_loop::expand);
+        let buffers = [BufferParam { name: "out", is_output: true }];
+        let assumes = [Assume::LenEqProduct { a: "out", x_scalar: 0, y_scalar: 1 }];
+        match prove_bounds_freedom_dispatch(&def, &buffers, &assumes, [16, 16, 1]) {
+            ProveResult::Proved { obligations } => assert_eq!(obligations, 1),
+            ProveResult::SolverError { detail } => panic!(
+                "the per-axis leaf was declared lazily inside the loop frame and dropped on the \
+                 pop — round 7's predeclaration hazard, now reachable: {detail}"
+            ),
+            other => panic!("expected Proved{{1}}, got {other:?}"),
+        }
+    }
+
+    /// The flat position/count builtins stay **unmodeled** in dispatch mode.
+    ///
+    /// The macro's R1 rejects them at the source, so this is the fail-closed
+    /// backstop rather than the live gate — but a backstop that has never been
+    /// exercised is a guess. A kernel that reaches the prover with a flat
+    /// `ABSOLUTE_POS` index under a dispatch walk must be `OutOfSubset`, never
+    /// `Proved`: modeling it would need §2's identity, which is false here.
+    #[cube(launch)]
+    fn prover_test_dispatch_flat_backstop(out: &mut Array<f32>, w: u32, h: u32) {
+        let x = ABSOLUTE_POS_X;
+        let y = ABSOLUTE_POS_Y;
+        if x < w && y < h && ABSOLUTE_POS < out.len() {
+            out[ABSOLUTE_POS] = 1.0f32;
+        }
+    }
+
+    #[test]
+    fn dispatch_mode_leaves_the_flat_builtins_unmodeled() {
+        let def = build_dispatch_out_w_h!(prover_test_dispatch_flat_backstop::expand);
+        let buffers = [BufferParam { name: "out", is_output: true }];
+        let assumes = [Assume::LenEqProduct { a: "out", x_scalar: 0, y_scalar: 1 }];
+        match prove_bounds_freedom_dispatch(&def, &buffers, &assumes, [16, 16, 1]) {
+            ProveResult::OutOfSubset { .. } => {}
+            other => panic!(
+                "flat ABSOLUTE_POS must stay unmodeled in dispatch mode (the fail-closed backstop \
+                 behind the macro's R1), got {other:?}"
+            ),
+        }
+    }
+
+    /// The `p3` witness, at the prover: the recognizer's job is to hand over
+    /// only facts that are true of the *executable* predicate, and the model
+    /// asserted here is the mathematical product. If the macro ever accepted the
+    /// wrapping spelling `A.len() == (w * h) as usize`, THIS is the state it
+    /// would create — a length-2 buffer whose model says 4 294 967 298 — and the
+    /// out-of-bounds index would prove. The test pins that the danger is real
+    /// (so R6 is load-bearing) by showing the model does assert the unwrapped
+    /// product.
+    #[test]
+    fn product_assume_asserts_the_mathematical_product_which_is_why_r6_exists() {
+        let def = build_dispatch_out_w_h!(prover_test_dispatch_ew2d::expand);
+        let buffers = [BufferParam { name: "out", is_output: true }];
+        // `len == w*h` plus `len == 2` is satisfiable only for tiny w*h. If the
+        // model wrapped the product the way `(w*h) as usize` does, `w = 2,
+        // h = 2147483649` would satisfy both and the context would stay
+        // feasible; with the mathematical product it does not, and the only
+        // models are the honest small ones.
+        let assumes = [
+            Assume::LenEqProduct { a: "out", x_scalar: 0, y_scalar: 1 },
+            Assume::LenEqConst { a: "out", value: 2 },
+        ];
+        match prove_bounds_freedom_dispatch(&def, &buffers, &assumes, [16, 16, 1]) {
+            ProveResult::Proved { .. } => {}
+            other => panic!("a `len == w*h` and `len == 2` context is feasible: {other:?}"),
+        }
+    }
+
+    /// §13 risk 5: a **contradictory** pair of product assumes must be rejected,
+    /// not vacuously discharged. `a.len() == w*h` with `a.len() == 7` and
+    /// `w == h`-free is satisfiable; forcing the product to be simultaneously
+    /// two different constants is not.
+    #[test]
+    fn contradictory_product_assumes_are_rejected_not_vacuously_proved() {
+        let def = build_dispatch_out_w_h!(prover_test_dispatch_ew2d::expand);
+        let buffers = [BufferParam { name: "out", is_output: true }];
+        // `len = w*y` for TWO different scalar pairs where one pair is (0,0) and
+        // the other is (0,1), plus `len = 0` and a nonzero scalar bound, is
+        // contradictory only via the nonlinear facts.
+        let assumes = [
+            Assume::LenEqProduct { a: "out", x_scalar: 0, y_scalar: 1 },
+            Assume::LenEqConst { a: "out", value: 6 },
+            Assume::LenEqConst { a: "out", value: 7 },
+        ];
+        match prove_bounds_freedom_dispatch(&def, &buffers, &assumes, [16, 16, 1]) {
+            ProveResult::OutOfSubset { reason } => assert!(
+                reason.contains("contradictory") || reason.contains("unknown"),
+                "expected the infeasible-assumption guard to fire: {reason}"
+            ),
+            ProveResult::Proved { obligations } => panic!(
+                "VACUOUS PROOF: a contradictory assume set Proved{{{obligations}}}"
+            ),
+            other => panic!("expected OutOfSubset, got {other:?}"),
+        }
+    }
+
+    /// This module's own source, with `mod tests` removed — so a source-level
+    /// assertion below cannot be satisfied by its own string literal (which
+    /// would make it vacuous rather than discriminating).
+    fn non_test_source() -> &'static str {
+        let src = include_str!("prover.rs");
+        src.split("#[cfg(test)]\nmod tests {").next().expect("split always yields a first part")
+    }
+
+    /// The **risk-1 structural** property, asserted as a property of the code
+    /// rather than of one verdict: there is exactly ONE construction of the
+    /// exact modular position recomposition in this module, and both
+    /// `abs_pos_sym` (1-D cooperative) and `abs_pos_axis_sym` (per axis) go
+    /// through it.
+    ///
+    /// A source-level test is the honest form here — the risk is that a *future*
+    /// edit adds a fourth copy, and no runtime verdict can see that. It reads
+    /// this file and counts the sites that assert the equation's shape.
+    #[test]
+    fn the_position_recomposition_has_exactly_one_construction_site() {
+        let src = non_test_source();
+        // The equation is `pos = cube*dim + unit - wrap*2^32`; its distinctive
+        // token is subtracting the wrap term from the recomposed sum.
+        let sites = src.matches("let rhs = self.smt.sub(sum, wraps);").count();
+        assert_eq!(
+            sites, 1,
+            "docs/design-2d-dispatch.md §13 risk 1: the round-5 recomposition equation must have \
+             exactly ONE construction (`recompose_pos`). Found {sites}. Four copies kept apart \
+             only by a clause gate is precisely the failure mode the risk pre-registered — route \
+             the new caller through `recompose_pos` instead."
+        );
+        // ...and both position builders must call it.
+        assert!(
+            src.contains("self.recompose_pos(\"abs_pos\", \"abs_wrap\", cube, unit, cube_dim)"),
+            "abs_pos_sym must build its recomposition through the shared implementation"
+        );
+        assert!(
+            src.contains("let abs = self.recompose_pos("),
+            "abs_pos_axis_sym must build its recomposition through the shared implementation"
+        );
+    }
+
+    /// §10.4 correction 1: `abs_pos_sym`'s 1-D precondition must be *written
+    /// down*, in the place a future 2-D-cooperative implementer will look. The
+    /// round-9 F4 pattern — a doc claim with a test that reads the doc.
+    #[test]
+    fn abs_pos_sym_carries_its_required_work_note() {
+        let src = non_test_source();
+        assert!(
+            src.contains("REQUIRED WORK before any 2-D cooperative milestone"),
+            "the 1-D precondition of the cooperative recomposition must be stated at \
+             `abs_pos_sym` itself (docs/design-2d-dispatch.md §10.4 correction 1)"
+        );
+        assert!(
+            src.contains("912 of 960 threads"),
+            "the note must carry the MEASUREMENT, not just the assertion"
+        );
     }
 }

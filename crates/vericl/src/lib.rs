@@ -80,9 +80,9 @@ pub use contract::{
 #[doc(hidden)]
 pub use evidence::{
     RACE_FREEDOM_ASSUMPTION_CHECK, RaceDependency, SMT_RACE_FREEDOM_CHECK,
-    cooperative_differential_config, differential_config, differential_vector_config,
-    proved_bounds_cooperative_config, proved_config, proved_race_config,
-    race_freedom_assumption_claim,
+    cooperative_differential_config, differential_config, differential_dispatch_config,
+    differential_vector_config, proved_bounds_cooperative_config, proved_config,
+    proved_config_with_logic, proved_race_config, race_freedom_assumption_claim,
 };
 #[doc(hidden)]
 pub use line::Line;
